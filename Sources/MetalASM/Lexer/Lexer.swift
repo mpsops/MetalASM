@@ -258,15 +258,25 @@ public final class Lexer {
             advance()
         }
 
-        // Check for hex: 0x
+        // Check for hex: 0x, 0xH (half), 0xK (fp80), 0xL (fp128), 0xM (ppc_fp128)
         if pos + 1 < source.count && source[pos] == "0" && (source[pos+1] == "x" || source[pos+1] == "X") {
             text.append(source[pos]); advance()
             text.append(source[pos]); advance()
+            // LLVM IR uses 0xH for half, 0xK for fp80, 0xL for fp128, 0xM for ppc_fp128
+            var isTypedHexFloat = false
+            if pos < source.count {
+                let ch = source[pos]
+                if ch == "H" || ch == "K" || ch == "L" || ch == "M" {
+                    text.append(ch); advance()
+                    isTypedHexFloat = true
+                }
+            }
             while pos < source.count && isHexChar(source[pos]) {
                 text.append(source[pos])
                 advance()
             }
-            return Token(kind: text.contains(".") ? .float_ : .integer, text: text, line: startLine, column: startCol)
+            let kind: Token.Kind = isTypedHexFloat ? .float_ : (text.contains(".") ? .float_ : .integer)
+            return Token(kind: kind, text: text, line: startLine, column: startCol)
         }
 
         // Decimal number, possibly float

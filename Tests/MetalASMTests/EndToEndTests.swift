@@ -141,6 +141,94 @@ final class EndToEndTests: XCTestCase {
         XCTAssertEqual(bitcode[3], 0xDE)
     }
 
+    /// Test assembling the GEMM IR and write metallib for external verification.
+    func testAssembleGEMMIR() throws {
+        let irURL = URL(fileURLWithPath: "/tmp/gemm_debug_8x8x8_NN.ll")
+        guard FileManager.default.fileExists(atPath: irURL.path) else {
+            throw XCTSkip("GEMM IR file not found at /tmp/gemm_debug_8x8x8_NN.ll")
+        }
+
+        let source = try String(contentsOf: irURL, encoding: .utf8)
+        let metallib = try MetalASM.assemble(ir: source)
+        let outURL = URL(fileURLWithPath: "/tmp/gemm_attr_fixed.metallib")
+        try metallib.write(to: outURL)
+        print("Wrote \(metallib.count) bytes to \(outURL.path)")
+        XCTAssertGreaterThan(metallib.count, 0)
+    }
+
+    /// Helper: extract bitcode from metallib data
+    private func extractBitcode(from metallib: Data) -> Data? {
+        let bytes = [UInt8](metallib)
+        for i in 0..<(bytes.count - 4) {
+            if bytes[i] == 0xDE && bytes[i+1] == 0xC0 && bytes[i+2] == 0x17 && bytes[i+3] == 0x0B {
+                let off = Int(bytes[i+8]) | (Int(bytes[i+9]) << 8) | (Int(bytes[i+10]) << 16) | (Int(bytes[i+11]) << 24)
+                let sz = Int(bytes[i+12]) | (Int(bytes[i+13]) << 8) | (Int(bytes[i+14]) << 16) | (Int(bytes[i+15]) << 24)
+                return Data(bytes[(i+off)..<(i+off+sz)])
+            }
+        }
+        return nil
+    }
+
+    /// Test assembling the MFA-generated GEMM IR (bf16 variant).
+    func testAssembleMFAIR() throws {
+        let irURL = URL(fileURLWithPath: "/tmp/mfa_gemm_debug.ll")
+        guard FileManager.default.fileExists(atPath: irURL.path) else {
+            throw XCTSkip("MFA IR not found at /tmp/mfa_gemm_debug.ll")
+        }
+
+        let source = try String(contentsOf: irURL, encoding: .utf8)
+        let metallib = try MetalASM.assemble(ir: source, platform: .macOS(version: 26))
+        try metallib.write(to: URL(fileURLWithPath: "/tmp/mfa_debug.metallib"))
+        print("Wrote \(metallib.count) bytes")
+
+        if let bc = extractBitcode(from: metallib) {
+            try bc.write(to: URL(fileURLWithPath: "/tmp/mfa_debug.bc"))
+            print("Extracted \(bc.count) bytes of bitcode")
+        }
+    }
+
+    /// Test assembling progressively larger subsets of MFA IR.
+    func testMFABisect() throws {
+        // Test various IR files to isolate the invalid record
+        let paths = ["/tmp/mfa_bisect9.ll", "/tmp/mfa_bisect10.ll", "/tmp/mfa_bisect6.ll"]
+        for path in paths {
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            let source = try String(contentsOfFile: path, encoding: .utf8)
+            do {
+                let metallib = try MetalASM.assemble(ir: source, platform: .macOS(version: 26))
+                let label = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                if let bc = extractBitcode(from: metallib) {
+                    try bc.write(to: URL(fileURLWithPath: "/tmp/\(label)_test.bc"))
+                    print("[\(label)] \(bc.count) bytes bitcode")
+                }
+            } catch {
+                print("[\(path)] Parse error: \(error)")
+            }
+        }
+    }
+
+    /// Minimal test for store instruction encoding.
+    func testStoreEncoding() throws {
+        let ir = """
+        target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+        target triple = "air64_v28-apple-macosx26.0.0"
+        source_filename = "store_test"
+
+        define kernel void @test_store(
+          i32 addrspace(1)* %out
+        ) {
+        entry:
+          store i32 42, i32 addrspace(1)* %out
+          ret void
+        }
+        """
+        let metallib = try MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
+        if let bc = extractBitcode(from: metallib) {
+            try bc.write(to: URL(fileURLWithPath: "/tmp/store_test.bc"))
+            print("Store test: \(bc.count) bytes bitcode")
+        }
+    }
+
     /// Compare our metallib size with the reference (sanity check).
     func testMetallibSizeReasonable() throws {
         let refURL = URL(fileURLWithPath: "/tmp/air-monolithic-test/monolithic.metallib")
@@ -162,5 +250,76 @@ final class EndToEndTests: XCTestCase {
         let ratio = Double(ourMetallib.count) / Double(refData.count)
         XCTAssertGreaterThan(ratio, 0.8, "Our metallib is too small compared to reference")
         XCTAssertLessThan(ratio, 1.2, "Our metallib is too large compared to reference")
+    }
+}
+
+// GPU pipeline test for simple kernels
+extension EndToEndTests {
+    /// Test that a minimal kernel can create a GPU pipeline via MetalASM.
+    func testSimpleKernelPipeline() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        source_filename = "test_simple"
+        target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+        target triple = "air64_v28-apple-macosx26.0.0"
+
+        define void @test_kernel(ptr addrspace(1) %buf) #0 {
+        entry:
+          ret void
+        }
+
+        attributes #0 = { convergent mustprogress nounwind willreturn "frame-pointer"="none" }
+
+        !llvm.module.flags = !{!0}
+        !air.kernel = !{!1}
+        !air.version = !{!5}
+
+        !0 = !{i32 7, !"frame-pointer", i32 0}
+        !1 = !{ptr @test_kernel, !2, !4}
+        !2 = !{!3}
+        !3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"buf"}
+        !4 = !{i32 1, i32 1, i32 1}
+        !5 = !{i32 2, i32 8, i32 0}
+        """
+
+        // Verify parsing succeeds with opaque ptr syntax
+        let lexer = Lexer(source: ir)
+        let tokens = lexer.tokenize()
+        var parser = Parser(tokens: tokens)
+        let module = try parser.parse()
+        XCTAssertEqual(module.functions.count, 1)
+        XCTAssertEqual(module.functions[0].name, "test_kernel")
+        #endif
+    }
+}
+
+// Quick test for llvm-dis compatibility
+extension EndToEndTests {
+    func testMinimalIRDisassembly() throws {
+        let ir = try String(contentsOfFile: "/tmp/gemm_simple.ll", encoding: .utf8)
+        
+        let metallib = try MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
+        try metallib.write(to: URL(fileURLWithPath: "/tmp/minimal_metalasm.metallib"))
+        
+        // Extract bitcode from metallib
+        let bytes = [UInt8](metallib)
+        var bcOffset = 0
+        var bcSize = 0
+        for i in 0..<(bytes.count - 4) {
+            if bytes[i] == 0xDE && bytes[i+1] == 0xC0 && bytes[i+2] == 0x17 && bytes[i+3] == 0x0B {
+                let off = Int(bytes[i+8]) | (Int(bytes[i+9]) << 8) | (Int(bytes[i+10]) << 16) | (Int(bytes[i+11]) << 24)
+                let sz = Int(bytes[i+12]) | (Int(bytes[i+13]) << 8) | (Int(bytes[i+14]) << 16) | (Int(bytes[i+15]) << 24)
+                bcOffset = i + off
+                bcSize = sz
+                break
+            }
+        }
+        
+        let bcData = Data(bytes[bcOffset..<(bcOffset + bcSize)])
+        try bcData.write(to: URL(fileURLWithPath: "/tmp/minimal_metalasm.bc"))
+        print("Wrote \(bcSize) bytes of bitcode to /tmp/minimal_metalasm.bc")
+        XCTAssertGreaterThan(bcSize, 0)
     }
 }

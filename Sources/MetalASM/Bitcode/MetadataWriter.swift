@@ -1,4 +1,5 @@
-/// Writes METADATA_BLOCK and METADATA_KIND_BLOCK in LLVM bitcode format.
+/// Writes METADATA_BLOCK, METADATA_KIND_BLOCK, OPERAND_BUNDLE_TAGS_BLOCK,
+/// and Block 26 (singlethread) in LLVM bitcode format.
 final class MetadataWriter {
     // METADATA_BLOCK record codes
     static let stringOldCode: UInt64 = 1   // METADATA_STRING (old, deprecated)
@@ -10,27 +11,91 @@ final class MetadataWriter {
     static let namedNodeCode: UInt64 = 10  // METADATA_NAMED_NODE
     static let stringCode: UInt64 = 11     // METADATA_STRINGS (new, with count+offset)
 
-    /// METADATA_BLOCK ID.
-    static let blockID: UInt64 = 15
+    /// Block IDs.
+    static let metadataBlockID: UInt64 = 15
+    static let metadataKindBlockID: UInt64 = 22
+    static let operandBundleTagsBlockID: UInt64 = 21
+    static let singlethreadBlockID: UInt64 = 26
+
+    /// Standard LLVM metadata kind names (must match metal-as output exactly).
+    static let standardMetadataKinds: [String] = [
+        "dbg", "tbaa", "prof", "fpmath", "range", "tbaa.struct",
+        "invariant.load", "alias.scope", "noalias", "nontemporal",
+        "llvm.mem.parallel_loop_access", "nonnull", "dereferenceable",
+        "dereferenceable_or_null", "make.implicit", "unpredictable",
+        "invariant.group", "align", "llvm.loop", "type",
+        "section_prefix", "absolute_symbol", "associated", "callees",
+        "irr_loop", "llvm.access.group", "callback",
+        "llvm.preserve.access.index", "vcall_visibility", "noundef",
+        "annotation", "heapallocsite", "air.function_groups",
+    ]
+
+    /// Standard operand bundle tag names.
+    static let standardOperandBundleTags: [String] = [
+        "deopt", "funclet", "gc-transition", "cfguardtarget",
+        "preallocated", "gc-live", "clang.arc.attachedcall", "ptrauth",
+    ]
+
+    /// Write the METADATA_KIND_BLOCK (standard metadata kind definitions).
+    static func writeMetadataKindBlock(to writer: BitstreamWriter) {
+        writer.enterSubblock(blockID: metadataKindBlockID, abbrevLen: 3)
+
+        for (idx, name) in standardMetadataKinds.enumerated() {
+            // KIND record: [kind_id, ...name_chars]
+            var operands: [UInt64] = [UInt64(idx)]
+            for b in name.utf8 { operands.append(UInt64(b)) }
+            writer.emitUnabbrevRecord(code: kindCode, operands: operands)
+        }
+
+        writer.exitBlock()
+    }
+
+    /// Write the OPERAND_BUNDLE_TAGS_BLOCK.
+    static func writeOperandBundleTagsBlock(to writer: BitstreamWriter) {
+        writer.enterSubblock(blockID: operandBundleTagsBlockID, abbrevLen: 3)
+
+        for tag in standardOperandBundleTags {
+            // OPERAND_BUNDLE_TAG record (code 1): [...name_chars]
+            var operands: [UInt64] = []
+            for b in tag.utf8 { operands.append(UInt64(b)) }
+            writer.emitUnabbrevRecord(code: 1, operands: operands)
+        }
+
+        writer.exitBlock()
+    }
+
+    /// Write Block 26 (singlethread execution width info).
+    static func writeSinglethreadBlock(to writer: BitstreamWriter) {
+        writer.enterSubblock(blockID: singlethreadBlockID, abbrevLen: 2)
+
+        // UnknownCode1 record: "singlethread"
+        var operands: [UInt64] = []
+        for b in "singlethread".utf8 { operands.append(UInt64(b)) }
+        writer.emitUnabbrevRecord(code: 1, operands: operands)
+
+        writer.exitBlock()
+    }
 
     /// Write the METADATA_BLOCK for the module.
-    static func write(to writer: BitstreamWriter, module: IRModule, enumerator: ValueEnumerator) {
+    ///
+    /// LLVM bitcode metadata ID assignment:
+    ///   0..stringCount-1  → METADATA_STRING records
+    ///   stringCount..stringCount+valueCount-1  → METADATA_VALUE records
+    ///   stringCount+valueCount..  → METADATA_NODE records
+    static func write(to writer: BitstreamWriter, module: IRModule, enumerator: ValueEnumerator, moduleConstants: BitcodeWriter.ModuleConstantMap = BitcodeWriter.ModuleConstantMap()) {
         // Skip if no metadata
         guard !module.metadataNodes.isEmpty || !module.namedMetadata.isEmpty else {
             return
         }
 
-        writer.enterSubblock(blockID: blockID, abbrevLen: 4)
+        writer.enterSubblock(blockID: metadataBlockID, abbrevLen: 4)
 
-        // Emit all metadata nodes first
-        // We need to emit them in index order
         let sortedNodes = module.metadataNodes.sorted { $0.index < $1.index }
 
-        // Build a metadata string table: collect all strings referenced by metadata
+        // --- Phase 1: Collect metadata strings ---
         var metadataStrings: [String] = []
         var stringToIndex: [String: Int] = [:]
 
-        // Collect strings from metadata operands
         for node in sortedNodes {
             for op in node.operands {
                 if case .string(let s) = op {
@@ -42,61 +107,113 @@ final class MetadataWriter {
             }
         }
 
-        // Emit metadata strings using old-style METADATA_STRING records
-        // (simpler than the new METADATA_STRINGS blob format)
-        for str in metadataStrings {
-            let bytes = Array(str.utf8)
-            var operands: [UInt64] = []
-            for b in bytes {
-                operands.append(UInt64(b))
+        // --- Phase 2: Collect METADATA_VALUE entries ---
+        // Each .constant or .value operand needs its own METADATA_VALUE record.
+        // METADATA_VALUE [type_index, value_id] where value_id refers to a constant
+        // in the module-level CONSTANTS_BLOCK or a global/function.
+        struct MetadataValueEntry: Hashable {
+            let typeIdx: Int
+            let valueID: UInt64  // absolute value ID in the module value table
+        }
+        var metadataValues: [MetadataValueEntry] = []
+        var valueToIndex: [MetadataValueEntry: Int] = [:]
+
+        func registerMetadataValue(_ entry: MetadataValueEntry) -> Int {
+            if let existing = valueToIndex[entry] {
+                return existing
             }
+            let idx = metadataValues.count
+            valueToIndex[entry] = idx
+            metadataValues.append(entry)
+            return idx
+        }
+
+        // Pre-scan all nodes to collect VALUE entries
+        for node in sortedNodes {
+            for op in node.operands {
+                switch op {
+                case .constant(let type, let constant):
+                    let typeIdx = enumerator.typeIndex(type)
+                    // Look up the value ID from the module constants map
+                    let encoded: UInt64
+                    switch constant {
+                    case .integer(_, let val):
+                        encoded = val >= 0 ? UInt64(val) << 1 : (UInt64(bitPattern: -val) << 1) | 1
+                    default: encoded = 0
+                    }
+                    let key = "\(type):\(encoded)"
+                    let valID = UInt64(moduleConstants.valueMap[key] ?? 0)
+                    _ = registerMetadataValue(MetadataValueEntry(typeIdx: typeIdx, valueID: valID))
+
+                case .value(let type, let name):
+                    let typeIdx = enumerator.typeIndex(type)
+                    // Function/global references use their global value ID directly
+                    let valID = UInt64(enumerator.globalValueID(name: name) ?? 0)
+                    _ = registerMetadataValue(MetadataValueEntry(typeIdx: typeIdx, valueID: valID))
+
+                default:
+                    break
+                }
+            }
+        }
+
+        let stringCount = metadataStrings.count
+        let valueCount = metadataValues.count
+
+        // --- Phase 3: Emit metadata strings ---
+        for str in metadataStrings {
+            var operands: [UInt64] = []
+            for b in str.utf8 { operands.append(UInt64(b)) }
             writer.emitUnabbrevRecord(code: stringOldCode, operands: operands)
         }
 
-        // Emit metadata nodes
-        // Metadata IDs: strings come first (0..stringCount-1), then nodes
-        let stringCount = metadataStrings.count
+        // --- Phase 4: Emit METADATA_VALUE records ---
+        // Each gets a metadata ID = stringCount + valueIndex
+        // METADATA_VALUE: [type_index, value_id]
+        for entry in metadataValues {
+            writer.emitUnabbrevRecord(code: valueCode, operands: [
+                UInt64(entry.typeIdx),
+                entry.valueID
+            ])
+        }
 
+        // --- Phase 5: Emit METADATA_NODE records ---
+        // Each node gets metadata ID = stringCount + valueCount + nodeIndex
+        // IMPORTANT: LLVM METADATA_NODE operands use (metadata_id + 1), where 0 = null
         for node in sortedNodes {
             var operands: [UInt64] = []
             for op in node.operands {
                 switch op {
                 case .string(let s):
-                    // Reference to metadata string
-                    let strIdx = stringToIndex[s]!
-                    operands.append(UInt64(strIdx))
+                    operands.append(UInt64(stringToIndex[s]!) + 1)
 
                 case .metadata(let idx):
-                    // Reference to another metadata node
-                    // The ID is stringCount + nodeIndex
-                    operands.append(UInt64(stringCount + idx))
+                    // Reference to another node: ID = stringCount + valueCount + nodeIndex
+                    operands.append(UInt64(stringCount + valueCount + idx) + 1)
 
                 case .constant(let type, let constant):
-                    // METADATA_VALUE: type_id, value
-                    // For constants embedded in metadata, we need to emit them inline
-                    // Using a simplified approach: emit type index and constant value
+                    // Reference to the METADATA_VALUE we emitted
                     let typeIdx = enumerator.typeIndex(type)
-                    operands.append(UInt64(typeIdx))
+                    let encoded: UInt64
                     switch constant {
                     case .integer(_, let val):
-                        operands.append(UInt64(bitPattern: val))
-                    default:
-                        operands.append(0)
+                        encoded = val >= 0 ? UInt64(val) << 1 : (UInt64(bitPattern: -val) << 1) | 1
+                    default: encoded = 0
                     }
+                    let key = "\(type):\(encoded)"
+                    let valID = UInt64(moduleConstants.valueMap[key] ?? 0)
+                    let entry = MetadataValueEntry(typeIdx: typeIdx, valueID: valID)
+                    let valueIdx = valueToIndex[entry]!
+                    operands.append(UInt64(stringCount + valueIdx) + 1)
 
                 case .value(let type, let name):
-                    // Reference to a function/global as metadata value
                     let typeIdx = enumerator.typeIndex(type)
-                    operands.append(UInt64(typeIdx))
-                    if let valID = enumerator.globalValueID(name: name) {
-                        operands.append(UInt64(valID))
-                    } else {
-                        operands.append(0)
-                    }
+                    let valID = UInt64(enumerator.globalValueID(name: name) ?? 0)
+                    let entry = MetadataValueEntry(typeIdx: typeIdx, valueID: valID)
+                    let valueIdx = valueToIndex[entry]!
+                    operands.append(UInt64(stringCount + valueIdx) + 1)
 
                 case .null:
-                    // Null metadata operand: use a special sentinel
-                    // In LLVM bitcode, null metadata is represented by type=0 (void)
                     operands.append(0)
                 }
             }
@@ -105,20 +222,16 @@ final class MetadataWriter {
             writer.emitUnabbrevRecord(code: code, operands: operands)
         }
 
-        // Emit named metadata
+        // --- Phase 6: Emit named metadata ---
         for named in module.namedMetadata {
-            // METADATA_NAME: emit the name as chars
-            let nameBytes = Array(named.name.utf8)
             var nameOps: [UInt64] = []
-            for b in nameBytes {
-                nameOps.append(UInt64(b))
-            }
+            for b in named.name.utf8 { nameOps.append(UInt64(b)) }
             writer.emitUnabbrevRecord(code: nameCode, operands: nameOps)
 
-            // METADATA_NAMED_NODE: emit references to metadata nodes
+            // NAMED_NODE operands also use metadata_id + 1
             var nodeOps: [UInt64] = []
             for idx in named.operands {
-                nodeOps.append(UInt64(stringCount + idx))
+                nodeOps.append(UInt64(stringCount + valueCount + idx))
             }
             writer.emitUnabbrevRecord(code: namedNodeCode, operands: nodeOps)
         }

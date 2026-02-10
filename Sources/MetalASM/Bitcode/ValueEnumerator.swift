@@ -112,6 +112,9 @@ final class ValueEnumerator {
             }
         }
 
+        // 3b. Enumerate metadata and label types (always needed by LLVM)
+        enumerateType(.metadata)
+
         // 4. Enumerate types used in metadata
         for node in module.metadataNodes {
             for op in node.operands {
@@ -215,5 +218,13 @@ final class ValueEnumerator {
     /// Total number of global values.
     var globalValueCount: Int {
         return globalValues.count
+    }
+
+    /// Find a function by name.
+    func findFunction(named name: String) -> IRFunction? {
+        for fn in module.functions {
+            if fn.name == name { return fn }
+        }
+        return nil
     }
 }

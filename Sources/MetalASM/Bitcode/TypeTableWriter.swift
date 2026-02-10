@@ -22,6 +22,7 @@ final class TypeTableWriter {
     static let structNamedCode: UInt64 = 20
     static let functionCode: UInt64 = 21  // function type (new style)
     static let tokenCode: UInt64 = 22
+    static let bfloatCode: UInt64 = 23
 
     /// TYPE_BLOCK ID.
     static let blockID: UInt64 = 17
@@ -51,6 +52,9 @@ final class TypeTableWriter {
 
         case .float16:
             writer.emitUnabbrevRecord(code: halfCode, operands: [])
+
+        case .bfloat16:
+            writer.emitUnabbrevRecord(code: bfloatCode, operands: [])
 
         case .float32:
             writer.emitUnabbrevRecord(code: floatCode, operands: [])
@@ -99,11 +103,9 @@ final class TypeTableWriter {
         case .structure(let name, let elems, let isPacked):
             if let name = name {
                 // Named struct: first emit name, then body
-                writer.emitUnabbrevRecordWithBlob(
-                    code: structNameCode,
-                    operands: [],
-                    blob: Array(name.utf8)
-                )
+                var nameOps: [UInt64] = []
+                for b in name.utf8 { nameOps.append(UInt64(b)) }
+                writer.emitUnabbrevRecord(code: structNameCode, operands: nameOps)
                 // STRUCT_NAMED: [isPacked, ...elementTypes]
                 var operands: [UInt64] = [isPacked ? 1 : 0]
                 for elem in elems {
@@ -120,13 +122,11 @@ final class TypeTableWriter {
             }
 
         case .opaque(let name):
-            // Opaque struct: emit name first, then OPAQUE
-            writer.emitUnabbrevRecordWithBlob(
-                code: structNameCode,
-                operands: [],
-                blob: Array(name.utf8)
-            )
-            writer.emitUnabbrevRecord(code: opaqueCode, operands: [])
+            // Opaque struct: emit name first, then OPAQUE [ispacked]
+            var nameOps: [UInt64] = []
+            for b in name.utf8 { nameOps.append(UInt64(b)) }
+            writer.emitUnabbrevRecord(code: structNameCode, operands: nameOps)
+            writer.emitUnabbrevRecord(code: opaqueCode, operands: [0])  // ispacked=0
         }
     }
 }

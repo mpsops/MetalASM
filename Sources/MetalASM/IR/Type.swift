@@ -6,6 +6,7 @@ public indirect enum IRType: Hashable {
     case void
     case int(bits: Int)          // i1, i8, i16, i32, i64
     case float16                 // half
+    case bfloat16                // bfloat
     case float32                 // float
     case float64                 // double
     case pointer(pointee: IRType, addressSpace: Int)  // typed pointer: T addrspace(N)*

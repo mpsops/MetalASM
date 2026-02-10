@@ -329,6 +329,22 @@ public struct Parser {
             linkage = l
         }
 
+        // Parse optional calling convention
+        var callingConvention: IRFunction.CallingConvention = .c
+        if consumeIfKeyword("kernel") || consumeIfKeyword("spir_kernel") {
+            callingConvention = .spirKernel
+        } else if consumeIfKeyword("spir_func") {
+            callingConvention = .spirFunc
+        } else if consumeIfKeyword("ccc") {
+            callingConvention = .c
+        } else if consumeIfKeyword("fastcc") {
+            callingConvention = .fast
+        } else if consumeIfKeyword("coldcc") {
+            callingConvention = .cold
+        } else if consumeIfKeyword("swiftcc") {
+            callingConvention = .swiftcc
+        }
+
         // Parse return attributes and modifiers
         var localUnnamedAddr = false
         while true {
@@ -406,6 +422,7 @@ public struct Parser {
             isDeclaration: isDeclaration
         )
         fn.linkage = linkage
+        fn.callingConvention = callingConvention
         fn.localUnnamedAddr = localUnnamedAddr
         fn.parameterNames = paramNames
         fn.parameterStringAttributes = paramStringAttrs
@@ -513,7 +530,7 @@ public struct Parser {
                 if !isFirstBlock || !currentBlock.instructions.isEmpty {
                     blocks.append(currentBlock)
                 }
-                let labelName = String(advance().text.dropFirst()) // remove ':'
+                let labelName = String(advance().text.dropLast()) // remove trailing ':'
                 currentBlock = IRBasicBlock(name: labelName)
                 isFirstBlock = false
                 skipNewlines()
@@ -1193,11 +1210,25 @@ public struct Parser {
             case "i32": _ = advance(); baseType = .i32
             case "i64": _ = advance(); baseType = .i64
             case "half": _ = advance(); baseType = .float16
+            case "bfloat": _ = advance(); baseType = .bfloat16
             case "float": _ = advance(); baseType = .float32
             case "double": _ = advance(); baseType = .float64
             case "label": _ = advance(); baseType = .label
             case "metadata": _ = advance(); baseType = .metadata
             case "token": _ = advance(); baseType = .token
+            case "ptr":
+                _ = advance()
+                // Opaque pointer: ptr or ptr addrspace(N)
+                if current.kind == .keyword && current.text == "addrspace" {
+                    _ = advance()
+                    _ = try expect(.leftParen)
+                    let spaceTok = try expect(.integer)
+                    let addrSpace = Int(spaceTok.text) ?? 0
+                    _ = try expect(.rightParen)
+                    baseType = .pointer(pointee: .i8, addressSpace: addrSpace)
+                } else {
+                    baseType = .pointer(pointee: .i8, addressSpace: 0)
+                }
             case "opaque": _ = advance(); baseType = .opaque(name: "opaque")
             default:
                 // Check for iN (arbitrary width integer)
@@ -1363,19 +1394,33 @@ public struct Parser {
 
         case .integer:
             let text = advance().text
-            let value = Int64(text) ?? 0
+            let value: Int64
+            if text.hasPrefix("0x") || text.hasPrefix("0X") {
+                value = Int64(UInt64(String(text.dropFirst(2)), radix: 16) ?? 0)
+            } else {
+                value = Int64(text) ?? 0
+            }
             return .constant(.integer(type, value))
 
         case .float_:
             let text = advance().text
-            if text.hasPrefix("0x") {
-                // Hex float
+            if text.hasPrefix("0xH") {
+                // Half-precision hex float: 0xHXXXX (16-bit)
+                let hexStr = String(text.dropFirst(3))
+                let bits = UInt16(hexStr, radix: 16) ?? 0
+                return .constant(.float16(bits))
+            } else if text.hasPrefix("0x") {
+                // Hex float (double or float)
                 let hexStr = String(text.dropFirst(2))
                 if let bits = UInt64(hexStr, radix: 16) {
                     if case .float32 = type {
                         return .constant(.float32(Float(bitPattern: UInt32(bits & 0xFFFFFFFF))))
                     } else if case .float64 = type {
                         return .constant(.float64(Double(bitPattern: bits)))
+                    }
+                    // For half type with plain 0x prefix
+                    if case .float16 = type {
+                        return .constant(.float16(UInt16(bits & 0xFFFF)))
                     }
                 }
             }
@@ -1410,6 +1455,29 @@ public struct Parser {
                 return try parseConstantCast(type: type)
             }
             throw ParseError.unexpected("operand '\(text)'", line: current.line, column: current.column)
+
+        case .leftAngle:
+            // Vector constant literal: <i32 0, i32 1, ...>
+            _ = advance() // consume '<'
+            skipNewlines()
+            var elements: [IRConstant] = []
+            while current.kind != .rightAngle {
+                let elemType = try parseType()
+                let elemOp = try parseOperand(type: elemType)
+                switch elemOp {
+                case .constant(let c):
+                    elements.append(c)
+                default:
+                    // Non-constant in vector literal — treat as undef
+                    elements.append(.undef(elemType))
+                }
+                if current.kind == .comma {
+                    _ = advance()
+                    skipNewlines()
+                }
+            }
+            _ = try expect(.rightAngle)
+            return .constant(.vectorValue(type, elements))
 
         default:
             throw ParseError.unexpected(
@@ -1474,7 +1542,23 @@ public struct Parser {
             return .integer(type, Int64(text) ?? 0)
         case .float_:
             let text = advance().text
+            if text.hasPrefix("0xH") {
+                let bits = UInt16(String(text.dropFirst(3)), radix: 16) ?? 0
+                return .float16(bits)
+            } else if text.hasPrefix("0x") {
+                let hexStr = String(text.dropFirst(2))
+                if let bits = UInt64(hexStr, radix: 16) {
+                    if case .float32 = type {
+                        return .float32(Float(bitPattern: UInt32(bits & 0xFFFFFFFF)))
+                    }
+                    if case .float16 = type {
+                        return .float16(UInt16(bits & 0xFFFF))
+                    }
+                    return .float64(Double(bitPattern: bits))
+                }
+            }
             if let d = Double(text) {
+                if case .float32 = type { return .float32(Float(d)) }
                 return .float64(d)
             }
             return .float64(0)

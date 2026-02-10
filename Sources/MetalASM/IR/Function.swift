@@ -110,5 +110,7 @@ public final class IRFunction {
         case cold = 9
         case swiftcc = 16
         case cxxFastTLS = 17
+        case spirFunc = 75
+        case spirKernel = 76
     }
 }
