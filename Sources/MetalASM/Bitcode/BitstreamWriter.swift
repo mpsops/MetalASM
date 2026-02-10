@@ -1,0 +1,267 @@
+/// Low-level LLVM bitstream writer.
+///
+/// Emits bits LSB-first within each byte, supporting VBR encoding,
+/// block enter/exit, and unabbreviated records per the LLVM bitcode format.
+public final class BitstreamWriter {
+    /// The buffer accumulating output bytes.
+    private(set) var bytes: [UInt8] = []
+
+    /// Current byte being accumulated (not yet flushed).
+    private var currentByte: UInt8 = 0
+
+    /// Number of bits written into `currentByte` (0..7).
+    private var bitOffset: Int = 0
+
+    /// Stack of (blockStartByteIndex, outerAbbrevLen) for nested blocks.
+    private var blockStack: [(startIndex: Int, outerAbbrevLen: Int)] = []
+
+    /// Current abbreviation length (bits per abbrev id).
+    private var abbrevLen: Int = 2
+
+    // MARK: - Built-in abbrev IDs
+
+    /// END_BLOCK abbreviation ID.
+    static let endBlockAbbrevID: UInt64 = 0
+    /// ENTER_SUBBLOCK abbreviation ID.
+    static let enterSubblockAbbrevID: UInt64 = 1
+    /// DEFINE_ABBREV abbreviation ID.
+    static let defineAbbrevAbbrevID: UInt64 = 2
+    /// UNABBREV_RECORD abbreviation ID.
+    static let unabbrevRecordAbbrevID: UInt64 = 3
+
+    /// Total number of bits written so far.
+    var totalBits: Int {
+        bytes.count * 8 + bitOffset
+    }
+
+    public init() {}
+
+    // MARK: - Bit-level emission
+
+    /// Emit a single bit (0 or 1).
+    func emitBit(_ bit: UInt64) {
+        if (bit & 1) != 0 {
+            currentByte |= UInt8(1 << bitOffset)
+        }
+        bitOffset += 1
+        if bitOffset == 8 {
+            bytes.append(currentByte)
+            currentByte = 0
+            bitOffset = 0
+        }
+    }
+
+    /// Emit `numBits` low bits of `value`, LSB first.
+    func emit(_ value: UInt64, _ numBits: Int) {
+        assert(numBits >= 0 && numBits <= 64)
+        var val = value
+        var remaining = numBits
+        while remaining > 0 {
+            let bitsAvailable = 8 - bitOffset
+            let bitsToWrite = min(remaining, bitsAvailable)
+            let mask = UInt8((1 << bitsToWrite) - 1)
+            currentByte |= UInt8(val & UInt64(mask)) << bitOffset
+            val >>= bitsToWrite
+            bitOffset += bitsToWrite
+            remaining -= bitsToWrite
+            if bitOffset == 8 {
+                bytes.append(currentByte)
+                currentByte = 0
+                bitOffset = 0
+            }
+        }
+    }
+
+    /// Emit a value using Variable Bit Rate encoding with `numBits` chunk size.
+    /// Each chunk has (numBits-1) data bits + 1 continuation bit.
+    func emitVBR(_ value: UInt64, _ numBits: Int) {
+        assert(numBits >= 2)
+        let dataBits = numBits - 1
+        let dataMask: UInt64 = (1 << dataBits) - 1
+        var val = value
+        while true {
+            let chunk = val & dataMask
+            val >>= dataBits
+            if val == 0 {
+                emit(chunk, numBits)
+                return
+            }
+            // Set continuation bit
+            emit(chunk | (1 << dataBits), numBits)
+        }
+    }
+
+    /// Emit a signed value using VBR encoding.
+    /// Encodes sign in the LSB: positive n → 2n, negative n → (-2n) + 1.
+    func emitSignedVBR(_ value: Int64, _ numBits: Int) {
+        let encoded: UInt64
+        if value >= 0 {
+            encoded = UInt64(value) << 1
+        } else {
+            encoded = (UInt64(bitPattern: -value) << 1) | 1
+        }
+        emitVBR(encoded, numBits)
+    }
+
+    // MARK: - Alignment
+
+    /// Pad to 32-bit boundary with zero bits.
+    func alignTo32Bits() {
+        let totalBits = bytes.count * 8 + bitOffset
+        let remainder = totalBits % 32
+        if remainder != 0 {
+            let padding = 32 - remainder
+            emit(0, padding)
+        }
+    }
+
+    // MARK: - Block operations
+
+    /// Enter a sub-block. Emits ENTER_SUBBLOCK with the given block ID and
+    /// abbreviation length, then writes a placeholder for the block length.
+    func enterSubblock(blockID: UInt64, abbrevLen newAbbrevLen: Int) {
+        // Emit ENTER_SUBBLOCK abbreviation ID
+        emit(Self.enterSubblockAbbrevID, abbrevLen)
+        // Block ID as VBR8
+        emitVBR(blockID, 8)
+        // New abbreviation length as VBR4
+        emitVBR(UInt64(newAbbrevLen), 4)
+        // Align to 32-bit boundary before writing block length placeholder
+        alignTo32Bits()
+        // Save state: remember where the block length word will go
+        let startIndex = bytes.count
+        // Write placeholder for block length (in 32-bit words, excluding this word itself)
+        bytes.append(contentsOf: [0, 0, 0, 0])
+        blockStack.append((startIndex: startIndex, outerAbbrevLen: abbrevLen))
+        abbrevLen = newAbbrevLen
+    }
+
+    /// Exit the current sub-block. Writes END_BLOCK, aligns to 32 bits,
+    /// and patches the block length placeholder.
+    func exitBlock() {
+        guard let (startIndex, outerAbbrevLen) = blockStack.popLast() else {
+            fatalError("exitBlock called with no matching enterSubblock")
+        }
+        // Emit END_BLOCK abbreviation ID
+        emit(Self.endBlockAbbrevID, abbrevLen)
+        alignTo32Bits()
+        // Patch the block length: number of 32-bit words AFTER the length field
+        let blockContentBytes = bytes.count - startIndex - 4
+        assert(blockContentBytes % 4 == 0)
+        let blockLengthWords = UInt32(blockContentBytes / 4)
+        bytes[startIndex + 0] = UInt8(blockLengthWords & 0xFF)
+        bytes[startIndex + 1] = UInt8((blockLengthWords >> 8) & 0xFF)
+        bytes[startIndex + 2] = UInt8((blockLengthWords >> 16) & 0xFF)
+        bytes[startIndex + 3] = UInt8((blockLengthWords >> 24) & 0xFF)
+        abbrevLen = outerAbbrevLen
+    }
+
+    // MARK: - Records
+
+    /// Emit an unabbreviated record with the given code and operands.
+    /// All values are encoded as VBR6.
+    func emitUnabbrevRecord(code: UInt64, operands: [UInt64]) {
+        emit(Self.unabbrevRecordAbbrevID, abbrevLen)
+        emitVBR(code, 6)
+        emitVBR(UInt64(operands.count), 6)
+        for op in operands {
+            emitVBR(op, 6)
+        }
+    }
+
+    /// Emit an unabbreviated record with a trailing blob (array of chars/bytes).
+    /// Used for string records.
+    func emitUnabbrevRecordWithBlob(code: UInt64, operands: [UInt64], blob: [UInt8]) {
+        emit(Self.unabbrevRecordAbbrevID, abbrevLen)
+        emitVBR(code, 6)
+        // Total operands = operands.count + blob.count
+        emitVBR(UInt64(operands.count + blob.count), 6)
+        for op in operands {
+            emitVBR(op, 6)
+        }
+        for b in blob {
+            emitVBR(UInt64(b), 6)
+        }
+    }
+
+    // MARK: - Raw data emission
+
+    /// Write raw bytes directly (must be 32-bit aligned before calling).
+    func emitRawBytes(_ data: [UInt8]) {
+        assert(bitOffset == 0, "Must be byte-aligned to emit raw bytes")
+        bytes.append(contentsOf: data)
+    }
+
+    /// Emit the LLVM bitcode magic "BC\xC0\xDE" (4 bytes).
+    func emitBitcodeMagic() {
+        assert(bitOffset == 0)
+        bytes.append(contentsOf: [0x42, 0x43, 0xC0, 0xDE])
+    }
+
+    // MARK: - Abbreviation support
+
+    /// Emit a record using a defined abbreviation.
+    /// `abbrevID` is the abbreviation ID (>= 4).
+    /// `operands` are the operand values in order.
+    func emitAbbreviatedRecord(abbrevID: UInt64, operands: [UInt64]) {
+        emit(abbrevID, abbrevLen)
+        for op in operands {
+            emitVBR(op, 6)
+        }
+    }
+
+    /// Emit a DEFINE_ABBREV record.
+    /// `operandEncodings` is a list of (encoding_type, optional_data) pairs.
+    ///
+    /// Encoding types:
+    /// - 1: Fixed(N) - N bits
+    /// - 2: VBR(N) - VBR with N-bit chunks
+    /// - 3: Array - followed by element encoding
+    /// - 4: Char6 - 6-bit char
+    /// - 5: Blob - raw bytes
+    func emitDefineAbbrev(operandEncodings: [(type: UInt8, data: UInt64?)]) {
+        emit(Self.defineAbbrevAbbrevID, abbrevLen)
+        emitVBR(UInt64(operandEncodings.count), 5)
+        for (encType, encData) in operandEncodings {
+            // Is this a literal? (bit 0 = 1 means literal)
+            if encType == 0 {
+                // Literal encoding: emit 1 (isLiteral=true), then value
+                emitBit(1)
+                emitVBR(encData ?? 0, 8)
+            } else {
+                // Non-literal encoding: emit 0 (isLiteral=false), then encoding type
+                emitBit(0)
+                emit(UInt64(encType), 3)
+                if encType == 1 || encType == 2 {
+                    // Fixed or VBR: emit the width parameter
+                    emitVBR(encData ?? 0, 5)
+                }
+            }
+        }
+    }
+
+    /// Emit a record using a defined abbreviation with a trailing blob.
+    func emitAbbreviatedRecordWithBlob(abbrevID: UInt64, operands: [UInt64], blob: [UInt8]) {
+        emit(abbrevID, abbrevLen)
+        for op in operands {
+            emitVBR(op, 6)
+        }
+        // Blob: emit length as VBR6, align to 32 bits, emit raw bytes, align again
+        emitVBR(UInt64(blob.count), 6)
+        alignTo32Bits()
+        emitRawBytes(blob)
+        alignTo32Bits()
+    }
+
+    // MARK: - Output
+
+    /// Finalize and return the bitstream bytes.
+    /// Flushes any remaining partial byte.
+    func finalize() -> [UInt8] {
+        var result = bytes
+        if bitOffset > 0 {
+            result.append(currentByte)
+        }
+        return result
+    }
+}
