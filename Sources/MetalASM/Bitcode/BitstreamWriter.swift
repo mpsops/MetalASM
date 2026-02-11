@@ -12,8 +12,8 @@ public final class BitstreamWriter {
     /// Number of bits written into `currentByte` (0..7).
     private var bitOffset: Int = 0
 
-    /// Stack of (blockStartByteIndex, outerAbbrevLen) for nested blocks.
-    private var blockStack: [(startIndex: Int, outerAbbrevLen: Int)] = []
+    /// Stack of (blockStartByteIndex, outerAbbrevLen, outerNextAbbrevID, outerAbbrevDefs) for nested blocks.
+    private var blockStack: [(startIndex: Int, outerAbbrevLen: Int, outerNextAbbrevID: UInt64, outerAbbrevDefs: [UInt64: [(type: UInt8, data: UInt64)]])] = []
 
     /// Current abbreviation length (bits per abbrev id).
     private var abbrevLen: Int = 2
@@ -150,14 +150,16 @@ public final class BitstreamWriter {
         let startIndex = bytes.count
         // Write placeholder for block length (in 32-bit words, excluding this word itself)
         bytes.append(contentsOf: [0, 0, 0, 0])
-        blockStack.append((startIndex: startIndex, outerAbbrevLen: abbrevLen))
+        blockStack.append((startIndex: startIndex, outerAbbrevLen: abbrevLen, outerNextAbbrevID: nextAbbrevID, outerAbbrevDefs: abbrevDefs))
         abbrevLen = newAbbrevLen
+        nextAbbrevID = 4
+        abbrevDefs = [:]
     }
 
     /// Exit the current sub-block. Writes END_BLOCK, aligns to 32 bits,
     /// and patches the block length placeholder.
     func exitBlock() {
-        guard let (startIndex, outerAbbrevLen) = blockStack.popLast() else {
+        guard let (startIndex, outerAbbrevLen, outerNextAbbrevID, outerAbbrevDefs) = blockStack.popLast() else {
             fatalError("exitBlock called with no matching enterSubblock")
         }
         // Emit END_BLOCK abbreviation ID
@@ -172,6 +174,8 @@ public final class BitstreamWriter {
         bytes[startIndex + 2] = UInt8((blockLengthWords >> 16) & 0xFF)
         bytes[startIndex + 3] = UInt8((blockLengthWords >> 24) & 0xFF)
         abbrevLen = outerAbbrevLen
+        nextAbbrevID = outerNextAbbrevID
+        abbrevDefs = outerAbbrevDefs
     }
 
     // MARK: - Records
@@ -265,13 +269,40 @@ public final class BitstreamWriter {
 
     // MARK: - Abbreviation support
 
+    /// Stored abbreviation operand encodings, keyed by abbrevID.
+    /// Each entry is the list of non-literal operand encodings: (type, data).
+    /// Literal operands are omitted (emitted automatically by the definition).
+    private var abbrevDefs: [UInt64: [(type: UInt8, data: UInt64)]] = [:]
+
+    /// Next abbreviation ID to assign in the current block.
+    private var nextAbbrevID: UInt64 = 4
+
     /// Emit a record using a defined abbreviation.
     /// `abbrevID` is the abbreviation ID (>= 4).
-    /// `operands` are the operand values in order.
+    /// `operands` are the non-literal operand values in definition order.
     func emitAbbreviatedRecord(abbrevID: UInt64, operands: [UInt64]) {
         emit(abbrevID, abbrevLen)
-        for op in operands {
-            emitVBR(op, 6)
+        guard let encodings = abbrevDefs[abbrevID] else {
+            // Fallback: VBR6 for all (shouldn't happen if abbreviation was defined)
+            for op in operands {
+                emitVBR(op, 6)
+            }
+            return
+        }
+        var opIdx = 0
+        for enc in encodings {
+            let val = opIdx < operands.count ? operands[opIdx] : 0
+            switch enc.type {
+            case 1: // Fixed
+                emit(val, Int(enc.data))
+            case 2: // VBR
+                emitVBR(val, Int(enc.data))
+            case 4: // Char6
+                emit(val, 6)
+            default:
+                emitVBR(val, 6)
+            }
+            opIdx += 1
         }
     }
 
@@ -285,24 +316,32 @@ public final class BitstreamWriter {
     /// - 4: Char6 - 6-bit char
     /// - 5: Blob - raw bytes
     func emitDefineAbbrev(operandEncodings: [(type: UInt8, data: UInt64?)]) {
+        let thisID = nextAbbrevID
+        nextAbbrevID += 1
+
         emit(Self.defineAbbrevAbbrevID, abbrevLen)
         emitVBR(UInt64(operandEncodings.count), 5)
+
+        // Collect non-literal encodings for emitAbbreviatedRecord
+        var nonLiterals: [(type: UInt8, data: UInt64)] = []
+
         for (encType, encData) in operandEncodings {
-            // Is this a literal? (bit 0 = 1 means literal)
             if encType == 0 {
-                // Literal encoding: emit 1 (isLiteral=true), then value
+                // Literal encoding
                 emitBit(1)
                 emitVBR(encData ?? 0, 8)
+                // Literals are not passed as operands — skip
             } else {
-                // Non-literal encoding: emit 0 (isLiteral=false), then encoding type
                 emitBit(0)
                 emit(UInt64(encType), 3)
                 if encType == 1 || encType == 2 {
-                    // Fixed or VBR: emit the width parameter
                     emitVBR(encData ?? 0, 5)
                 }
+                nonLiterals.append((type: encType, data: encData ?? 0))
             }
         }
+
+        abbrevDefs[thisID] = nonLiterals
     }
 
     /// Emit a record using a defined abbreviation with a trailing blob.

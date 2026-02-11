@@ -60,6 +60,109 @@ final class FunctionWriter {
     static let constantsBlockID: UInt64 = 11
     static let valueSymtabBlockID: UInt64 = 14
 
+    // Abbreviation IDs (assigned sequentially from 4)
+    // These are defined per FUNCTION_BLOCK and provide compact encoding
+    // for the most common instruction patterns.
+    static let abbrevBinop: UInt64 = 4      // INST_BINOP: [relID, relID, opcode]
+    static let abbrevCast: UInt64 = 5       // INST_CAST: [relID, typeID, castop]
+    static let abbrevExtractElt: UInt64 = 6 // INST_EXTRACTELT: [relID, relID]
+    static let abbrevInsertElt: UInt64 = 7  // INST_INSERTELT: [relID, relID, relID]
+    static let abbrevLoad: UInt64 = 8       // INST_LOAD: [relID, typeID, align, volatile]
+    static let abbrevStore: UInt64 = 9      // INST_STORE: [relID, relID, align, volatile]
+    static let abbrevCmp: UInt64 = 10       // INST_CMP2: [relID, relID, predicate]
+    static let abbrevSelect: UInt64 = 11    // INST_SELECT: [relID, relID, relID]
+    static let abbrevBrUnc: UInt64 = 12     // INST_BR unconditional: [bbIdx]
+    static let abbrevBrCond: UInt64 = 13    // INST_BR conditional: [bbIdx, bbIdx, relID]
+    static let abbrevRet: UInt64 = 14       // INST_RET void: []
+    static let abbrevPhi2: UInt64 = 15      // INST_PHI 2-entry: [typeID, val, bb, val, bb]
+
+    /// Define abbreviations for common instruction patterns.
+    /// Must be called right after entering FUNCTION_BLOCK.
+    private static func defineAbbreviations(to writer: BitstreamWriter) {
+        // Abbrev 4: BINOP [code=Fixed6, relID=VBR8, relID=VBR8, opcode=Fixed4]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instBinopCode)),   // literal: code = 2
+            (2, 8),                        // VBR8: lhs relID
+            (2, 8),                        // VBR8: rhs relID
+            (1, 4),                        // Fixed4: binop opcode (0-12)
+        ])
+        // Abbrev 5: CAST [code=Fixed6, relID=VBR8, typeID=VBR6, castop=Fixed4]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instCastCode)),
+            (2, 8),                        // VBR8: operand relID
+            (2, 6),                        // VBR6: dest type ID
+            (1, 4),                        // Fixed4: cast opcode (0-12)
+        ])
+        // Abbrev 6: EXTRACTELT [code, relID, relID]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instExtractEltCode)),
+            (2, 8),
+            (2, 8),
+        ])
+        // Abbrev 7: INSERTELT [code, relID, relID, relID]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instInsertEltCode)),
+            (2, 8),
+            (2, 8),
+            (2, 8),
+        ])
+        // Abbrev 8: LOAD [code, relID, typeID, align, volatile]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instLoadCode)),
+            (2, 8),                        // VBR8: ptr relID
+            (2, 6),                        // VBR6: type ID
+            (1, 4),                        // Fixed4: align
+            (1, 1),                        // Fixed1: volatile
+        ])
+        // Abbrev 9: STORE [code, relID, relID, align, volatile]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instStoreCode)),
+            (2, 8),
+            (2, 8),
+            (1, 4),                        // Fixed4: align
+            (1, 1),                        // Fixed1: volatile
+        ])
+        // Abbrev 10: CMP2 [code, relID, relID, predicate]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instCmp2Code)),
+            (2, 8),
+            (2, 8),
+            (1, 6),                        // Fixed6: predicate
+        ])
+        // Abbrev 11: SELECT [code, relID, relID, relID]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instSelectCode)),
+            (2, 8),
+            (2, 8),
+            (2, 8),
+        ])
+        // Abbrev 12: BR unconditional [code, bbIdx]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instBrCode)),
+            (2, 6),                        // VBR6: bb index
+        ])
+        // Abbrev 13: BR conditional [code, bbIdx, bbIdx, relID]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instBrCode)),
+            (2, 6),
+            (2, 6),
+            (2, 8),
+        ])
+        // Abbrev 14: RET void [code]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instRetCode)),
+        ])
+        // Abbrev 15: PHI 2-entry [code, typeID, sval, bb, sval, bb]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instPhiCode)),
+            (2, 6),                        // VBR6: type ID
+            (2, 8),                        // VBR8: val0 (signed encoded)
+            (2, 6),                        // VBR6: bb0
+            (2, 8),                        // VBR8: val1
+            (2, 6),                        // VBR6: bb1
+        ])
+    }
+
     /// Write a FUNCTION_BLOCK for a defined function.
     static func write(
         to writer: BitstreamWriter,
@@ -70,6 +173,9 @@ final class FunctionWriter {
         guard !function.isDeclaration else { return }
 
         writer.enterSubblock(blockID: functionBlockID, abbrevLen: 5)
+
+        // Define abbreviations for compact encoding
+        defineAbbreviations(to: writer)
 
         // DECLAREBLOCKS: number of basic blocks
         writer.emitUnabbrevRecord(code: declareBlocksCode, operands: [
@@ -358,7 +464,7 @@ final class FunctionWriter {
         switch inst.opcode {
         case .ret:
             if inst.type.isVoid && inst.operands.isEmpty {
-                writer.emitUnabbrevRecord(code: instRetCode)
+                writer.emitAbbreviatedRecord(abbrevID: abbrevRet, operands: [])
             } else if let op = inst.operands.first {
                 let valID = resolveOperand(op)
                 writer.emitUnabbrevRecord(code: instRetCode, relativeID(valID))
@@ -370,7 +476,7 @@ final class FunctionWriter {
                 if case .basicBlock(let bb) = inst.operands[0] {
                     bbIdx = UInt64(bbIndexMap[bb.name] ?? 0)
                 } else { bbIdx = 0 }
-                writer.emitUnabbrevRecord(code: instBrCode, bbIdx)
+                writer.emitAbbreviatedRecord(abbrevID: abbrevBrUnc, operands: [bbIdx])
             } else if inst.operands.count == 3 {
                 let trueBBIdx: UInt64
                 let falseBBIdx: UInt64
@@ -381,7 +487,7 @@ final class FunctionWriter {
                     falseBBIdx = UInt64(bbIndexMap[bb.name] ?? 0)
                 } else { falseBBIdx = 0 }
                 let condID = resolveOperand(inst.operands[0])
-                writer.emitUnabbrevRecord(code: instBrCode, trueBBIdx, falseBBIdx, relativeID(condID))
+                writer.emitAbbreviatedRecord(abbrevID: abbrevBrCond, operands: [trueBBIdx, falseBBIdx, relativeID(condID)])
             }
 
         case .alloca:
@@ -408,21 +514,21 @@ final class FunctionWriter {
         case .load:
             if let op = inst.operands.first {
                 let valID = resolveOperand(op)
-                writer.emitUnabbrevRecord(code: instLoadCode,
+                writer.emitAbbreviatedRecord(abbrevID: abbrevLoad, operands: [
                     relativeID(valID),
                     UInt64(enumerator.typeIndex(inst.type)),
                     UInt64(log2Align(inst.attributes.alignment ?? 1)),
-                    inst.attributes.isVolatile ? 1 : 0)
+                    inst.attributes.isVolatile ? 1 : 0])
             }
 
         case .store:
             if inst.operands.count >= 2 {
                 let valID = resolveOperand(inst.operands[0])
                 let ptrID = resolveOperand(inst.operands[1])
-                writer.emitUnabbrevRecord(code: instStoreCode,
+                writer.emitAbbreviatedRecord(abbrevID: abbrevStore, operands: [
                     relativeID(ptrID), relativeID(valID),
                     UInt64(log2Align(inst.attributes.alignment ?? 1)),
-                    inst.attributes.isVolatile ? 1 : 0)
+                    inst.attributes.isVolatile ? 1 : 0])
             }
 
         case .getelementptr:
@@ -441,10 +547,10 @@ final class FunctionWriter {
              .fpTrunc, .fpExt, .ptrToInt, .intToPtr, .addrSpaceCast:
             if let op = inst.operands.first {
                 let valID = resolveOperand(op)
-                writer.emitUnabbrevRecord(code: instCastCode,
+                writer.emitAbbreviatedRecord(abbrevID: abbrevCast, operands: [
                     relativeID(valID),
                     UInt64(enumerator.typeIndex(inst.type)),
-                    UInt64(castOpcode(inst.opcode)))
+                    UInt64(castOpcode(inst.opcode))])
             }
 
         case .add, .fadd, .sub, .fsub, .mul, .fmul, .udiv, .sdiv, .fdiv,
@@ -452,16 +558,16 @@ final class FunctionWriter {
             if inst.operands.count >= 2 {
                 let lhs = resolveOperand(inst.operands[0])
                 let rhs = resolveOperand(inst.operands[1])
-                writer.emitUnabbrevRecord(code: instBinopCode,
-                    relativeID(lhs), relativeID(rhs), UInt64(binopOpcode(inst.opcode)))
+                writer.emitAbbreviatedRecord(abbrevID: abbrevBinop, operands: [
+                    relativeID(lhs), relativeID(rhs), UInt64(binopOpcode(inst.opcode))])
             }
 
         case .icmp, .fcmp:
             if inst.operands.count >= 2 {
                 let lhs = resolveOperand(inst.operands[0])
                 let rhs = resolveOperand(inst.operands[1])
-                writer.emitUnabbrevRecord(code: instCmp2Code,
-                    relativeID(lhs), relativeID(rhs), UInt64(inst.attributes.predicate ?? 0))
+                writer.emitAbbreviatedRecord(abbrevID: abbrevCmp, operands: [
+                    relativeID(lhs), relativeID(rhs), UInt64(inst.attributes.predicate ?? 0)])
             }
 
         case .call:
@@ -517,39 +623,54 @@ final class FunctionWriter {
         case .phi:
             // INST_PHI: [ty, val0, bb0, val1, bb1, ...]
             // Values are encoded as signed VBR relative IDs
-            var operands: [UInt64] = [UInt64(enumerator.typeIndex(inst.type))]
-            // PHI operands come in (value, basicblock) pairs
-            var i = 0
-            while i + 1 < inst.operands.count {
-                let valID = resolveOperand(inst.operands[i])
-                // PHI values use signed relative encoding
-                let rel = Int64(currentValueID) - Int64(valID)
-                let encoded: UInt64 = rel >= 0 ? UInt64(rel) << 1 : (UInt64(-rel) << 1) | 1
-                operands.append(encoded)
-                // BB index
-                if case .basicBlock(let bb) = inst.operands[i+1] {
-                    operands.append(UInt64(bbIndexMap[bb.name] ?? 0))
-                } else {
-                    operands.append(0)
+            let typeID = UInt64(enumerator.typeIndex(inst.type))
+
+            // Fast path: 2-entry phi (most common) uses abbreviation
+            if inst.operands.count == 4 {
+                let v0 = resolveOperand(inst.operands[0])
+                let r0 = Int64(currentValueID) - Int64(v0)
+                let e0: UInt64 = r0 >= 0 ? UInt64(r0) << 1 : (UInt64(-r0) << 1) | 1
+                let bb0: UInt64
+                if case .basicBlock(let bb) = inst.operands[1] { bb0 = UInt64(bbIndexMap[bb.name] ?? 0) } else { bb0 = 0 }
+                let v1 = resolveOperand(inst.operands[2])
+                let r1 = Int64(currentValueID) - Int64(v1)
+                let e1: UInt64 = r1 >= 0 ? UInt64(r1) << 1 : (UInt64(-r1) << 1) | 1
+                let bb1: UInt64
+                if case .basicBlock(let bb) = inst.operands[3] { bb1 = UInt64(bbIndexMap[bb.name] ?? 0) } else { bb1 = 0 }
+                writer.emitAbbreviatedRecord(abbrevID: abbrevPhi2, operands: [typeID, e0, bb0, e1, bb1])
+            } else {
+                var operands: [UInt64] = [typeID]
+                var i = 0
+                while i + 1 < inst.operands.count {
+                    let valID = resolveOperand(inst.operands[i])
+                    let rel = Int64(currentValueID) - Int64(valID)
+                    let encoded: UInt64 = rel >= 0 ? UInt64(rel) << 1 : (UInt64(-rel) << 1) | 1
+                    operands.append(encoded)
+                    if case .basicBlock(let bb) = inst.operands[i+1] {
+                        operands.append(UInt64(bbIndexMap[bb.name] ?? 0))
+                    } else {
+                        operands.append(0)
+                    }
+                    i += 2
                 }
-                i += 2
+                writer.emitUnabbrevRecord(code: instPhiCode, operands: operands)
             }
-            writer.emitUnabbrevRecord(code: instPhiCode, operands: operands)
 
         case .select:
             if inst.operands.count >= 3 {
                 let cond = resolveOperand(inst.operands[0])
                 let trueVal = resolveOperand(inst.operands[1])
                 let falseVal = resolveOperand(inst.operands[2])
-                writer.emitUnabbrevRecord(code: instSelectCode,
-                    relativeID(trueVal), relativeID(falseVal), relativeID(cond))
+                writer.emitAbbreviatedRecord(abbrevID: abbrevSelect, operands: [
+                    relativeID(trueVal), relativeID(falseVal), relativeID(cond)])
             }
 
         case .extractElement:
             if inst.operands.count >= 2 {
                 let vec = resolveOperand(inst.operands[0])
                 let idx = resolveOperand(inst.operands[1])
-                writer.emitUnabbrevRecord(code: instExtractEltCode, relativeID(vec), relativeID(idx))
+                writer.emitAbbreviatedRecord(abbrevID: abbrevExtractElt, operands: [
+                    relativeID(vec), relativeID(idx)])
             }
 
         case .insertElement:
@@ -557,8 +678,8 @@ final class FunctionWriter {
                 let vec = resolveOperand(inst.operands[0])
                 let elt = resolveOperand(inst.operands[1])
                 let idx = resolveOperand(inst.operands[2])
-                writer.emitUnabbrevRecord(code: instInsertEltCode,
-                    relativeID(vec), relativeID(elt), relativeID(idx))
+                writer.emitAbbreviatedRecord(abbrevID: abbrevInsertElt, operands: [
+                    relativeID(vec), relativeID(elt), relativeID(idx)])
             }
 
         case .shuffleVector:
