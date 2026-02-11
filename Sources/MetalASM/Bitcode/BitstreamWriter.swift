@@ -36,6 +36,11 @@ public final class BitstreamWriter {
 
     public init() {}
 
+    /// Initialize with a capacity hint (bytes).
+    public init(capacity: Int) {
+        bytes.reserveCapacity(capacity)
+    }
+
     // MARK: - Bit-level emission
 
     /// Emit a single bit (0 or 1).
@@ -52,33 +57,47 @@ public final class BitstreamWriter {
     }
 
     /// Emit `numBits` low bits of `value`, LSB first.
+    @inline(__always)
     func emit(_ value: UInt64, _ numBits: Int) {
-        assert(numBits >= 0 && numBits <= 64)
-        var val = value
-        var remaining = numBits
-        while remaining > 0 {
-            let bitsAvailable = 8 - bitOffset
-            let bitsToWrite = min(remaining, bitsAvailable)
-            let mask = UInt8((1 << bitsToWrite) - 1)
-            currentByte |= UInt8(val & UInt64(mask)) << bitOffset
-            val >>= bitsToWrite
-            bitOffset += bitsToWrite
-            remaining -= bitsToWrite
+        // Fast path: if everything fits in the current byte
+        if numBits <= 8 - bitOffset {
+            currentByte |= UInt8(truncatingIfNeeded: value) << bitOffset
+            bitOffset += numBits
             if bitOffset == 8 {
                 bytes.append(currentByte)
                 currentByte = 0
                 bitOffset = 0
             }
+            return
         }
+
+        // General path: pack into a 64-bit accumulator, flush whole bytes
+        var acc = UInt64(currentByte) | (value << bitOffset)
+        var totalBits = bitOffset + numBits
+
+        while totalBits >= 8 {
+            bytes.append(UInt8(truncatingIfNeeded: acc))
+            acc >>= 8
+            totalBits -= 8
+        }
+
+        currentByte = UInt8(truncatingIfNeeded: acc)
+        bitOffset = totalBits
     }
 
     /// Emit a value using Variable Bit Rate encoding with `numBits` chunk size.
     /// Each chunk has (numBits-1) data bits + 1 continuation bit.
+    @inline(__always)
     func emitVBR(_ value: UInt64, _ numBits: Int) {
-        assert(numBits >= 2)
-        let dataBits = numBits - 1
-        let dataMask: UInt64 = (1 << dataBits) - 1
+        let dataMask: UInt64 = (1 << (numBits - 1)) - 1
+        // Fast path: value fits in one chunk (very common)
+        if value <= dataMask {
+            emit(value, numBits)
+            return
+        }
+        // General path
         var val = value
+        let dataBits = numBits - 1
         while true {
             let chunk = val & dataMask
             val >>= dataBits
@@ -86,7 +105,6 @@ public final class BitstreamWriter {
                 emit(chunk, numBits)
                 return
             }
-            // Set continuation bit
             emit(chunk | (1 << dataBits), numBits)
         }
     }
@@ -167,6 +185,53 @@ public final class BitstreamWriter {
         for op in operands {
             emitVBR(op, 6)
         }
+    }
+
+    // MARK: - Inline unabbreviated record emission (no array allocation)
+
+    @inline(__always)
+    func emitUnabbrevRecord(code: UInt64) {
+        emit(Self.unabbrevRecordAbbrevID, abbrevLen)
+        emitVBR(code, 6)
+        emitVBR(0, 6)
+    }
+
+    @inline(__always)
+    func emitUnabbrevRecord(code: UInt64, _ a: UInt64) {
+        emit(Self.unabbrevRecordAbbrevID, abbrevLen)
+        emitVBR(code, 6)
+        emitVBR(1, 6)
+        emitVBR(a, 6)
+    }
+
+    @inline(__always)
+    func emitUnabbrevRecord(code: UInt64, _ a: UInt64, _ b: UInt64) {
+        emit(Self.unabbrevRecordAbbrevID, abbrevLen)
+        emitVBR(code, 6)
+        emitVBR(2, 6)
+        emitVBR(a, 6)
+        emitVBR(b, 6)
+    }
+
+    @inline(__always)
+    func emitUnabbrevRecord(code: UInt64, _ a: UInt64, _ b: UInt64, _ c: UInt64) {
+        emit(Self.unabbrevRecordAbbrevID, abbrevLen)
+        emitVBR(code, 6)
+        emitVBR(3, 6)
+        emitVBR(a, 6)
+        emitVBR(b, 6)
+        emitVBR(c, 6)
+    }
+
+    @inline(__always)
+    func emitUnabbrevRecord(code: UInt64, _ a: UInt64, _ b: UInt64, _ c: UInt64, _ d: UInt64) {
+        emit(Self.unabbrevRecordAbbrevID, abbrevLen)
+        emitVBR(code, 6)
+        emitVBR(4, 6)
+        emitVBR(a, 6)
+        emitVBR(b, 6)
+        emitVBR(c, 6)
+        emitVBR(d, 6)
     }
 
     /// Emit an unabbreviated record with a trailing blob (array of chars/bytes).

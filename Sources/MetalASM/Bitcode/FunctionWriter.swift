@@ -91,11 +91,10 @@ final class FunctionWriter {
         // Collect constants BEFORE assigning instruction IDs
         // (constants block is emitted before instructions, so constants get lower IDs)
         var constants: [(IRType, IRConstant)] = []
-        var constantValueMap: [String: Int] = [:]  // key → valueID
+        var constantValueMap: [IRConstant: Int] = [:]
 
         func registerConstant(_ c: IRConstant) {
-            let key = "\(c)"
-            if constantValueMap[key] != nil { return }
+            if constantValueMap[c] != nil { return }
 
             // First, recursively register sub-constants of constant expressions
             switch c {
@@ -111,8 +110,8 @@ final class FunctionWriter {
             }
 
             // Then register this constant (sub-constants get lower IDs)
-            if constantValueMap[key] == nil {
-                constantValueMap[key] = nextValueID
+            if constantValueMap[c] == nil {
+                constantValueMap[c] = nextValueID
                 constants.append((c.type, c))
                 nextValueID += 1
             }
@@ -178,13 +177,8 @@ final class FunctionWriter {
             }
         }
 
-        // Emit VALUE_SYMTAB for named values
-        writeValueSymtab(
-            to: writer,
-            function: function,
-            localValues: localValues,
-            enumerator: enumerator
-        )
+        // Skip VALUE_SYMTAB — Metal doesn't need SSA names for pipeline creation.
+        // This saves ~20-30% of bitcode size for large kernels.
 
         writer.exitBlock()
     }
@@ -194,66 +188,53 @@ final class FunctionWriter {
     private static func writeConstantsBlock(
         to writer: BitstreamWriter,
         constants: [(IRType, IRConstant)],
-        constantValueMap: [String: Int],
+        constantValueMap: [IRConstant: Int],
         enumerator: ValueEnumerator
     ) {
         writer.enterSubblock(blockID: constantsBlockID, abbrevLen: 5)
 
         var currentType: IRType? = nil
 
-        // Helper to resolve a constant to its absolute value ID
         func resolveConstant(_ c: IRConstant) -> UInt64 {
-            let key = "\(c)"
-            if let id = constantValueMap[key] {
+            if let id = constantValueMap[c] {
                 return UInt64(id)
             }
-            // For constants that reference globals (e.g., @tg_buf)
             return 0
         }
 
         for (type, constant) in constants {
-            // Emit SETTYPE if type changed
             if type != currentType {
-                writer.emitUnabbrevRecord(code: cstSetTypeCode, operands: [
-                    UInt64(enumerator.typeIndex(type))
-                ])
+                writer.emitUnabbrevRecord(code: cstSetTypeCode, UInt64(enumerator.typeIndex(type)))
                 currentType = type
             }
 
             switch constant {
             case .integer(_, let value):
-                // Encode as signed VBR: positive → 2*v, negative → (-2*v)+1
                 let encoded: UInt64
                 if value >= 0 {
                     encoded = UInt64(value) << 1
                 } else {
                     encoded = (UInt64(bitPattern: -value) << 1) | 1
                 }
-                writer.emitUnabbrevRecord(code: cstIntegerCode, operands: [encoded])
+                writer.emitUnabbrevRecord(code: cstIntegerCode, encoded)
 
             case .float32(let value):
-                writer.emitUnabbrevRecord(code: cstFloatCode, operands: [
-                    UInt64(value.bitPattern)
-                ])
+                writer.emitUnabbrevRecord(code: cstFloatCode, UInt64(value.bitPattern))
 
             case .float64(let value):
-                writer.emitUnabbrevRecord(code: cstFloatCode, operands: [
-                    UInt64(value.bitPattern)
-                ])
+                writer.emitUnabbrevRecord(code: cstFloatCode, UInt64(value.bitPattern))
 
             case .float16(let bits):
-                writer.emitUnabbrevRecord(code: cstFloatCode, operands: [
-                    UInt64(bits)
-                ])
+                writer.emitUnabbrevRecord(code: cstFloatCode, UInt64(bits))
 
             case .null:
-                writer.emitUnabbrevRecord(code: cstNullCode, operands: [])
+                writer.emitUnabbrevRecord(code: cstNullCode)
 
             case .undef:
-                writer.emitUnabbrevRecord(code: cstUndefCode, operands: [])
+                writer.emitUnabbrevRecord(code: cstUndefCode)
 
             case .zeroInitializer:
-                writer.emitUnabbrevRecord(code: cstNullCode, operands: [])
+                writer.emitUnabbrevRecord(code: cstNullCode)
 
             case .bitcast(let inner, let destTy):
                 // CE_CAST: [opcode, desttype, val]
@@ -330,7 +311,7 @@ final class FunctionWriter {
         to writer: BitstreamWriter,
         enumerator: ValueEnumerator,
         localValues: [String: Int],
-        constantValueMap: [String: Int],
+        constantValueMap: [IRConstant: Int],
         currentValueID: Int,
         bbIndexMap: [String: Int]
     ) {
@@ -349,8 +330,7 @@ final class FunctionWriter {
                 return 0
 
             case .constant(let c):
-                let key = "\(c)"
-                if let id = constantValueMap[key] {
+                if let id = constantValueMap[c] {
                     return UInt64(id)
                 }
                 return 0
@@ -378,41 +358,30 @@ final class FunctionWriter {
         switch inst.opcode {
         case .ret:
             if inst.type.isVoid && inst.operands.isEmpty {
-                // void return
-                writer.emitUnabbrevRecord(code: instRetCode, operands: [])
+                writer.emitUnabbrevRecord(code: instRetCode)
             } else if let op = inst.operands.first {
                 let valID = resolveOperand(op)
-                writer.emitUnabbrevRecord(code: instRetCode, operands: [relativeID(valID)])
+                writer.emitUnabbrevRecord(code: instRetCode, relativeID(valID))
             }
 
         case .br:
             if inst.operands.count == 1 {
-                // Unconditional branch: [bbid]
                 let bbIdx: UInt64
                 if case .basicBlock(let bb) = inst.operands[0] {
                     bbIdx = UInt64(bbIndexMap[bb.name] ?? 0)
-                } else {
-                    bbIdx = 0
-                }
-                writer.emitUnabbrevRecord(code: instBrCode, operands: [bbIdx])
+                } else { bbIdx = 0 }
+                writer.emitUnabbrevRecord(code: instBrCode, bbIdx)
             } else if inst.operands.count == 3 {
-                // Conditional branch: [bbid_true, bbid_false, cond]
                 let trueBBIdx: UInt64
                 let falseBBIdx: UInt64
                 if case .basicBlock(let bb) = inst.operands[1] {
                     trueBBIdx = UInt64(bbIndexMap[bb.name] ?? 0)
-                } else {
-                    trueBBIdx = 0
-                }
+                } else { trueBBIdx = 0 }
                 if case .basicBlock(let bb) = inst.operands[2] {
                     falseBBIdx = UInt64(bbIndexMap[bb.name] ?? 0)
-                } else {
-                    falseBBIdx = 0
-                }
+                } else { falseBBIdx = 0 }
                 let condID = resolveOperand(inst.operands[0])
-                writer.emitUnabbrevRecord(code: instBrCode, operands: [
-                    trueBBIdx, falseBBIdx, relativeID(condID)
-                ])
+                writer.emitUnabbrevRecord(code: instBrCode, trueBBIdx, falseBBIdx, relativeID(condID))
             }
 
         case .alloca:
@@ -420,9 +389,8 @@ final class FunctionWriter {
             // align encoding: (log2(align)+1) | (inalloca << 5) | (explicittype << 6) | (swifterror << 7)
             let allocaType = inst.attributes.allocaType ?? inst.type
             // The count operand is a constant i32 1 — find it in the constant map
-            let countKey = "\(IRConstant.integer(.i32, 1))"
             let countID: UInt64
-            if let cid = constantValueMap[countKey] {
+            if let cid = constantValueMap[.integer(.i32, 1)] {
                 countID = UInt64(cid)  // ALLOCA uses absolute value IDs, not relative
             } else {
                 // Fallback: look for any i32 constant with value 1
@@ -438,28 +406,23 @@ final class FunctionWriter {
             writer.emitUnabbrevRecord(code: instAllocaCode, operands: operands)
 
         case .load:
-            // INST_LOAD (code 20): [val, type, align, vol]
             if let op = inst.operands.first {
                 let valID = resolveOperand(op)
-                writer.emitUnabbrevRecord(code: instLoadCode, operands: [
+                writer.emitUnabbrevRecord(code: instLoadCode,
                     relativeID(valID),
                     UInt64(enumerator.typeIndex(inst.type)),
                     UInt64(log2Align(inst.attributes.alignment ?? 1)),
-                    inst.attributes.isVolatile ? 1 : 0
-                ])
+                    inst.attributes.isVolatile ? 1 : 0)
             }
 
         case .store:
-            // INST_STORE: [val, ptr, align, vol]
             if inst.operands.count >= 2 {
                 let valID = resolveOperand(inst.operands[0])
                 let ptrID = resolveOperand(inst.operands[1])
-                writer.emitUnabbrevRecord(code: instStoreCode, operands: [
-                    relativeID(ptrID),
-                    relativeID(valID),
+                writer.emitUnabbrevRecord(code: instStoreCode,
+                    relativeID(ptrID), relativeID(valID),
                     UInt64(log2Align(inst.attributes.alignment ?? 1)),
-                    inst.attributes.isVolatile ? 1 : 0
-                ])
+                    inst.attributes.isVolatile ? 1 : 0)
             }
 
         case .getelementptr:
@@ -476,39 +439,29 @@ final class FunctionWriter {
 
         case .bitcast, .zext, .sext, .trunc, .fpToUI, .fpToSI, .uiToFP, .siToFP,
              .fpTrunc, .fpExt, .ptrToInt, .intToPtr, .addrSpaceCast:
-            // INST_CAST: [val, destty, castopc]
             if let op = inst.operands.first {
                 let valID = resolveOperand(op)
-                writer.emitUnabbrevRecord(code: instCastCode, operands: [
+                writer.emitUnabbrevRecord(code: instCastCode,
                     relativeID(valID),
                     UInt64(enumerator.typeIndex(inst.type)),
-                    UInt64(castOpcode(inst.opcode))
-                ])
+                    UInt64(castOpcode(inst.opcode)))
             }
 
         case .add, .fadd, .sub, .fsub, .mul, .fmul, .udiv, .sdiv, .fdiv,
              .urem, .srem, .frem, .shl, .lshr, .ashr, .and, .or, .xor:
-            // INST_BINOP: [val1, val2, opcode]
             if inst.operands.count >= 2 {
                 let lhs = resolveOperand(inst.operands[0])
                 let rhs = resolveOperand(inst.operands[1])
-                writer.emitUnabbrevRecord(code: instBinopCode, operands: [
-                    relativeID(lhs),
-                    relativeID(rhs),
-                    UInt64(binopOpcode(inst.opcode))
-                ])
+                writer.emitUnabbrevRecord(code: instBinopCode,
+                    relativeID(lhs), relativeID(rhs), UInt64(binopOpcode(inst.opcode)))
             }
 
         case .icmp, .fcmp:
-            // INST_CMP2: [val1, val2, predicate]
             if inst.operands.count >= 2 {
                 let lhs = resolveOperand(inst.operands[0])
                 let rhs = resolveOperand(inst.operands[1])
-                writer.emitUnabbrevRecord(code: instCmp2Code, operands: [
-                    relativeID(lhs),
-                    relativeID(rhs),
-                    UInt64(inst.attributes.predicate ?? 0)
-                ])
+                writer.emitUnabbrevRecord(code: instCmp2Code,
+                    relativeID(lhs), relativeID(rhs), UInt64(inst.attributes.predicate ?? 0))
             }
 
         case .call:
@@ -588,48 +541,33 @@ final class FunctionWriter {
                 let cond = resolveOperand(inst.operands[0])
                 let trueVal = resolveOperand(inst.operands[1])
                 let falseVal = resolveOperand(inst.operands[2])
-                writer.emitUnabbrevRecord(code: instSelectCode, operands: [
-                    relativeID(trueVal),
-                    relativeID(falseVal),
-                    relativeID(cond)
-                ])
+                writer.emitUnabbrevRecord(code: instSelectCode,
+                    relativeID(trueVal), relativeID(falseVal), relativeID(cond))
             }
 
         case .extractElement:
-            // INST_EXTRACTELT: [val, idx]
             if inst.operands.count >= 2 {
                 let vec = resolveOperand(inst.operands[0])
                 let idx = resolveOperand(inst.operands[1])
-                writer.emitUnabbrevRecord(code: instExtractEltCode, operands: [
-                    relativeID(vec),
-                    relativeID(idx)
-                ])
+                writer.emitUnabbrevRecord(code: instExtractEltCode, relativeID(vec), relativeID(idx))
             }
 
         case .insertElement:
-            // INST_INSERTELT: [val, elt, idx]
             if inst.operands.count >= 3 {
                 let vec = resolveOperand(inst.operands[0])
                 let elt = resolveOperand(inst.operands[1])
                 let idx = resolveOperand(inst.operands[2])
-                writer.emitUnabbrevRecord(code: instInsertEltCode, operands: [
-                    relativeID(vec),
-                    relativeID(elt),
-                    relativeID(idx)
-                ])
+                writer.emitUnabbrevRecord(code: instInsertEltCode,
+                    relativeID(vec), relativeID(elt), relativeID(idx))
             }
 
         case .shuffleVector:
-            // INST_SHUFFLEVEC: [val1, val2, mask]
             if inst.operands.count >= 3 {
                 let vec1 = resolveOperand(inst.operands[0])
                 let vec2 = resolveOperand(inst.operands[1])
                 let mask = resolveOperand(inst.operands[2])
-                writer.emitUnabbrevRecord(code: instShuffleVecCode, operands: [
-                    relativeID(vec1),
-                    relativeID(vec2),
-                    relativeID(mask)
-                ])
+                writer.emitUnabbrevRecord(code: instShuffleVecCode,
+                    relativeID(vec1), relativeID(vec2), relativeID(mask))
             }
 
         case .switchInst:
@@ -660,11 +598,10 @@ final class FunctionWriter {
             }
 
         case .unreachable:
-            writer.emitUnabbrevRecord(code: instUnreachableCode, operands: [])
+            writer.emitUnabbrevRecord(code: instUnreachableCode)
 
         default:
-            // Unsupported instruction - emit as unreachable
-            writer.emitUnabbrevRecord(code: instUnreachableCode, operands: [])
+            writer.emitUnabbrevRecord(code: instUnreachableCode)
         }
     }
 

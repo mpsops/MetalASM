@@ -1,15 +1,88 @@
 /// Tokenizer for LLVM IR text.
 ///
 /// Converts a string of LLVM IR text into a sequence of `Token` values.
-/// Handles identifiers, keywords, numbers, strings, punctuation, and comments.
+/// Operates on raw UTF-8 bytes for performance — IR is pure ASCII.
 public final class Lexer {
-    private let source: [Character]
+    private let source: [UInt8]
     private var pos: Int = 0
-    private var line: Int = 1
-    private var column: Int = 1
 
     public init(source: String) {
-        self.source = Array(source)
+        self.source = Array(source.utf8)
+    }
+
+    // Byte constants
+    private static let NL:    UInt8 = 0x0A  // \n
+    private static let CR:    UInt8 = 0x0D  // \r
+    private static let TAB:   UInt8 = 0x09  // \t
+    private static let SPACE: UInt8 = 0x20  //
+    private static let SEMI:  UInt8 = 0x3B  // ;
+    private static let QUOTE: UInt8 = 0x22  // "
+    private static let BSLASH:UInt8 = 0x5C  // \
+    private static let AT:    UInt8 = 0x40  // @
+    private static let PCT:   UInt8 = 0x25  // %
+    private static let BANG:  UInt8 = 0x21  // !
+    private static let HASH:  UInt8 = 0x23  // #
+    private static let DOLLAR:UInt8 = 0x24  // $
+    private static let LPAREN:UInt8 = 0x28  // (
+    private static let RPAREN:UInt8 = 0x29  // )
+    private static let LBRACE:UInt8 = 0x7B  // {
+    private static let RBRACE:UInt8 = 0x7D  // }
+    private static let LBRACK:UInt8 = 0x5B  // [
+    private static let RBRACK:UInt8 = 0x5D  // ]
+    private static let LANGLE:UInt8 = 0x3C  // <
+    private static let RANGLE:UInt8 = 0x3E  // >
+    private static let COMMA: UInt8 = 0x2C  // ,
+    private static let EQ:    UInt8 = 0x3D  // =
+    private static let STAR:  UInt8 = 0x2A  // *
+    private static let DOT:   UInt8 = 0x2E  // .
+    private static let MINUS: UInt8 = 0x2D  // -
+    private static let USCORE:UInt8 = 0x5F  // _
+    private static let COLON: UInt8 = 0x3A  // :
+    private static let _0:    UInt8 = 0x30
+    private static let _9:    UInt8 = 0x39
+    private static let _a:    UInt8 = 0x61
+    private static let _c:    UInt8 = 0x63
+    private static let _e:    UInt8 = 0x65
+    private static let _f:    UInt8 = 0x66
+    private static let _x:    UInt8 = 0x78
+    private static let _z:    UInt8 = 0x7A
+    private static let _A:    UInt8 = 0x41
+    private static let _E:    UInt8 = 0x45
+    private static let _F:    UInt8 = 0x46
+    private static let _H:    UInt8 = 0x48
+    private static let _K:    UInt8 = 0x4B
+    private static let _L:    UInt8 = 0x4C
+    private static let _M:    UInt8 = 0x4D
+    private static let _X:    UInt8 = 0x58
+    private static let _Z:    UInt8 = 0x5A
+
+    @inline(__always)
+    private static func isDigit(_ b: UInt8) -> Bool { b >= _0 && b <= _9 }
+
+    @inline(__always)
+    private static func isLetter(_ b: UInt8) -> Bool {
+        (b >= _a && b <= _z) || (b >= _A && b <= _Z)
+    }
+
+    @inline(__always)
+    private static func isHexDigit(_ b: UInt8) -> Bool {
+        isDigit(b) || (b >= _a && b <= _f) || (b >= _A && b <= _F)
+    }
+
+    @inline(__always)
+    private static func isIdentChar(_ b: UInt8) -> Bool {
+        isLetter(b) || isDigit(b) || b == USCORE || b == DOT || b == DOLLAR || b == MINUS
+    }
+
+    private var count: Int { source.count }
+
+    @inline(__always)
+    private func byte(_ i: Int) -> UInt8 { source[i] }
+
+    // Build String from byte range
+    @inline(__always)
+    private func text(_ start: Int, _ end: Int) -> String {
+        String(decoding: source[start..<end], as: UTF8.self)
     }
 
     // MARK: - Public API
@@ -17,6 +90,7 @@ public final class Lexer {
     /// Tokenize the entire source into an array of tokens.
     public func tokenize() -> [Token] {
         var tokens: [Token] = []
+        tokens.reserveCapacity(count / 6)  // rough estimate
         while true {
             let tok = nextToken()
             tokens.append(tok)
@@ -27,117 +101,88 @@ public final class Lexer {
 
     // MARK: - Token production
 
-    /// Return the next token.
     func nextToken() -> Token {
         skipWhitespaceAndComments()
 
-        guard pos < source.count else {
-            return Token(kind: .eof, text: "", line: line, column: column)
+        guard pos < count else {
+            return Token(kind: .eof, text: "")
         }
 
-        let startLine = line
-        let startCol = column
-        let ch = source[pos]
+        let ch = byte(pos)
 
         switch ch {
-        case "\n":
-            advance()
-            return Token(kind: .newline, text: "\n", line: startLine, column: startCol)
+        case Self.NL:
+            pos += 1
+            return Token(kind: .newline, text: "\n")
 
-        case "(":
-            advance()
-            return Token(kind: .leftParen, text: "(", line: startLine, column: startCol)
-        case ")":
-            advance()
-            return Token(kind: .rightParen, text: ")", line: startLine, column: startCol)
-        case "{":
-            advance()
-            return Token(kind: .leftBrace, text: "{", line: startLine, column: startCol)
-        case "}":
-            advance()
-            return Token(kind: .rightBrace, text: "}", line: startLine, column: startCol)
-        case "[":
-            advance()
-            return Token(kind: .leftBracket, text: "[", line: startLine, column: startCol)
-        case "]":
-            advance()
-            return Token(kind: .rightBracket, text: "]", line: startLine, column: startCol)
-        case "<":
-            advance()
-            return Token(kind: .leftAngle, text: "<", line: startLine, column: startCol)
-        case ">":
-            advance()
-            return Token(kind: .rightAngle, text: ">", line: startLine, column: startCol)
-        case ",":
-            advance()
-            return Token(kind: .comma, text: ",", line: startLine, column: startCol)
-        case "=":
-            advance()
-            return Token(kind: .equals, text: "=", line: startLine, column: startCol)
-        case "*":
-            advance()
-            return Token(kind: .star, text: "*", line: startLine, column: startCol)
+        case Self.LPAREN:  pos += 1; return Token(kind: .leftParen, text: "(")
+        case Self.RPAREN:  pos += 1; return Token(kind: .rightParen, text: ")")
+        case Self.LBRACE:  pos += 1; return Token(kind: .leftBrace, text: "{")
+        case Self.RBRACE:  pos += 1; return Token(kind: .rightBrace, text: "}")
+        case Self.LBRACK:  pos += 1; return Token(kind: .leftBracket, text: "[")
+        case Self.RBRACK:  pos += 1; return Token(kind: .rightBracket, text: "]")
+        case Self.LANGLE:  pos += 1; return Token(kind: .leftAngle, text: "<")
+        case Self.RANGLE:  pos += 1; return Token(kind: .rightAngle, text: ">")
+        case Self.COMMA:   pos += 1; return Token(kind: .comma, text: ",")
+        case Self.EQ:      pos += 1; return Token(kind: .equals, text: "=")
+        case Self.STAR:    pos += 1; return Token(kind: .star, text: "*")
 
-        case ".":
-            // Check for ...
-            if pos + 2 < source.count && source[pos+1] == "." && source[pos+2] == "." {
-                advance(); advance(); advance()
-                return Token(kind: .dotDotDot, text: "...", line: startLine, column: startCol)
+        case Self.DOT:
+            if pos + 2 < count && byte(pos+1) == Self.DOT && byte(pos+2) == Self.DOT {
+                pos += 3
+                return Token(kind: .dotDotDot, text: "...")
             }
-            // Otherwise, part of a float or identifier
-            return lexNumber(startLine: startLine, startCol: startCol)
+            return lexNumber()
 
-        case "\"":
-            return lexString(startLine: startLine, startCol: startCol)
+        case Self.QUOTE:
+            return lexString()
 
-        case "@":
-            return lexGlobalIdent(startLine: startLine, startCol: startCol)
+        case Self.AT:
+            return lexGlobalIdent()
 
-        case "%":
-            return lexLocalIdent(startLine: startLine, startCol: startCol)
+        case Self.PCT:
+            return lexLocalIdent()
 
-        case "!":
-            return lexMetadata(startLine: startLine, startCol: startCol)
+        case Self.BANG:
+            return lexMetadata()
 
-        case "#":
-            return lexAttrGroupRef(startLine: startLine, startCol: startCol)
+        case Self.HASH:
+            return lexAttrGroupRef()
 
-        case "$":
-            return lexComdatRef(startLine: startLine, startCol: startCol)
+        case Self.DOLLAR:
+            return lexComdatRef()
 
-        case "-", "0"..."9":
-            return lexNumber(startLine: startLine, startCol: startCol)
+        case Self.MINUS, Self._0...Self._9:
+            return lexNumber()
 
-        case "c":
-            // Could be c"string" (constant string) or keyword
-            if pos + 1 < source.count && source[pos+1] == "\"" {
-                advance() // skip 'c'
-                let str = lexString(startLine: startLine, startCol: startCol)
-                return Token(kind: .string, text: "c" + str.text, line: startLine, column: startCol)
+        case Self._c:
+            if pos + 1 < count && byte(pos+1) == Self.QUOTE {
+                pos += 1  // skip 'c'
+                let str = lexString()
+                return Token(kind: .string, text: "c" + str.text)
             }
-            return lexKeywordOrIdent(startLine: startLine, startCol: startCol)
+            return lexKeywordOrIdent()
 
         default:
-            if ch.isLetter || ch == "_" {
-                return lexKeywordOrIdent(startLine: startLine, startCol: startCol)
+            if Self.isLetter(ch) || ch == Self.USCORE {
+                return lexKeywordOrIdent()
             }
-            // Unknown character - skip it
-            advance()
-            return Token(kind: .keyword, text: String(ch), line: startLine, column: startCol)
+            pos += 1
+            return Token(kind: .keyword, text: text(pos-1, pos))
         }
     }
 
     // MARK: - Lexing helpers
 
     private func skipWhitespaceAndComments() {
-        while pos < source.count {
-            let ch = source[pos]
-            if ch == " " || ch == "\t" || ch == "\r" {
-                advance()
-            } else if ch == ";" {
-                // Line comment - skip to end of line
-                while pos < source.count && source[pos] != "\n" {
-                    advance()
+        while pos < count {
+            let ch = byte(pos)
+            if ch == Self.SPACE || ch == Self.TAB || ch == Self.CR {
+                pos += 1
+            } else if ch == Self.SEMI {
+                pos += 1
+                while pos < count && byte(pos) != Self.NL {
+                    pos += 1
                 }
             } else {
                 break
@@ -145,192 +190,139 @@ public final class Lexer {
         }
     }
 
-    private func lexString(startLine: Int, startCol: Int) -> Token {
-        assert(source[pos] == "\"")
-        advance() // skip opening quote
-        var text = "\""
-        while pos < source.count && source[pos] != "\"" {
-            if source[pos] == "\\" {
-                text.append(source[pos])
-                advance()
-                if pos < source.count {
-                    text.append(source[pos])
-                    advance()
-                }
+    private func lexString() -> Token {
+        let start = pos
+        pos += 1  // skip opening quote
+        while pos < count && byte(pos) != Self.QUOTE {
+            if byte(pos) == Self.BSLASH {
+                pos += 1
+                if pos < count { pos += 1 }
             } else {
-                text.append(source[pos])
-                advance()
+                pos += 1
             }
         }
-        if pos < source.count {
-            text.append("\"")
-            advance() // skip closing quote
+        if pos < count {
+            pos += 1  // skip closing quote
         }
-        return Token(kind: .string, text: text, line: startLine, column: startCol)
+        return Token(kind: .string, text: text(start, pos))
     }
 
-    private func lexGlobalIdent(startLine: Int, startCol: Int) -> Token {
-        assert(source[pos] == "@")
-        advance() // skip @
-        var text = "@"
+    private func lexGlobalIdent() -> Token {
+        let start = pos
+        pos += 1  // skip @
+        if pos < count && byte(pos) == Self.QUOTE {
+            _ = lexString()  // advances past the quoted name
+            return Token(kind: .globalIdent, text: text(start, pos))
+        }
+        while pos < count && Self.isIdentChar(byte(pos)) {
+            pos += 1
+        }
+        return Token(kind: .globalIdent, text: text(start, pos))
+    }
 
-        if pos < source.count && source[pos] == "\"" {
-            // Quoted name: @"name"
-            let str = lexString(startLine: startLine, startCol: startCol)
-            text += str.text
+    private func lexLocalIdent() -> Token {
+        let start = pos
+        pos += 1  // skip %
+        if pos < count && byte(pos) == Self.QUOTE {
+            _ = lexString()
+            return Token(kind: .localIdent, text: text(start, pos))
+        }
+        while pos < count && Self.isIdentChar(byte(pos)) {
+            pos += 1
+        }
+        return Token(kind: .localIdent, text: text(start, pos))
+    }
+
+    private func lexMetadata() -> Token {
+        let start = pos
+        pos += 1  // skip !
+
+        if pos < count && byte(pos) == Self.QUOTE {
+            _ = lexString()
+            return Token(kind: .metadataString, text: text(start, pos))
+        } else if pos < count && byte(pos) == Self.LBRACE {
+            return Token(kind: .exclamation, text: "!")
         } else {
-            // Unquoted name
-            while pos < source.count && isIdentChar(source[pos]) {
-                text.append(source[pos])
-                advance()
+            while pos < count && Self.isIdentChar(byte(pos)) {
+                pos += 1
             }
-        }
-        return Token(kind: .globalIdent, text: text, line: startLine, column: startCol)
-    }
-
-    private func lexLocalIdent(startLine: Int, startCol: Int) -> Token {
-        assert(source[pos] == "%")
-        advance() // skip %
-        var text = "%"
-
-        if pos < source.count && source[pos] == "\"" {
-            let str = lexString(startLine: startLine, startCol: startCol)
-            text += str.text
-        } else {
-            while pos < source.count && isIdentChar(source[pos]) {
-                text.append(source[pos])
-                advance()
-            }
-        }
-        return Token(kind: .localIdent, text: text, line: startLine, column: startCol)
-    }
-
-    private func lexMetadata(startLine: Int, startCol: Int) -> Token {
-        assert(source[pos] == "!")
-        advance() // skip !
-
-        if pos < source.count && source[pos] == "\"" {
-            // Metadata string: !"string"
-            let str = lexString(startLine: startLine, startCol: startCol)
-            return Token(kind: .metadataString, text: "!" + str.text, line: startLine, column: startCol)
-        } else if pos < source.count && source[pos] == "{" {
-            // !{ is just ! followed by {
-            return Token(kind: .exclamation, text: "!", line: startLine, column: startCol)
-        } else {
-            // Metadata identifier: !name or !0
-            var text = "!"
-            while pos < source.count && isIdentChar(source[pos]) {
-                text.append(source[pos])
-                advance()
-            }
-            return Token(kind: .metadataIdent, text: text, line: startLine, column: startCol)
+            return Token(kind: .metadataIdent, text: text(start, pos))
         }
     }
 
-    private func lexAttrGroupRef(startLine: Int, startCol: Int) -> Token {
-        assert(source[pos] == "#")
-        advance()
-        var text = "#"
-        while pos < source.count && source[pos].isNumber {
-            text.append(source[pos])
-            advance()
+    private func lexAttrGroupRef() -> Token {
+        let start = pos
+        pos += 1  // skip #
+        while pos < count && Self.isDigit(byte(pos)) {
+            pos += 1
         }
-        return Token(kind: .attrGroupRef, text: text, line: startLine, column: startCol)
+        return Token(kind: .attrGroupRef, text: text(start, pos))
     }
 
-    private func lexComdatRef(startLine: Int, startCol: Int) -> Token {
-        assert(source[pos] == "$")
-        advance()
-        var text = "$"
-        while pos < source.count && isIdentChar(source[pos]) {
-            text.append(source[pos])
-            advance()
+    private func lexComdatRef() -> Token {
+        let start = pos
+        pos += 1  // skip $
+        while pos < count && Self.isIdentChar(byte(pos)) {
+            pos += 1
         }
-        return Token(kind: .comdatRef, text: text, line: startLine, column: startCol)
+        return Token(kind: .comdatRef, text: text(start, pos))
     }
 
-    private func lexNumber(startLine: Int, startCol: Int) -> Token {
-        var text = ""
+    private func lexNumber() -> Token {
+        let start = pos
 
         // Handle negative sign
-        if pos < source.count && source[pos] == "-" {
-            text.append("-")
-            advance()
+        if pos < count && byte(pos) == Self.MINUS {
+            pos += 1
         }
 
-        // Check for hex: 0x, 0xH (half), 0xK (fp80), 0xL (fp128), 0xM (ppc_fp128)
-        if pos + 1 < source.count && source[pos] == "0" && (source[pos+1] == "x" || source[pos+1] == "X") {
-            text.append(source[pos]); advance()
-            text.append(source[pos]); advance()
-            // LLVM IR uses 0xH for half, 0xK for fp80, 0xL for fp128, 0xM for ppc_fp128
+        // Check for hex: 0x
+        if pos + 1 < count && byte(pos) == Self._0 && (byte(pos+1) == Self._x || byte(pos+1) == Self._X) {
+            pos += 2
             var isTypedHexFloat = false
-            if pos < source.count {
-                let ch = source[pos]
-                if ch == "H" || ch == "K" || ch == "L" || ch == "M" {
-                    text.append(ch); advance()
+            if pos < count {
+                let ch = byte(pos)
+                if ch == Self._H || ch == Self._K || ch == Self._L || ch == Self._M {
+                    pos += 1
                     isTypedHexFloat = true
                 }
             }
-            while pos < source.count && isHexChar(source[pos]) {
-                text.append(source[pos])
-                advance()
+            while pos < count && Self.isHexDigit(byte(pos)) {
+                pos += 1
             }
-            let kind: Token.Kind = isTypedHexFloat ? .float_ : (text.contains(".") ? .float_ : .integer)
-            return Token(kind: kind, text: text, line: startLine, column: startCol)
+            let kind: Token.Kind = isTypedHexFloat ? .float_ : .integer
+            return Token(kind: kind, text: text(start, pos))
         }
 
         // Decimal number, possibly float
         var isFloat = false
-        while pos < source.count && (source[pos].isNumber || source[pos] == "." || source[pos] == "e" || source[pos] == "E") {
-            if source[pos] == "." || source[pos] == "e" || source[pos] == "E" {
+        while pos < count {
+            let ch = byte(pos)
+            if Self.isDigit(ch) {
+                pos += 1
+            } else if ch == Self.DOT || ch == Self._e || ch == Self._E {
                 isFloat = true
+                pos += 1
+            } else {
+                break
             }
-            text.append(source[pos])
-            advance()
         }
 
-        return Token(kind: isFloat ? .float_ : .integer, text: text, line: startLine, column: startCol)
+        return Token(kind: isFloat ? .float_ : .integer, text: text(start, pos))
     }
 
-    private func lexKeywordOrIdent(startLine: Int, startCol: Int) -> Token {
-        var text = ""
-        while pos < source.count && isIdentChar(source[pos]) {
-            text.append(source[pos])
-            advance()
+    private func lexKeywordOrIdent() -> Token {
+        let start = pos
+        while pos < count && Self.isIdentChar(byte(pos)) {
+            pos += 1
         }
 
         // Check if this is a label (followed by ':')
-        if pos < source.count && source[pos] == ":" {
-            advance()
-            return Token(kind: .label, text: text + ":", line: startLine, column: startCol)
-        }
-
-        return Token(kind: .keyword, text: text, line: startLine, column: startCol)
-    }
-
-    // MARK: - Character classification
-
-    private func isIdentChar(_ ch: Character) -> Bool {
-        return ch.isLetter || ch.isNumber || ch == "_" || ch == "." || ch == "$" || ch == "-"
-    }
-
-    private func isHexChar(_ ch: Character) -> Bool {
-        return ch.isHexDigit
-    }
-
-    private func advance() {
-        if pos < source.count {
-            if source[pos] == "\n" {
-                line += 1
-                column = 1
-            } else {
-                column += 1
-            }
+        if pos < count && byte(pos) == Self.COLON {
             pos += 1
+            return Token(kind: .label, text: text(start, pos))
         }
-    }
 
-    private func peek() -> Character? {
-        return pos < source.count ? source[pos] : nil
+        return Token(kind: .keyword, text: text(start, pos))
     }
 }

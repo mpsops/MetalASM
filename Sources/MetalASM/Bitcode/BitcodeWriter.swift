@@ -1,3 +1,5 @@
+import Foundation
+
 /// Orchestrates serialization of an IRModule into LLVM bitcode bytes.
 ///
 /// Produces bitcode starting with "BC\xC0\xDE" that can be wrapped in
@@ -34,12 +36,19 @@ public final class BitcodeWriter {
     //  section, visibility, tls, unnamed_addr, externally_initialized,
     //  dllstorageclass, comdat, addrspace, preemptionspecifier]
 
+    /// Timing breakdown for the last write() call.
+    public static var _bcBreakdown: String = ""
+
     /// Write a complete LLVM bitcode from the given module.
     ///
     /// Returns the raw bitcode bytes starting with "BC\xC0\xDE".
     public static func write(module: IRModule) -> [UInt8] {
+        let te = CFAbsoluteTimeGetCurrent()
         let enumerator = ValueEnumerator(module: module)
-        let writer = BitstreamWriter()
+        let te1 = CFAbsoluteTimeGetCurrent()
+        // Rough estimate: ~8 bytes per instruction
+        let instCount = module.functions.reduce(0) { $0 + $1.basicBlocks.reduce(0) { $0 + $1.instructions.count } }
+        let writer = BitstreamWriter(capacity: instCount * 8 + 4096)
 
         // Emit magic
         writer.emitBitcodeMagic()
@@ -120,15 +129,19 @@ public final class BitcodeWriter {
         MetadataWriter.writeSinglethreadBlock(to: writer)
 
         // Function bodies
+        let tf = CFAbsoluteTimeGetCurrent()
         for fn in module.functions {
             if !fn.isDeclaration {
                 FunctionWriter.write(to: writer, function: fn, enumerator: enumerator, moduleConstantCount: moduleConstants.entries.count)
             }
         }
+        let tf1 = CFAbsoluteTimeGetCurrent()
 
         writer.exitBlock() // end MODULE_BLOCK
 
-        return writer.finalize()
+        let result = writer.finalize()
+        _bcBreakdown = String(format: "enum=%.0fms fn=%.0fms", (te1-te)*1000, (tf1-tf)*1000)
+        return result
     }
 
     // MARK: - Attribute blocks
@@ -483,18 +496,16 @@ public final class BitcodeWriter {
         var currentType: IRType? = nil
         for (type, kind) in moduleConstants.entries {
             if type != currentType {
-                writer.emitUnabbrevRecord(code: 1, operands: [
-                    UInt64(enumerator.typeIndex(type))
-                ]) // SETTYPE
+                writer.emitUnabbrevRecord(code: 1, UInt64(enumerator.typeIndex(type)))
                 currentType = type
             }
             switch kind {
             case .integer(let encoded):
-                writer.emitUnabbrevRecord(code: 4, operands: [encoded]) // CST_CODE_INTEGER
+                writer.emitUnabbrevRecord(code: 4, encoded)
             case .null:
-                writer.emitUnabbrevRecord(code: 2, operands: []) // CST_CODE_NULL
+                writer.emitUnabbrevRecord(code: 2)
             case .undef:
-                writer.emitUnabbrevRecord(code: 3, operands: []) // CST_CODE_UNDEF
+                writer.emitUnabbrevRecord(code: 3)
             }
         }
 

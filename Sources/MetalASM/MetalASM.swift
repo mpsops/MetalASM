@@ -6,6 +6,9 @@ import Foundation
 /// `device.makeLibrary(data:)` — entirely in-process, no external tools.
 public enum MetalASM {
 
+    /// Last assembly timing breakdown (set after each `assemble` call).
+    public static var _lastTiming: String = ""
+
     /// Assemble LLVM IR text into metallib data.
     ///
     /// - Parameters:
@@ -17,13 +20,23 @@ public enum MetalASM {
         platform: MetallibWriter.Platform = .macOS(version: 26)
     ) throws -> Data {
         // Phase 1: Parse IR text into in-memory representation
+        let t0 = CFAbsoluteTimeGetCurrent()
         let lexer = Lexer(source: ir)
         let tokens = lexer.tokenize()
+        let t1 = CFAbsoluteTimeGetCurrent()
         var parser = Parser(tokens: tokens)
         let module = try parser.parse()
+        let t2 = CFAbsoluteTimeGetCurrent()
 
         // Phase 2: Serialize IR to LLVM bitcode
         let bitcodeBytes = BitcodeWriter.write(module: module)
+        let t3 = CFAbsoluteTimeGetCurrent()
+
+        // Store timing in thread-local so caller can read it
+        MetalASM._lastTiming = String(format: "lex=%.0fms parse=%.0fms bc=%.0fms (%dKB→%dKB) %@",
+                     (t1-t0)*1000, (t2-t1)*1000, (t3-t2)*1000,
+                     ir.utf8.count/1024, bitcodeBytes.count/1024,
+                     BitcodeWriter._bcBreakdown)
 
         // Phase 3: Wrap in metallib container
         let entries = module.kernelEntries.map { name in
