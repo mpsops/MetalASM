@@ -990,6 +990,11 @@ public struct Parser {
         _ = advance() // consume icmp/fcmp
         skipNewlines()
 
+        // Skip optional fast-math flags (e.g., fcmp fast ogt ...)
+        while current.kind == .keyword && isFastMathFlag(current.text) {
+            _ = advance()
+        }
+
         // Parse predicate
         let predTok = try expect(.keyword)
         let predicate = cmpPredicate(predTok.text, isFP: isFP)
@@ -1374,6 +1379,28 @@ public struct Parser {
 
     // MARK: - Operand parsing
 
+    /// Parse a hex literal (0x...) as a floating-point constant.
+    /// LLVM IR encodes float hex constants as double-precision bits (16 hex digits).
+    /// The lexer classifies these as `.integer` since they lack a typed prefix (0xH/0xK/etc.).
+    private mutating func parseHexFloatOperand(type: IRType) throws -> IRInstruction.Operand {
+        let text = advance().text
+        let hexStr = String(text.dropFirst(2)) // strip "0x"
+        guard let bits = UInt64(hexStr, radix: 16) else {
+            return .constant(.float64(0))
+        }
+        let asDouble = Double(bitPattern: bits)
+        switch type {
+        case .float32:
+            return .constant(.float32(Float(asDouble)))
+        case .float16:
+            return .constant(.float16(UInt16(Float(asDouble).bitPattern & 0xFFFF)))
+        case .bfloat16:
+            return .constant(.float16(UInt16(Float(asDouble).bitPattern >> 16)))
+        default:
+            return .constant(.float64(asDouble))
+        }
+    }
+
     private mutating func parseOperand(type: IRType) throws -> IRInstruction.Operand {
         skipNewlines()
 
@@ -1393,10 +1420,20 @@ public struct Parser {
             return .value(val)
 
         case .integer:
-            let text = advance().text
+            let text = current.text
+            // LLVM IR hex floats (e.g., float 0xFFF0000000000000) are lexed as .integer
+            // because they lack a typed prefix (0xH, 0xK, etc.) and contain no '.'.
+            // When the expected type is float, redirect to the hex float parsing logic.
+            if (text.hasPrefix("0x") || text.hasPrefix("0X")),
+               type.isFloatingPoint {
+                // Fall through to .float_ case
+                return try parseHexFloatOperand(type: type)
+            }
+            _ = advance()
             let value: Int64
             if text.hasPrefix("0x") || text.hasPrefix("0X") {
-                value = Int64(UInt64(String(text.dropFirst(2)), radix: 16) ?? 0)
+                let bits = UInt64(String(text.dropFirst(2)), radix: 16) ?? 0
+                value = Int64(bitPattern: bits)
             } else {
                 value = Int64(text) ?? 0
             }
@@ -1410,15 +1447,17 @@ public struct Parser {
                 let bits = UInt16(hexStr, radix: 16) ?? 0
                 return .constant(.float16(bits))
             } else if text.hasPrefix("0x") {
-                // Hex float (double or float)
+                // Hex float: LLVM IR always encodes as double-precision bits.
+                // For float32: interpret bits as double, then convert the VALUE to Float.
+                // For float16: interpret bits as double, then convert the VALUE to Float16 bits.
                 let hexStr = String(text.dropFirst(2))
                 if let bits = UInt64(hexStr, radix: 16) {
+                    let asDouble = Double(bitPattern: bits)
                     if case .float32 = type {
-                        return .constant(.float32(Float(bitPattern: UInt32(bits & 0xFFFFFFFF))))
+                        return .constant(.float32(Float(asDouble)))
                     } else if case .float64 = type {
-                        return .constant(.float64(Double(bitPattern: bits)))
+                        return .constant(.float64(asDouble))
                     }
-                    // For half type with plain 0x prefix
                     if case .float16 = type {
                         return .constant(.float16(UInt16(bits & 0xFFFF)))
                     }
@@ -1546,15 +1585,18 @@ public struct Parser {
                 let bits = UInt16(String(text.dropFirst(3)), radix: 16) ?? 0
                 return .float16(bits)
             } else if text.hasPrefix("0x") {
+                // LLVM IR hex floats are always double-precision bits.
+                // Convert the double VALUE to the target type.
                 let hexStr = String(text.dropFirst(2))
                 if let bits = UInt64(hexStr, radix: 16) {
+                    let asDouble = Double(bitPattern: bits)
                     if case .float32 = type {
-                        return .float32(Float(bitPattern: UInt32(bits & 0xFFFFFFFF)))
+                        return .float32(Float(asDouble))
                     }
                     if case .float16 = type {
                         return .float16(UInt16(bits & 0xFFFF))
                     }
-                    return .float64(Double(bitPattern: bits))
+                    return .float64(asDouble)
                 }
             }
             if let d = Double(text) {

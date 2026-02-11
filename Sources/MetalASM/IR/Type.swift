@@ -56,6 +56,16 @@ public indirect enum IRType: Hashable {
         return nil
     }
 
+    /// Whether this is a floating-point type (half, bfloat, float, double).
+    var isFloatingPoint: Bool {
+        switch self {
+        case .float16, .bfloat16, .float32, .float64:
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Whether this is a first-class type (can be used as a value).
     var isFirstClass: Bool {
         switch self {

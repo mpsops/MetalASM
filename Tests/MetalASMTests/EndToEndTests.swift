@@ -187,6 +187,30 @@ final class EndToEndTests: XCTestCase {
         }
     }
 
+    /// Test assembling attention IR and loading on GPU.
+    func testAssembleAttentionIR() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let path = "/tmp/mfa_attn_10x10x3_fwd.ll"
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw XCTSkip("Attention IR not found at \(path)")
+        }
+        let source = try String(contentsOfFile: path, encoding: .utf8)
+        let metallib = try MetalASM.assemble(ir: source, platform: .macOS(version: 26))
+        print("Assembled \(metallib.count) bytes")
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal device")
+        }
+        let library = try device.makeLibrary(data: asDispatchData(metallib))
+        let fn = library.makeFunction(name: "attention")
+        XCTAssertNotNil(fn, "attention function not found")
+        let pipeline = try device.makeComputePipelineState(function: fn!)
+        print("GPU load OK, maxTotalThreadsPerThreadgroup=\(pipeline.maxTotalThreadsPerThreadgroup)")
+        #endif
+    }
+
     /// Test assembling progressively larger subsets of MFA IR.
     func testMFABisect() throws {
         // Test various IR files to isolate the invalid record
