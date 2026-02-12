@@ -79,26 +79,17 @@ public final class BitcodeWriter {
 
         // Triple
         if !module.targetTriple.isEmpty {
-            let tripleBytes = Array(module.targetTriple.utf8)
-            var ops: [UInt64] = []
-            for b in tripleBytes { ops.append(UInt64(b)) }
-            writer.emitUnabbrevRecord(code: tripleCode, operands: ops)
+            writer.emitUnabbrevStringRecord(code: tripleCode, module.targetTriple)
         }
 
         // Data layout
         if !module.dataLayout.isEmpty {
-            let dlBytes = Array(module.dataLayout.utf8)
-            var ops: [UInt64] = []
-            for b in dlBytes { ops.append(UInt64(b)) }
-            writer.emitUnabbrevRecord(code: datalayoutCode, operands: ops)
+            writer.emitUnabbrevStringRecord(code: datalayoutCode, module.dataLayout)
         }
 
         // Source filename
         if !module.sourceFilename.isEmpty {
-            let sfBytes = Array(module.sourceFilename.utf8)
-            var ops: [UInt64] = []
-            for b in sfBytes { ops.append(UInt64(b)) }
-            writer.emitUnabbrevRecord(code: sourceFilenameCode, operands: ops)
+            writer.emitUnabbrevStringRecord(code: sourceFilenameCode, module.sourceFilename)
         }
 
         // Build module constant map first (needed for global var initIDs)
@@ -164,101 +155,101 @@ public final class BitcodeWriter {
                 switch attr {
                 // Enum attribute IDs from LLVMBitCodes.h (ATTR_KIND_*)
                 case .noUnwind:
-                    operands.append(contentsOf: encodeEnumAttr(id: 18))  // ATTR_KIND_NO_UNWIND
+                    appendEnumAttr(to: &operands, id: 18)  // ATTR_KIND_NO_UNWIND
                 case .noReturn:
-                    operands.append(contentsOf: encodeEnumAttr(id: 17))  // ATTR_KIND_NO_RETURN
+                    appendEnumAttr(to: &operands, id: 17)  // ATTR_KIND_NO_RETURN
                 case .convergent:
-                    operands.append(contentsOf: encodeEnumAttr(id: 43))  // ATTR_KIND_CONVERGENT
+                    appendEnumAttr(to: &operands, id: 43)  // ATTR_KIND_CONVERGENT
                 case .mustProgress:
-                    operands.append(contentsOf: encodeEnumAttr(id: 70))  // ATTR_KIND_MUSTPROGRESS
+                    appendEnumAttr(to: &operands, id: 70)  // ATTR_KIND_MUSTPROGRESS
                 case .willReturn:
-                    operands.append(contentsOf: encodeEnumAttr(id: 61))  // ATTR_KIND_WILLRETURN
+                    appendEnumAttr(to: &operands, id: 61)  // ATTR_KIND_WILLRETURN
                 case .noFree:
-                    operands.append(contentsOf: encodeEnumAttr(id: 62))  // ATTR_KIND_NOFREE
+                    appendEnumAttr(to: &operands, id: 62)  // ATTR_KIND_NOFREE
                 case .noSync:
-                    operands.append(contentsOf: encodeEnumAttr(id: 63))  // ATTR_KIND_NOSYNC
+                    appendEnumAttr(to: &operands, id: 63)  // ATTR_KIND_NOSYNC
                 case .noCallback:
-                    operands.append(contentsOf: encodeEnumAttr(id: 71))  // ATTR_KIND_NO_CALLBACK
+                    appendEnumAttr(to: &operands, id: 71)  // ATTR_KIND_NO_CALLBACK
                 case .argMemOnly:
-                    operands.append(contentsOf: encodeEnumAttr(id: 45))  // ATTR_KIND_ARGMEMONLY
+                    appendEnumAttr(to: &operands, id: 45)  // ATTR_KIND_ARGMEMONLY
                 case .readNone:
-                    operands.append(contentsOf: encodeEnumAttr(id: 20))  // ATTR_KIND_READ_NONE
+                    appendEnumAttr(to: &operands, id: 20)  // ATTR_KIND_READ_NONE
                 case .readOnly:
-                    operands.append(contentsOf: encodeEnumAttr(id: 21))  // ATTR_KIND_READ_ONLY
+                    appendEnumAttr(to: &operands, id: 21)  // ATTR_KIND_READ_ONLY
                 case .noCapture:
-                    operands.append(contentsOf: encodeEnumAttr(id: 11))  // ATTR_KIND_NO_CAPTURE
+                    appendEnumAttr(to: &operands, id: 11)  // ATTR_KIND_NO_CAPTURE
                 case .noAlias:
-                    operands.append(contentsOf: encodeEnumAttr(id: 9))   // ATTR_KIND_NO_ALIAS
+                    appendEnumAttr(to: &operands, id: 9)   // ATTR_KIND_NO_ALIAS
                 case .nonNull:
-                    operands.append(contentsOf: encodeEnumAttr(id: 39))  // ATTR_KIND_NON_NULL
+                    appendEnumAttr(to: &operands, id: 39)  // ATTR_KIND_NON_NULL
                 case .signExt:
-                    operands.append(contentsOf: encodeEnumAttr(id: 24))  // ATTR_KIND_S_EXT
+                    appendEnumAttr(to: &operands, id: 24)  // ATTR_KIND_S_EXT
                 case .zeroExt:
-                    operands.append(contentsOf: encodeEnumAttr(id: 34))  // ATTR_KIND_Z_EXT
+                    appendEnumAttr(to: &operands, id: 34)  // ATTR_KIND_Z_EXT
                 case .inReg:
-                    operands.append(contentsOf: encodeEnumAttr(id: 5))   // ATTR_KIND_IN_REG
+                    appendEnumAttr(to: &operands, id: 5)   // ATTR_KIND_IN_REG
                 case .structRet:
-                    operands.append(contentsOf: encodeEnumAttr(id: 29))  // ATTR_KIND_STRUCT_RET
+                    appendEnumAttr(to: &operands, id: 29)  // ATTR_KIND_STRUCT_RET
                 case .byVal:
-                    operands.append(contentsOf: encodeEnumAttr(id: 3))   // ATTR_KIND_BY_VAL
+                    appendEnumAttr(to: &operands, id: 3)   // ATTR_KIND_BY_VAL
                 case .nest:
-                    operands.append(contentsOf: encodeEnumAttr(id: 8))   // ATTR_KIND_NEST
+                    appendEnumAttr(to: &operands, id: 8)   // ATTR_KIND_NEST
                 case .noRecurse:
-                    operands.append(contentsOf: encodeEnumAttr(id: 48))  // ATTR_KIND_NO_RECURSE
+                    appendEnumAttr(to: &operands, id: 48)  // ATTR_KIND_NO_RECURSE
                 case .noInline:
-                    operands.append(contentsOf: encodeEnumAttr(id: 14))  // ATTR_KIND_NO_INLINE
+                    appendEnumAttr(to: &operands, id: 14)  // ATTR_KIND_NO_INLINE
                 case .alwaysInline:
-                    operands.append(contentsOf: encodeEnumAttr(id: 2))   // ATTR_KIND_ALWAYS_INLINE
+                    appendEnumAttr(to: &operands, id: 2)   // ATTR_KIND_ALWAYS_INLINE
                 case .optNone:
-                    operands.append(contentsOf: encodeEnumAttr(id: 37))  // ATTR_KIND_OPTIMIZE_NONE
+                    appendEnumAttr(to: &operands, id: 37)  // ATTR_KIND_OPTIMIZE_NONE
                 case .optSize:
-                    operands.append(contentsOf: encodeEnumAttr(id: 19))  // ATTR_KIND_OPTIMIZE_FOR_SIZE
+                    appendEnumAttr(to: &operands, id: 19)  // ATTR_KIND_OPTIMIZE_FOR_SIZE
                 case .minSize:
-                    operands.append(contentsOf: encodeEnumAttr(id: 6))   // ATTR_KIND_MIN_SIZE
+                    appendEnumAttr(to: &operands, id: 6)   // ATTR_KIND_MIN_SIZE
                 case .speculatable:
-                    operands.append(contentsOf: encodeEnumAttr(id: 53))  // ATTR_KIND_SPECULATABLE
+                    appendEnumAttr(to: &operands, id: 53)  // ATTR_KIND_SPECULATABLE
                 case .strictFP:
-                    operands.append(contentsOf: encodeEnumAttr(id: 54))  // ATTR_KIND_STRICT_FP
+                    appendEnumAttr(to: &operands, id: 54)  // ATTR_KIND_STRICT_FP
                 case .immArg:
-                    operands.append(contentsOf: encodeEnumAttr(id: 60))  // ATTR_KIND_IMMARG
+                    appendEnumAttr(to: &operands, id: 60)  // ATTR_KIND_IMMARG
                 case .noundef:
-                    operands.append(contentsOf: encodeEnumAttr(id: 68))  // ATTR_KIND_NOUNDEF
+                    appendEnumAttr(to: &operands, id: 68)  // ATTR_KIND_NOUNDEF
                 case .returned:
-                    operands.append(contentsOf: encodeEnumAttr(id: 22))  // ATTR_KIND_RETURNED
+                    appendEnumAttr(to: &operands, id: 22)  // ATTR_KIND_RETURNED
                 case .writeOnly:
-                    operands.append(contentsOf: encodeEnumAttr(id: 52))  // ATTR_KIND_WRITEONLY
+                    appendEnumAttr(to: &operands, id: 52)  // ATTR_KIND_WRITEONLY
                 case .cold:
-                    operands.append(contentsOf: encodeEnumAttr(id: 36))  // ATTR_KIND_COLD
+                    appendEnumAttr(to: &operands, id: 36)  // ATTR_KIND_COLD
                 case .hot:
-                    operands.append(contentsOf: encodeEnumAttr(id: 72))  // ATTR_KIND_HOT
+                    appendEnumAttr(to: &operands, id: 72)  // ATTR_KIND_HOT
                 case .naked:
-                    operands.append(contentsOf: encodeEnumAttr(id: 7))   // ATTR_KIND_NAKED
+                    appendEnumAttr(to: &operands, id: 7)   // ATTR_KIND_NAKED
                 case .noBuiltin:
-                    operands.append(contentsOf: encodeEnumAttr(id: 10))  // ATTR_KIND_NO_BUILTIN
+                    appendEnumAttr(to: &operands, id: 10)  // ATTR_KIND_NO_BUILTIN
                 case .noImplicitFloat:
-                    operands.append(contentsOf: encodeEnumAttr(id: 13))  // ATTR_KIND_NO_IMPLICIT_FLOAT
+                    appendEnumAttr(to: &operands, id: 13)  // ATTR_KIND_NO_IMPLICIT_FLOAT
                 case .noProfile:
-                    operands.append(contentsOf: encodeEnumAttr(id: 73))  // ATTR_KIND_NO_PROFILE
+                    appendEnumAttr(to: &operands, id: 73)  // ATTR_KIND_NO_PROFILE
                 case .noSanitizeCoverage:
-                    operands.append(contentsOf: encodeEnumAttr(id: 76))  // ATTR_KIND_NO_SANITIZE_COVERAGE
+                    appendEnumAttr(to: &operands, id: 76)  // ATTR_KIND_NO_SANITIZE_COVERAGE
                 case .noRedZone:
-                    operands.append(contentsOf: encodeEnumAttr(id: 16))  // ATTR_KIND_NO_RED_ZONE
+                    appendEnumAttr(to: &operands, id: 16)  // ATTR_KIND_NO_RED_ZONE
                 case .noMerge:
-                    operands.append(contentsOf: encodeEnumAttr(id: 66))  // ATTR_KIND_NO_MERGE
+                    appendEnumAttr(to: &operands, id: 66)  // ATTR_KIND_NO_MERGE
                 case .inaccessibleMemOnly:
-                    operands.append(contentsOf: encodeEnumAttr(id: 49))  // ATTR_KIND_INACCESSIBLEMEM_ONLY
+                    appendEnumAttr(to: &operands, id: 49)  // ATTR_KIND_INACCESSIBLEMEM_ONLY
                 case .inaccessibleMemOrArgMemOnly:
-                    operands.append(contentsOf: encodeEnumAttr(id: 50))  // ATTR_KIND_INACCESSIBLEMEM_OR_ARGMEMONLY
+                    appendEnumAttr(to: &operands, id: 50)  // ATTR_KIND_INACCESSIBLEMEM_OR_ARGMEMONLY
                 case .stringAttr(let key, let value):
                     if let value = value {
                         operands.append(4) // string attr with value
-                        for b in key.utf8 { operands.append(UInt64(b)) }
+                        operands.append(contentsOf: key.utf8.lazy.map { UInt64($0) })
                         operands.append(0) // null terminator
-                        for b in value.utf8 { operands.append(UInt64(b)) }
+                        operands.append(contentsOf: value.utf8.lazy.map { UInt64($0) })
                         operands.append(0) // null terminator
                     } else {
                         operands.append(3) // string attr without value
-                        for b in key.utf8 { operands.append(UInt64(b)) }
+                        operands.append(contentsOf: key.utf8.lazy.map { UInt64($0) })
                         operands.append(0) // null terminator
                     }
                 default:
@@ -272,10 +263,11 @@ public final class BitcodeWriter {
         writer.exitBlock()
     }
 
-    /// Encode an enum attribute ID for the PARAMATTR_GRP record.
-    private static func encodeEnumAttr(id: UInt64) -> [UInt64] {
-        // In PARAMATTR_GRP, enum attrs are: [kind=0, attr_id]
-        return [0, id]
+    /// Append an enum attribute to the operands array (inline, no allocation).
+    @inline(__always)
+    private static func appendEnumAttr(to operands: inout [UInt64], id: UInt64) {
+        operands.append(0)  // kind=0 (enum)
+        operands.append(id)
     }
 
     private static func writeParamAttrBlock(to writer: BitstreamWriter, module: IRModule) {
@@ -399,12 +391,7 @@ public final class BitcodeWriter {
         writer.enterSubblock(blockID: 14, abbrevLen: 4) // VALUE_SYMTAB_BLOCK
 
         for entry in enumerator.globalValues {
-            let nameBytes = Array(entry.name.utf8)
-            var operands: [UInt64] = [UInt64(entry.valueID)]
-            for b in nameBytes {
-                operands.append(UInt64(b))
-            }
-            writer.emitUnabbrevRecord(code: 1, operands: operands) // VST_CODE_ENTRY
+            writer.emitUnabbrevStringRecord(code: 1, leading: UInt64(entry.valueID), entry.name)
         }
 
         writer.exitBlock()

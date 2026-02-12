@@ -12,21 +12,21 @@ final class LexerTests: XCTestCase {
         let significant = tokens.filter { $0.kind != .newline && $0.kind != .eof }
 
         XCTAssertEqual(significant[0].kind, .keyword)
-        XCTAssertEqual(significant[0].text, "define")
+        XCTAssertEqual(lexer.text(significant[0]), "define")
 
         XCTAssertEqual(significant[1].kind, .keyword)
-        XCTAssertEqual(significant[1].text, "void")
+        XCTAssertEqual(lexer.text(significant[1]), "void")
 
         XCTAssertEqual(significant[2].kind, .globalIdent)
-        XCTAssertEqual(significant[2].text, "@main")
+        XCTAssertEqual(lexer.text(significant[2]), "@main")
 
         XCTAssertEqual(significant[3].kind, .leftParen)
         XCTAssertEqual(significant[4].kind, .rightParen)
         XCTAssertEqual(significant[5].kind, .leftBrace)
         XCTAssertEqual(significant[6].kind, .keyword)
-        XCTAssertEqual(significant[6].text, "ret")
+        XCTAssertEqual(lexer.text(significant[6]), "ret")
         XCTAssertEqual(significant[7].kind, .keyword)
-        XCTAssertEqual(significant[7].text, "void")
+        XCTAssertEqual(lexer.text(significant[7]), "void")
         XCTAssertEqual(significant[8].kind, .rightBrace)
     }
 
@@ -35,7 +35,7 @@ final class LexerTests: XCTestCase {
         let lexer = Lexer(source: source)
         let tokens = lexer.tokenize()
         let significant = tokens.filter { $0.kind != .newline && $0.kind != .eof }
-        XCTAssertEqual(significant[0].text, "define")
+        XCTAssertEqual(lexer.text(significant[0]), "define")
     }
 
     func testMetadataTokens() {
@@ -45,12 +45,12 @@ final class LexerTests: XCTestCase {
         let significant = tokens.filter { $0.kind != .newline && $0.kind != .eof }
 
         XCTAssertEqual(significant[0].kind, .metadataIdent)
-        XCTAssertEqual(significant[0].text, "!0")
+        XCTAssertEqual(lexer.text(significant[0]), "!0")
         XCTAssertEqual(significant[1].kind, .equals)
         XCTAssertEqual(significant[2].kind, .exclamation)
         XCTAssertEqual(significant[3].kind, .leftBrace)
         XCTAssertEqual(significant[4].kind, .metadataString)
-        XCTAssertEqual(significant[4].text, "!\"hello\"")
+        XCTAssertEqual(lexer.text(significant[4]), "!\"hello\"")
     }
 
     func testTypes() {
@@ -59,10 +59,10 @@ final class LexerTests: XCTestCase {
         let tokens = lexer.tokenize()
         let significant = tokens.filter { $0.kind != .newline && $0.kind != .eof }
 
-        XCTAssertEqual(significant[0].text, "float")
-        XCTAssertEqual(significant[1].text, "addrspace")
+        XCTAssertEqual(lexer.text(significant[0]), "float")
+        XCTAssertEqual(lexer.text(significant[1]), "addrspace")
         XCTAssertEqual(significant[2].kind, .leftParen)
-        XCTAssertEqual(significant[3].text, "1")
+        XCTAssertEqual(lexer.text(significant[3]), "1")
         XCTAssertEqual(significant[4].kind, .rightParen)
         XCTAssertEqual(significant[5].kind, .star)
     }
@@ -74,9 +74,9 @@ final class LexerTests: XCTestCase {
         let significant = tokens.filter { $0.kind != .newline && $0.kind != .eof }
 
         XCTAssertEqual(significant[0].kind, .localIdent)
-        XCTAssertEqual(significant[0].text, "%ev")
+        XCTAssertEqual(lexer.text(significant[0]), "%ev")
         XCTAssertEqual(significant[1].kind, .equals)
-        XCTAssertEqual(significant[2].text, "alloca")
+        XCTAssertEqual(lexer.text(significant[2]), "alloca")
     }
 
     func testAttrGroupRef() {
@@ -85,9 +85,9 @@ final class LexerTests: XCTestCase {
         let tokens = lexer.tokenize()
         let significant = tokens.filter { $0.kind != .newline && $0.kind != .eof }
 
-        XCTAssertEqual(significant[0].text, "attributes")
+        XCTAssertEqual(lexer.text(significant[0]), "attributes")
         XCTAssertEqual(significant[1].kind, .attrGroupRef)
-        XCTAssertEqual(significant[1].text, "#0")
+        XCTAssertEqual(lexer.text(significant[1]), "#0")
     }
 
     func testNumbers() {
@@ -97,13 +97,13 @@ final class LexerTests: XCTestCase {
         let significant = tokens.filter { $0.kind != .newline && $0.kind != .eof }
 
         XCTAssertEqual(significant[0].kind, .integer)
-        XCTAssertEqual(significant[0].text, "42")
+        XCTAssertEqual(lexer.text(significant[0]), "42")
         XCTAssertEqual(significant[1].kind, .integer)
-        XCTAssertEqual(significant[1].text, "-1")
+        XCTAssertEqual(lexer.text(significant[1]), "-1")
         XCTAssertEqual(significant[2].kind, .integer)
-        XCTAssertEqual(significant[2].text, "0xFF")
+        XCTAssertEqual(lexer.text(significant[2]), "0xFF")
         XCTAssertEqual(significant[3].kind, .float_)
-        XCTAssertEqual(significant[3].text, "2.0")
+        XCTAssertEqual(lexer.text(significant[3]), "2.0")
     }
 
     func testStringTokens() {
@@ -113,7 +113,7 @@ final class LexerTests: XCTestCase {
         let significant = tokens.filter { $0.kind != .newline && $0.kind != .eof }
 
         XCTAssertEqual(significant[0].kind, .string)
-        XCTAssertEqual(significant[0].text, "\"hello world\"")
+        XCTAssertEqual(lexer.text(significant[0]), "\"hello world\"")
     }
 
     func testMonolithicIR() throws {
@@ -133,7 +133,7 @@ final class LexerTests: XCTestCase {
         XCTAssertEqual(tokens.last?.kind, .eof)
 
         // Should contain key identifiers
-        let texts = Set(tokens.map { $0.text })
+        let texts = Set(tokens.map { lexer.text($0) })
         XCTAssertTrue(texts.contains("define"))
         XCTAssertTrue(texts.contains("declare"))
         XCTAssertTrue(texts.contains("@monolithic_kernel"))

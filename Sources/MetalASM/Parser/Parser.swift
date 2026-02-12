@@ -4,6 +4,7 @@
 /// Supports the subset of LLVM IR used by Metal AIR, including typed pointers.
 public struct Parser {
     private var tokens: [Token]
+    private let source: [UInt8]
     private var pos: Int = 0
 
     /// Named values in the current function scope.
@@ -15,8 +16,102 @@ public struct Parser {
     /// Struct type definitions.
     private var structTypes: [String: IRType] = [:]
 
-    public init(tokens: [Token]) {
+    public init(tokens: [Token], source: [UInt8]) {
         self.tokens = tokens
+        self.source = source
+    }
+
+    /// Get the text of a token from the source buffer.
+    @inline(__always)
+    private func text(_ t: Token) -> String {
+        String(decoding: source[t.start..<t.end], as: UTF8.self)
+    }
+
+    /// Compare token text to a string without allocating (for hot paths).
+    @inline(__always)
+    private func textEquals(_ t: Token, _ s: String) -> Bool {
+        let len = t.end - t.start
+        guard len == s.utf8.count else { return false }
+        var i = t.start
+        for b in s.utf8 {
+            if source[i] != b { return false }
+            i += 1
+        }
+        return true
+    }
+
+    /// Compare token text to a static string without allocating.
+    @inline(__always)
+    private func textEquals(_ t: Token, _ s: StaticString) -> Bool {
+        let len = t.end - t.start
+        guard len == s.utf8CodeUnitCount else { return false }
+        return s.withUTF8Buffer { buf in
+            for i in 0..<len {
+                if source[t.start + i] != buf[i] { return false }
+            }
+            return true
+        }
+    }
+
+    /// Parse an integer from token bytes without String allocation.
+    @inline(__always)
+    private func tokenInt(_ t: Token) -> Int? {
+        var i = t.start
+        let end = t.end
+        guard i < end else { return nil }
+        var neg = false
+        if source[i] == 0x2D { neg = true; i += 1 } // '-'
+        guard i < end && source[i] >= 0x30 && source[i] <= 0x39 else { return nil }
+        var val = 0
+        while i < end {
+            let b = source[i]
+            guard b >= 0x30 && b <= 0x39 else { return nil }
+            val = val * 10 + Int(b - 0x30)
+            i += 1
+        }
+        return neg ? -val : val
+    }
+
+    /// Build a String from token bytes, skipping `drop` bytes from the start.
+    @inline(__always)
+    private func tokenText(_ t: Token, dropFirst drop: Int = 0) -> String {
+        String(decoding: source[(t.start + drop)..<t.end], as: UTF8.self)
+    }
+
+    /// Parse hex digits from token bytes (after skipping `drop` prefix bytes) into UInt64.
+    @inline(__always)
+    private func tokenHexUInt64(_ t: Token, dropFirst drop: Int) -> UInt64? {
+        var i = t.start + drop
+        let end = t.end
+        guard i < end else { return nil }
+        var val: UInt64 = 0
+        while i < end {
+            let b = source[i]
+            if b >= 0x30 && b <= 0x39 { val = val &* 16 &+ UInt64(b - 0x30) }
+            else if b >= 0x61 && b <= 0x66 { val = val &* 16 &+ UInt64(b - 0x61 + 10) }
+            else if b >= 0x41 && b <= 0x46 { val = val &* 16 &+ UInt64(b - 0x41 + 10) }
+            else { return nil }
+            i += 1
+        }
+        return val
+    }
+
+    /// Check if token matches any string in a set (byte-level, no allocation).
+    @inline(__always)
+    private func tokenInSet(_ t: Token, _ set: Set<String>) -> Bool {
+        let len = t.end - t.start
+        for s in set {
+            if s.utf8.count == len {
+                var match = true
+                var i = t.start
+                for b in s.utf8 {
+                    if source[i] != b { match = false; break }
+                    i += 1
+                }
+                if match { return true }
+            }
+        }
+        return false
     }
 
     // MARK: - Error handling
@@ -30,7 +125,7 @@ public struct Parser {
 
     private var current: Token {
         guard pos < tokens.count else {
-            return Token(kind: .eof, text: "")
+            return Token.eof
         }
         return tokens[pos]
     }
@@ -50,7 +145,7 @@ public struct Parser {
     private func peek(offset: Int = 0) -> Token {
         let idx = pos + offset
         guard idx < tokens.count else {
-            return Token(kind: .eof, text: "")
+            return Token.eof
         }
         return tokens[idx]
     }
@@ -60,9 +155,9 @@ public struct Parser {
         guard current.kind == kind else {
             throw ParseError.expected(
                 "\(kind) \(context)",
-                got: "\(current.kind)(\(current.text))",
-                line: current.line,
-                column: current.column
+                got: "\(current.kind)(\(text(current)))",
+                line: 0,
+                column: 0
             )
         }
         return advance()
@@ -70,19 +165,19 @@ public struct Parser {
 
     private mutating func expectKeyword(_ keyword: String) throws -> Token {
         skipNewlines()
-        guard current.kind == .keyword && current.text == keyword else {
+        guard current.kind == .keyword && textEquals(current, keyword) else {
             throw ParseError.expected(
                 "keyword '\(keyword)'",
-                got: current.text,
-                line: current.line,
-                column: current.column
+                got: text(current),
+                line: 0,
+                column: 0
             )
         }
         return advance()
     }
 
     private mutating func consumeIfKeyword(_ keyword: String) -> Bool {
-        if current.kind == .keyword && current.text == keyword {
+        if current.kind == .keyword && textEquals(current, keyword) {
             pos += 1
             return true
         }
@@ -134,42 +229,33 @@ public struct Parser {
     // MARK: - Top-level keyword handling
 
     private mutating func parseTopLevelKeyword(_ module: IRModule) throws {
-        let keyword = current.text
-
-        switch keyword {
-        case "source_filename":
+        if textEquals(current, "source_filename") {
             _ = advance()
             _ = try expect(.equals)
             let str = try expect(.string)
-            module.sourceFilename = unquote(str.text)
-
-        case "target":
+            module.sourceFilename = unquote(text(str))
+        } else if textEquals(current, "target") {
             _ = advance()
             let what = try expect(.keyword)
             _ = try expect(.equals)
             let str = try expect(.string)
-            if what.text == "datalayout" {
-                module.dataLayout = unquote(str.text)
-            } else if what.text == "triple" {
-                module.targetTriple = unquote(str.text)
+            if textEquals(what, "datalayout") {
+                module.dataLayout = unquote(text(str))
+            } else if textEquals(what, "triple") {
+                module.targetTriple = unquote(text(str))
             }
-
-        case "define":
+        } else if textEquals(current, "define") {
             let fn = try parseFunctionDefinition()
             module.functions.append(fn)
             globalValues[fn.name] = IRValue(type: fn.type, name: fn.name)
-
-        case "declare":
+        } else if textEquals(current, "declare") {
             let fn = try parseFunctionDeclaration()
             module.functions.append(fn)
             globalValues[fn.name] = IRValue(type: fn.type, name: fn.name)
-
-        case "attributes":
+        } else if textEquals(current, "attributes") {
             let group = try parseAttributeGroup()
             module.attributeGroups.append(group)
-
-        default:
-            // Skip unknown top-level directives
+        } else {
             skipToNextLine()
         }
     }
@@ -179,12 +265,12 @@ public struct Parser {
     private mutating func parseTypeDefinition(_ module: IRModule) throws {
         // %name = type { ... } or %name = type opaque
         let nameTok = try expect(.localIdent)
-        let name = String(nameTok.text.dropFirst()) // remove %
+        let name = tokenText(nameTok, dropFirst: 1) // remove %
         _ = try expect(.equals)
         _ = try expectKeyword("type")
 
         skipNewlines()
-        if current.kind == .keyword && current.text == "opaque" {
+        if current.kind == .keyword && textEquals(current, "opaque") {
             _ = advance()
             let opaqueType = IRType.opaque(name: name)
             structTypes[name] = opaqueType
@@ -224,7 +310,7 @@ public struct Parser {
 
     private mutating func parseGlobalDefinition(_ module: IRModule) throws {
         let nameTok = try expect(.globalIdent)
-        let name = String(nameTok.text.dropFirst()) // remove @
+        let name = tokenText(nameTok, dropFirst: 1) // remove @
         _ = try expect(.equals)
 
         skipNewlines()
@@ -244,11 +330,11 @@ public struct Parser {
                 localUnnamedAddr = true
             } else if consumeIfKeyword("unnamed_addr") {
                 unnamedAddr = true
-            } else if current.kind == .keyword && current.text == "addrspace" {
+            } else if current.kind == .keyword && textEquals(current, "addrspace") {
                 _ = advance()
                 _ = try expect(.leftParen)
                 let spaceTok = try expect(.integer)
-                addressSpace = Int(spaceTok.text) ?? 0
+                addressSpace = tokenInt(spaceTok) ?? 0
                 _ = try expect(.rightParen)
             } else if consumeIfKeyword("externally_initialized") {
                 // skip
@@ -285,7 +371,7 @@ public struct Parser {
             skipNewlines()
             if consumeIfKeyword("align") {
                 let alignTok = try expect(.integer)
-                alignment = Int(alignTok.text) ?? 0
+                alignment = tokenInt(alignTok) ?? 0
             } else {
                 // Skip other attributes
                 _ = advance()
@@ -360,7 +446,7 @@ public struct Parser {
 
         // Parse function name
         let nameTok = try expect(.globalIdent)
-        let name = String(nameTok.text.dropFirst())
+        let name = tokenText(nameTok, dropFirst: 1)
 
         // Parse parameter list
         _ = try expect(.leftParen)
@@ -405,9 +491,9 @@ public struct Parser {
         while true {
             if current.kind == .attrGroupRef {
                 let ref = advance()
-                attrGroupIndex = Int(String(ref.text.dropFirst()))
+                attrGroupIndex = tokenInt(Token(kind: ref.kind, start: ref.start + 1, end: ref.end))
                 skipNewlines()
-            } else if current.kind == .keyword && isAttributeKeyword(current.text) {
+            } else if current.kind == .keyword && tokenInSet(current, Self.attributeKeywords) {
                 _ = advance()
                 skipNewlines()
             } else {
@@ -464,12 +550,12 @@ public struct Parser {
         // Parse attributes between type and name
         skipNewlines()
         while true {
-            if current.kind == .keyword && isParamAttributeKeyword(current.text) {
+            if current.kind == .keyword && tokenInSet(current, Self.paramAttributeKeywords) {
                 let attr = parseParamAttribute()
                 if let a = attr { attrs.append(a) }
             } else if current.kind == .string {
                 // String attribute like "air-buffer-no-alias"
-                let key = unquote(advance().text)
+                let key = unquote(text(advance()))
                 stringAttrs[key] = ""
             } else {
                 break
@@ -485,29 +571,27 @@ public struct Parser {
 
         // Parse name if present
         if current.kind == .localIdent {
-            name = String(advance().text.dropFirst())
+            name = tokenText(advance(), dropFirst: 1)
         }
 
         return (type, name, stringAttrs, attrs)
     }
 
     private mutating func parseParamAttribute() -> IRAttribute? {
-        let text = current.text
+        let t = current
         _ = advance()
-        switch text {
-        case "noundef": return .noundef
-        case "nocapture": return .noCapture
-        case "nonnull": return .nonNull
-        case "readonly": return .readOnly
-        case "writeonly": return .writeOnly
-        case "signext": return .signExt
-        case "zeroext": return .zeroExt
-        case "inreg": return .inReg
-        case "noalias": return .noAlias
-        case "immarg": return .immArg
-        case "returned": return .returned
-        default: return nil
-        }
+        if textEquals(t, "noundef") { return .noundef }
+        if textEquals(t, "nocapture") { return .noCapture }
+        if textEquals(t, "nonnull") { return .nonNull }
+        if textEquals(t, "readonly") { return .readOnly }
+        if textEquals(t, "writeonly") { return .writeOnly }
+        if textEquals(t, "signext") { return .signExt }
+        if textEquals(t, "zeroext") { return .zeroExt }
+        if textEquals(t, "inreg") { return .inReg }
+        if textEquals(t, "noalias") { return .noAlias }
+        if textEquals(t, "immarg") { return .immArg }
+        if textEquals(t, "returned") { return .returned }
+        return nil
     }
 
     // MARK: - Function body
@@ -530,7 +614,8 @@ public struct Parser {
                 if !isFirstBlock || !currentBlock.instructions.isEmpty {
                     blocks.append(currentBlock)
                 }
-                let labelName = String(advance().text.dropLast()) // remove trailing ':'
+                let labelTok = advance()
+                let labelName = String(decoding: source[labelTok.start..<(labelTok.end - 1)], as: UTF8.self) // remove trailing ':'
                 currentBlock = IRBasicBlock(name: labelName)
                 isFirstBlock = false
                 skipNewlines()
@@ -565,7 +650,7 @@ public struct Parser {
             let name = advance()
             if current.kind == .equals {
                 _ = advance() // consume =
-                resultName = String(name.text.dropFirst())
+                resultName = tokenText(name, dropFirst: 1)
             } else {
                 // Not an assignment - put back
                 pos = saved
@@ -581,86 +666,102 @@ public struct Parser {
             return nil
         }
 
-        let opcode = current.text
-
-        switch opcode {
-        case "ret":
-            return try parseRet()
-        case "br":
-            return try parseBr()
-        case "call", "tail", "musttail", "notail":
-            return try parseCall(resultName: resultName)
-        case "alloca":
-            return try parseAlloca(resultName: resultName)
-        case "load":
-            return try parseLoad(resultName: resultName)
-        case "store":
-            return try parseStore()
-        case "getelementptr":
-            return try parseGEP(resultName: resultName)
-        case "bitcast":
-            return try parseCast(opcode: .bitcast, resultName: resultName)
-        case "zext":
-            return try parseCast(opcode: .zext, resultName: resultName)
-        case "sext":
-            return try parseCast(opcode: .sext, resultName: resultName)
-        case "trunc":
-            return try parseCast(opcode: .trunc, resultName: resultName)
-        case "fptoui":
-            return try parseCast(opcode: .fpToUI, resultName: resultName)
-        case "fptosi":
-            return try parseCast(opcode: .fpToSI, resultName: resultName)
-        case "uitofp":
-            return try parseCast(opcode: .uiToFP, resultName: resultName)
-        case "sitofp":
-            return try parseCast(opcode: .siToFP, resultName: resultName)
-        case "fptrunc":
-            return try parseCast(opcode: .fpTrunc, resultName: resultName)
-        case "fpext":
-            return try parseCast(opcode: .fpExt, resultName: resultName)
-        case "ptrtoint":
-            return try parseCast(opcode: .ptrToInt, resultName: resultName)
-        case "inttoptr":
-            return try parseCast(opcode: .intToPtr, resultName: resultName)
-        case "addrspacecast":
-            return try parseCast(opcode: .addrSpaceCast, resultName: resultName)
-        case "add", "sub", "mul", "udiv", "sdiv", "urem", "srem",
-             "shl", "lshr", "ashr", "and", "or", "xor",
-             "fadd", "fsub", "fmul", "fdiv", "frem":
-            return try parseBinOp(resultName: resultName)
-        case "icmp":
-            return try parseCmp(isFP: false, resultName: resultName)
-        case "fcmp":
-            return try parseCmp(isFP: true, resultName: resultName)
-        case "phi":
-            return try parsePhi(resultName: resultName)
-        case "select":
-            return try parseSelect(resultName: resultName)
-        case "fneg":
-            return try parseFNeg(resultName: resultName)
-        case "extractvalue":
-            return try parseExtractValue(resultName: resultName)
-        case "insertvalue":
-            return try parseInsertValue(resultName: resultName)
-        case "extractelement":
-            return try parseExtractElement(resultName: resultName)
-        case "insertelement":
-            return try parseInsertElement(resultName: resultName)
-        case "shufflevector":
-            return try parseShuffleVector(resultName: resultName)
-        case "unreachable":
-            _ = advance()
-            return IRInstruction(opcode: .unreachable)
-        case "switch":
-            return try parseSwitch()
-        case "fence":
-            skipToNextLine()
-            return nil
+        // Dispatch by first byte + textEquals to avoid String allocation per instruction.
+        let t = current
+        let fb = source[t.start]
+        switch fb {
+        case 0x72: // r
+            if textEquals(t, "ret") { return try parseRet() }
+            break
+        case 0x62: // b
+            if textEquals(t, "br") { return try parseBr() }
+            if textEquals(t, "bitcast") { return try parseCast(opcode: .bitcast, resultName: resultName) }
+            break
+        case 0x63: // c
+            if textEquals(t, "call") { return try parseCall(resultName: resultName) }
+            break
+        case 0x74: // t
+            if textEquals(t, "tail") || textEquals(t, "trunc") {
+                if textEquals(t, "tail") { return try parseCall(resultName: resultName) }
+                return try parseCast(opcode: .trunc, resultName: resultName)
+            }
+            break
+        case 0x6D: // m
+            if textEquals(t, "musttail") { return try parseCall(resultName: resultName) }
+            if textEquals(t, "mul") { return try parseBinOp(resultName: resultName) }
+            break
+        case 0x6E: // n
+            if textEquals(t, "notail") { return try parseCall(resultName: resultName) }
+            break
+        case 0x61: // a
+            if textEquals(t, "alloca") { return try parseAlloca(resultName: resultName) }
+            if textEquals(t, "add") || textEquals(t, "and") || textEquals(t, "ashr") {
+                return try parseBinOp(resultName: resultName)
+            }
+            if textEquals(t, "addrspacecast") { return try parseCast(opcode: .addrSpaceCast, resultName: resultName) }
+            break
+        case 0x6C: // l
+            if textEquals(t, "load") { return try parseLoad(resultName: resultName) }
+            if textEquals(t, "lshr") { return try parseBinOp(resultName: resultName) }
+            break
+        case 0x73: // s
+            if textEquals(t, "store") { return try parseStore() }
+            if textEquals(t, "select") { return try parseSelect(resultName: resultName) }
+            if textEquals(t, "sub") || textEquals(t, "sdiv") || textEquals(t, "srem") ||
+               textEquals(t, "shl") { return try parseBinOp(resultName: resultName) }
+            if textEquals(t, "sext") { return try parseCast(opcode: .sext, resultName: resultName) }
+            if textEquals(t, "sitofp") { return try parseCast(opcode: .siToFP, resultName: resultName) }
+            if textEquals(t, "shufflevector") { return try parseShuffleVector(resultName: resultName) }
+            if textEquals(t, "switch") { return try parseSwitch() }
+            break
+        case 0x67: // g
+            if textEquals(t, "getelementptr") { return try parseGEP(resultName: resultName) }
+            break
+        case 0x7A: // z
+            if textEquals(t, "zext") { return try parseCast(opcode: .zext, resultName: resultName) }
+            break
+        case 0x66: // f
+            if textEquals(t, "fptoui") { return try parseCast(opcode: .fpToUI, resultName: resultName) }
+            if textEquals(t, "fptosi") { return try parseCast(opcode: .fpToSI, resultName: resultName) }
+            if textEquals(t, "fptrunc") { return try parseCast(opcode: .fpTrunc, resultName: resultName) }
+            if textEquals(t, "fpext") { return try parseCast(opcode: .fpExt, resultName: resultName) }
+            if textEquals(t, "fadd") || textEquals(t, "fsub") || textEquals(t, "fmul") ||
+               textEquals(t, "fdiv") || textEquals(t, "frem") { return try parseBinOp(resultName: resultName) }
+            if textEquals(t, "fcmp") { return try parseCmp(isFP: true, resultName: resultName) }
+            if textEquals(t, "fneg") { return try parseFNeg(resultName: resultName) }
+            if textEquals(t, "fence") { skipToNextLine(); return nil }
+            break
+        case 0x75: // u
+            if textEquals(t, "uitofp") { return try parseCast(opcode: .uiToFP, resultName: resultName) }
+            if textEquals(t, "udiv") || textEquals(t, "urem") { return try parseBinOp(resultName: resultName) }
+            if textEquals(t, "unreachable") { _ = advance(); return IRInstruction(opcode: .unreachable) }
+            break
+        case 0x70: // p
+            if textEquals(t, "ptrtoint") { return try parseCast(opcode: .ptrToInt, resultName: resultName) }
+            if textEquals(t, "phi") { return try parsePhi(resultName: resultName) }
+            break
+        case 0x69: // i
+            if textEquals(t, "inttoptr") { return try parseCast(opcode: .intToPtr, resultName: resultName) }
+            if textEquals(t, "icmp") { return try parseCmp(isFP: false, resultName: resultName) }
+            if textEquals(t, "insertvalue") { return try parseInsertValue(resultName: resultName) }
+            if textEquals(t, "insertelement") { return try parseInsertElement(resultName: resultName) }
+            break
+        case 0x65: // e
+            if textEquals(t, "extractvalue") { return try parseExtractValue(resultName: resultName) }
+            if textEquals(t, "extractelement") { return try parseExtractElement(resultName: resultName) }
+            break
+        case 0x6F: // o
+            if textEquals(t, "or") || textEquals(t, "xor") { return try parseBinOp(resultName: resultName) }
+            break
+        case 0x78: // x
+            if textEquals(t, "xor") { return try parseBinOp(resultName: resultName) }
+            break
         default:
-            // Unknown instruction - skip line
-            skipToNextLine()
-            return nil
+            break
         }
+        // Unknown instruction - skip line
+        skipToNextLine()
+        return nil
     }
 
     // MARK: - Individual instruction parsers
@@ -687,7 +788,7 @@ public struct Parser {
         // Conditional: br i1 %cond, label %true, label %false
         if consumeIfKeyword("label") {
             let dest = try expect(.localIdent)
-            let bb = IRBasicBlock(name: String(dest.text.dropFirst()))
+            let bb = IRBasicBlock(name: tokenText(dest, dropFirst: 1))
             return IRInstruction(opcode: .br, operands: [.basicBlock(bb)])
         }
 
@@ -701,8 +802,8 @@ public struct Parser {
         _ = try expectKeyword("label")
         let falseDest = try expect(.localIdent)
 
-        let trueBB = IRBasicBlock(name: String(trueDest.text.dropFirst()))
-        let falseBB = IRBasicBlock(name: String(falseDest.text.dropFirst()))
+        let trueBB = IRBasicBlock(name: tokenText(trueDest, dropFirst: 1))
+        let falseBB = IRBasicBlock(name: tokenText(falseDest, dropFirst: 1))
         return IRInstruction(opcode: .br, operands: [cond, .basicBlock(trueBB), .basicBlock(falseBB)])
     }
 
@@ -722,7 +823,7 @@ public struct Parser {
 
         // Parse calling convention
         // Skip fast math flags
-        while current.kind == .keyword && isFastMathFlag(current.text) {
+        while current.kind == .keyword && tokenInSet(current, Self.binOpFlags) {
             _ = advance()
         }
 
@@ -731,7 +832,7 @@ public struct Parser {
 
         // Parse function reference
         let fnTok = try expect(.globalIdent)
-        let fnName = String(fnTok.text.dropFirst())
+        let fnName = tokenText(fnTok, dropFirst: 1)
 
         // Parse argument list
         _ = try expect(.leftParen)
@@ -791,7 +892,7 @@ public struct Parser {
             skipNewlines()
             if consumeIfKeyword("align") {
                 let tok = try expect(.integer)
-                alignment = Int(tok.text)
+                alignment = tokenInt(tok)
             } else {
                 // Skip unknown
                 _ = advance()
@@ -832,7 +933,7 @@ public struct Parser {
             skipNewlines()
             if consumeIfKeyword("align") {
                 let tok = try expect(.integer)
-                alignment = Int(tok.text)
+                alignment = tokenInt(tok)
             }
         }
 
@@ -869,7 +970,7 @@ public struct Parser {
             skipNewlines()
             if consumeIfKeyword("align") {
                 let tok = try expect(.integer)
-                alignment = Int(tok.text)
+                alignment = tokenInt(tok)
             }
         }
 
@@ -958,11 +1059,11 @@ public struct Parser {
     }
 
     private mutating func parseBinOp(resultName: String) throws -> IRInstruction {
-        let opcodeStr = advance().text
+        let opcodeTok = advance()
         skipNewlines()
 
         // Parse optional flags (nuw, nsw, exact, fast, nnan, etc.)
-        while current.kind == .keyword && isBinOpFlag(current.text) {
+        while current.kind == .keyword && tokenInSet(current, Self.binOpFlags) {
             _ = advance()
         }
 
@@ -971,7 +1072,7 @@ public struct Parser {
         _ = try expect(.comma)
         let rhs = try parseOperand(type: type)
 
-        let opcode = binOpFromString(opcodeStr)
+        let opcode = binOpFromToken(opcodeTok)
         let inst = IRInstruction(
             opcode: opcode,
             type: type,
@@ -991,13 +1092,13 @@ public struct Parser {
         skipNewlines()
 
         // Skip optional fast-math flags (e.g., fcmp fast ogt ...)
-        while current.kind == .keyword && isFastMathFlag(current.text) {
+        while current.kind == .keyword && tokenInSet(current, Self.binOpFlags) {
             _ = advance()
         }
 
         // Parse predicate
         let predTok = try expect(.keyword)
-        let predicate = cmpPredicate(predTok.text, isFP: isFP)
+        let predicate = cmpPredicate(predTok, isFP: isFP)
 
         let type = try parseType()
         let lhs = try parseOperand(type: type)
@@ -1033,7 +1134,7 @@ public struct Parser {
             let val = try parseOperand(type: type)
             _ = try expect(.comma)
             let bbTok = try expect(.localIdent)
-            let bb = IRBasicBlock(name: String(bbTok.text.dropFirst()))
+            let bb = IRBasicBlock(name: tokenText(bbTok, dropFirst: 1))
             _ = try expect(.rightBracket)
             operands.append(val)
             operands.append(.basicBlock(bb))
@@ -1109,7 +1210,7 @@ public struct Parser {
         var indices: [IRInstruction.Operand] = [agg]
         while consumeIf(.comma) {
             let tok = try expect(.integer)
-            indices.append(.intLiteral(Int64(tok.text)!))
+            indices.append(.intLiteral(Int64(tokenInt(tok) ?? 0)))
         }
         let inst = IRInstruction(opcode: .extractValue, type: .i32, name: resultName, operands: indices)
         if !resultName.isEmpty {
@@ -1129,7 +1230,7 @@ public struct Parser {
         var operands: [IRInstruction.Operand] = [agg, elem]
         while consumeIf(.comma) {
             let tok = try expect(.integer)
-            operands.append(.intLiteral(Int64(tok.text)!))
+            operands.append(.intLiteral(Int64(tokenInt(tok) ?? 0)))
         }
         let inst = IRInstruction(opcode: .insertValue, type: aggType, name: resultName, operands: operands)
         if !resultName.isEmpty {
@@ -1206,48 +1307,53 @@ public struct Parser {
 
         switch current.kind {
         case .keyword:
-            let text = current.text
-            switch text {
-            case "void": _ = advance(); baseType = .void
-            case "i1": _ = advance(); baseType = .i1
-            case "i8": _ = advance(); baseType = .i8
-            case "i16": _ = advance(); baseType = .i16
-            case "i32": _ = advance(); baseType = .i32
-            case "i64": _ = advance(); baseType = .i64
-            case "half": _ = advance(); baseType = .float16
-            case "bfloat": _ = advance(); baseType = .bfloat16
-            case "float": _ = advance(); baseType = .float32
-            case "double": _ = advance(); baseType = .float64
-            case "label": _ = advance(); baseType = .label
-            case "metadata": _ = advance(); baseType = .metadata
-            case "token": _ = advance(); baseType = .token
-            case "ptr":
+            let tt = current
+            let fb = source[tt.start]
+            let tlen = tt.end - tt.start
+            if fb == 0x76 && textEquals(tt, "void") { _ = advance(); baseType = .void }
+            else if fb == 0x69 && tlen == 2 && source[tt.start+1] == 0x31 { _ = advance(); baseType = .i1 }  // i1
+            else if fb == 0x69 && tlen == 2 && source[tt.start+1] == 0x38 { _ = advance(); baseType = .i8 }  // i8
+            else if fb == 0x69 && tlen == 3 && textEquals(tt, "i16") { _ = advance(); baseType = .i16 }
+            else if fb == 0x69 && tlen == 3 && textEquals(tt, "i32") { _ = advance(); baseType = .i32 }
+            else if fb == 0x69 && tlen == 3 && textEquals(tt, "i64") { _ = advance(); baseType = .i64 }
+            else if fb == 0x68 && textEquals(tt, "half") { _ = advance(); baseType = .float16 }
+            else if fb == 0x62 && textEquals(tt, "bfloat") { _ = advance(); baseType = .bfloat16 }
+            else if fb == 0x66 && tlen == 5 && textEquals(tt, "float") { _ = advance(); baseType = .float32 }
+            else if fb == 0x64 && textEquals(tt, "double") { _ = advance(); baseType = .float64 }
+            else if fb == 0x6C && textEquals(tt, "label") { _ = advance(); baseType = .label }
+            else if fb == 0x6D && textEquals(tt, "metadata") { _ = advance(); baseType = .metadata }
+            else if fb == 0x74 && textEquals(tt, "token") { _ = advance(); baseType = .token }
+            else if fb == 0x70 && textEquals(tt, "ptr") {
                 _ = advance()
-                // Opaque pointer: ptr or ptr addrspace(N)
-                if current.kind == .keyword && current.text == "addrspace" {
+                if current.kind == .keyword && textEquals(current, "addrspace") {
                     _ = advance()
                     _ = try expect(.leftParen)
                     let spaceTok = try expect(.integer)
-                    let addrSpace = Int(spaceTok.text) ?? 0
+                    let addrSpace = tokenInt(spaceTok) ?? 0
                     _ = try expect(.rightParen)
                     baseType = .pointer(pointee: .i8, addressSpace: addrSpace)
                 } else {
                     baseType = .pointer(pointee: .i8, addressSpace: 0)
                 }
-            case "opaque": _ = advance(); baseType = .opaque(name: "opaque")
-            default:
-                // Check for iN (arbitrary width integer)
-                if text.hasPrefix("i"), let bits = Int(text.dropFirst()) {
+            }
+            else if fb == 0x6F && textEquals(tt, "opaque") { _ = advance(); baseType = .opaque(name: "opaque") }
+            else if fb == 0x69 {
+                // iN (arbitrary width integer)
+                let sub = Token(kind: tt.kind, start: tt.start + 1, end: tt.end)
+                if let bits = tokenInt(sub) {
                     _ = advance()
                     baseType = .int(bits: bits)
                 } else {
-                    throw ParseError.unexpected("type keyword '\(text)'", line: current.line, column: current.column)
+                    throw ParseError.unexpected("type keyword '\(text(tt))'", line: 0, column: 0)
                 }
+            }
+            else {
+                throw ParseError.unexpected("type keyword '\(text(tt))'", line: 0, column: 0)
             }
 
         case .localIdent:
             // Struct type reference: %struct_name
-            let name = String(advance().text.dropFirst())
+            let name = tokenText(advance(), dropFirst: 1)
             if let ty = structTypes[name] {
                 baseType = ty
             } else {
@@ -1275,7 +1381,7 @@ public struct Parser {
             } else {
                 // Vector: <N x T>
                 let countTok = try expect(.integer)
-                let count = Int(countTok.text) ?? 0
+                let count = tokenInt(countTok) ?? 0
                 _ = try expectKeyword("x")
                 let elemType = try parseType()
                 _ = try expect(.rightAngle)
@@ -1286,7 +1392,7 @@ public struct Parser {
             // Array: [N x T]
             _ = advance()
             let countTok = try expect(.integer)
-            let count = Int(countTok.text) ?? 0
+            let count = tokenInt(countTok) ?? 0
             _ = try expectKeyword("x")
             let elemType = try parseType()
             _ = try expect(.rightBracket)
@@ -1294,8 +1400,8 @@ public struct Parser {
 
         default:
             throw ParseError.unexpected(
-                "in type position: \(current.kind)(\(current.text))",
-                line: current.line, column: current.column
+                "in type position: \(current.kind)(\(text(current)))",
+                line: 0, column: 0
             )
         }
 
@@ -1323,7 +1429,7 @@ public struct Parser {
             } else {
                 paramTypes.append(try parseType())
                 // Skip param attributes
-                while current.kind == .keyword && isParamAttributeKeyword(current.text) {
+                while current.kind == .keyword && tokenInSet(current, Self.paramAttributeKeywords) {
                     _ = advance()
                 }
                 while current.kind == .string {
@@ -1338,7 +1444,7 @@ public struct Parser {
                     }
                     paramTypes.append(try parseType())
                     // Skip param attributes
-                    while current.kind == .keyword && isParamAttributeKeyword(current.text) {
+                    while current.kind == .keyword && tokenInSet(current, Self.paramAttributeKeywords) {
                         _ = advance()
                     }
                     while current.kind == .string {
@@ -1358,11 +1464,11 @@ public struct Parser {
         // Check for addrspace(N) qualifier
         while true {
             skipNewlines()
-            if current.kind == .keyword && current.text == "addrspace" {
+            if current.kind == .keyword && textEquals(current, "addrspace") {
                 _ = advance()
                 _ = try expect(.leftParen)
                 let spaceTok = try expect(.integer)
-                let addrSpace = Int(spaceTok.text) ?? 0
+                let addrSpace = tokenInt(spaceTok) ?? 0
                 _ = try expect(.rightParen)
                 _ = try expect(.star)
                 ty = .pointer(pointee: ty, addressSpace: addrSpace)
@@ -1383,9 +1489,8 @@ public struct Parser {
     /// LLVM IR encodes float hex constants as double-precision bits (16 hex digits).
     /// The lexer classifies these as `.integer` since they lack a typed prefix (0xH/0xK/etc.).
     private mutating func parseHexFloatOperand(type: IRType) throws -> IRInstruction.Operand {
-        let text = advance().text
-        let hexStr = String(text.dropFirst(2)) // strip "0x"
-        guard let bits = UInt64(hexStr, radix: 16) else {
+        let tok = advance()
+        guard let bits = tokenHexUInt64(tok, dropFirst: 2) else {
             return .constant(.float64(0))
         }
         let asDouble = Double(bitPattern: bits)
@@ -1406,7 +1511,7 @@ public struct Parser {
 
         switch current.kind {
         case .localIdent:
-            let name = String(advance().text.dropFirst())
+            let name = tokenText(advance(), dropFirst: 1)
             if let val = localValues[name] {
                 return .value(val)
             }
@@ -1415,55 +1520,51 @@ public struct Parser {
             return .value(val)
 
         case .globalIdent:
-            let name = String(advance().text.dropFirst())
+            let name = tokenText(advance(), dropFirst: 1)
             let val = resolveGlobalValue(name, type: type)
             return .value(val)
 
         case .integer:
-            let text = current.text
-            // LLVM IR hex floats (e.g., float 0xFFF0000000000000) are lexed as .integer
-            // because they lack a typed prefix (0xH, 0xK, etc.) and contain no '.'.
-            // When the expected type is float, redirect to the hex float parsing logic.
-            if (text.hasPrefix("0x") || text.hasPrefix("0X")),
-               type.isFloatingPoint {
-                // Fall through to .float_ case
+            // Check for hex prefix (0x/0X)
+            let isHex = (current.end - current.start) > 2
+                && source[current.start] == 0x30
+                && (source[current.start + 1] == 0x78 || source[current.start + 1] == 0x58)
+            if isHex && type.isFloatingPoint {
                 return try parseHexFloatOperand(type: type)
             }
-            _ = advance()
+            let tok = advance()
             let value: Int64
-            if text.hasPrefix("0x") || text.hasPrefix("0X") {
-                let bits = UInt64(String(text.dropFirst(2)), radix: 16) ?? 0
+            if isHex {
+                let bits = tokenHexUInt64(tok, dropFirst: 2) ?? 0
                 value = Int64(bitPattern: bits)
             } else {
-                value = Int64(text) ?? 0
+                value = Int64(tokenInt(tok) ?? 0)
             }
             return .constant(.integer(type, value))
 
         case .float_:
-            let text = advance().text
-            if text.hasPrefix("0xH") {
-                // Half-precision hex float: 0xHXXXX (16-bit)
-                let hexStr = String(text.dropFirst(3))
-                let bits = UInt16(hexStr, radix: 16) ?? 0
-                return .constant(.float16(bits))
-            } else if text.hasPrefix("0x") {
-                // Hex float: LLVM IR always encodes as double-precision bits.
-                // For float32: interpret bits as double, then convert the VALUE to Float.
-                // For float16: interpret bits as double, then convert the VALUE to Float16 bits.
-                let hexStr = String(text.dropFirst(2))
-                if let bits = UInt64(hexStr, radix: 16) {
-                    let asDouble = Double(bitPattern: bits)
-                    if case .float32 = type {
-                        return .constant(.float32(Float(asDouble)))
-                    } else if case .float64 = type {
-                        return .constant(.float64(asDouble))
-                    }
-                    if case .float16 = type {
-                        return .constant(.float16(UInt16(bits & 0xFFFF)))
+            let tok = advance()
+            let len = tok.end - tok.start
+            if len > 3 && source[tok.start] == 0x30
+                && (source[tok.start + 1] == 0x78 || source[tok.start + 1] == 0x58) {
+                if source[tok.start + 2] == 0x48 { // 0xH - half precision
+                    let bits = UInt16(tokenHexUInt64(tok, dropFirst: 3) ?? 0)
+                    return .constant(.float16(bits))
+                } else { // 0x - double precision
+                    if let bits = tokenHexUInt64(tok, dropFirst: 2) {
+                        let asDouble = Double(bitPattern: bits)
+                        if case .float32 = type {
+                            return .constant(.float32(Float(asDouble)))
+                        } else if case .float64 = type {
+                            return .constant(.float64(asDouble))
+                        }
+                        if case .float16 = type {
+                            return .constant(.float16(UInt16(bits & 0xFFFF)))
+                        }
                     }
                 }
             }
-            if let d = Double(text) {
+            if let d = Double(tokenText(tok)) {
                 if case .float32 = type {
                     return .constant(.float32(Float(d)))
                 }
@@ -1472,28 +1573,27 @@ public struct Parser {
             return .constant(.float64(0))
 
         case .keyword:
-            let text = current.text
-            if text == "null" {
+            if textEquals(current, "null") {
                 _ = advance()
                 return .constant(.null(type))
-            } else if text == "undef" {
+            } else if textEquals(current, "undef") {
                 _ = advance()
                 return .constant(.undef(type))
-            } else if text == "zeroinitializer" {
+            } else if textEquals(current, "zeroinitializer") {
                 _ = advance()
                 return .constant(.zeroInitializer(type))
-            } else if text == "true" {
+            } else if textEquals(current, "true") {
                 _ = advance()
                 return .constant(.integer(.i1, 1))
-            } else if text == "false" {
+            } else if textEquals(current, "false") {
                 _ = advance()
                 return .constant(.integer(.i1, 0))
-            } else if text == "getelementptr" {
+            } else if textEquals(current, "getelementptr") {
                 return try parseConstantGEP(type: type)
-            } else if text == "bitcast" {
+            } else if textEquals(current, "bitcast") {
                 return try parseConstantCast(type: type)
             }
-            throw ParseError.unexpected("operand '\(text)'", line: current.line, column: current.column)
+            throw ParseError.unexpected("operand '\(text(current))'", line: 0, column: 0)
 
         case .leftAngle:
             // Vector constant literal: <i32 0, i32 1, ...>
@@ -1520,8 +1620,8 @@ public struct Parser {
 
         default:
             throw ParseError.unexpected(
-                "operand: \(current.kind)(\(current.text))",
-                line: current.line, column: current.column
+                "operand: \(current.kind)(\(text(current)))",
+                line: 0, column: 0
             )
         }
     }
@@ -1530,7 +1630,7 @@ public struct Parser {
         let type = try parseType()
 
         // Parse parameter attributes between type and value
-        while current.kind == .keyword && isParamAttributeKeyword(current.text) {
+        while current.kind == .keyword && tokenInSet(current, Self.paramAttributeKeywords) {
             _ = advance()
         }
         while current.kind == .string {
@@ -1577,38 +1677,39 @@ public struct Parser {
         skipNewlines()
         switch current.kind {
         case .integer:
-            let text = advance().text
-            return .integer(type, Int64(text) ?? 0)
+            let tok = advance()
+            return .integer(type, Int64(tokenInt(tok) ?? 0))
         case .float_:
-            let text = advance().text
-            if text.hasPrefix("0xH") {
-                let bits = UInt16(String(text.dropFirst(3)), radix: 16) ?? 0
-                return .float16(bits)
-            } else if text.hasPrefix("0x") {
-                // LLVM IR hex floats are always double-precision bits.
-                // Convert the double VALUE to the target type.
-                let hexStr = String(text.dropFirst(2))
-                if let bits = UInt64(hexStr, radix: 16) {
-                    let asDouble = Double(bitPattern: bits)
-                    if case .float32 = type {
-                        return .float32(Float(asDouble))
+            let tok = advance()
+            // Check prefix bytes for 0xH vs 0x
+            let len = tok.end - tok.start
+            if len > 3 && source[tok.start] == 0x30
+                && (source[tok.start + 1] == 0x78 || source[tok.start + 1] == 0x58) {
+                if source[tok.start + 2] == 0x48 { // 0xH - half precision
+                    let bits = UInt16(tokenHexUInt64(tok, dropFirst: 3) ?? 0)
+                    return .float16(bits)
+                } else { // 0x - double precision
+                    if let bits = tokenHexUInt64(tok, dropFirst: 2) {
+                        let asDouble = Double(bitPattern: bits)
+                        if case .float32 = type {
+                            return .float32(Float(asDouble))
+                        }
+                        if case .float16 = type {
+                            return .float16(UInt16(bits & 0xFFFF))
+                        }
+                        return .float64(asDouble)
                     }
-                    if case .float16 = type {
-                        return .float16(UInt16(bits & 0xFFFF))
-                    }
-                    return .float64(asDouble)
                 }
             }
-            if let d = Double(text) {
+            if let d = Double(tokenText(tok)) {
                 if case .float32 = type { return .float32(Float(d)) }
                 return .float64(d)
             }
             return .float64(0)
         case .keyword:
-            let text = current.text
-            if text == "undef" { _ = advance(); return .undef(type) }
-            if text == "zeroinitializer" { _ = advance(); return .zeroInitializer(type) }
-            if text == "null" { _ = advance(); return .null(type) }
+            if textEquals(current, "undef") { _ = advance(); return .undef(type) }
+            if textEquals(current, "zeroinitializer") { _ = advance(); return .zeroInitializer(type) }
+            if textEquals(current, "null") { _ = advance(); return .null(type) }
             // Skip unknown
             skipToNextLine()
             return .undef(type)
@@ -1627,7 +1728,7 @@ public struct Parser {
 
         if current.kind == .metadataIdent {
             let ident = advance()
-            let text = String(ident.text.dropFirst()) // remove !
+            let text = tokenText(ident, dropFirst: 1) // remove !
 
             if let index = Int(text) {
                 // Numbered metadata: !0 = !{...}
@@ -1701,24 +1802,23 @@ public struct Parser {
 
         // Metadata string: !"string"
         if current.kind == .metadataString {
-            let text = advance().text
+            let tok = advance()
             // Remove ! and quotes: !"foo" → foo
-            let inner = String(text.dropFirst()) // remove !
+            let inner = tokenText(tok, dropFirst: 1) // remove !
             return .string(unquote(inner))
         }
 
         // Metadata reference: !N
         if current.kind == .metadataIdent {
-            let text = advance().text
-            let numStr = String(text.dropFirst()) // remove !
-            if let idx = Int(numStr) {
+            let tok = advance()
+            if let idx = tokenInt(Token(kind: tok.kind, start: tok.start + 1, end: tok.end)) {
                 return .metadata(idx)
             }
-            return .string(numStr)
+            return .string(tokenText(tok, dropFirst: 1))
         }
 
         // Null/empty
-        if current.kind == .keyword && current.text == "null" {
+        if current.kind == .keyword && textEquals(current, "null") {
             _ = advance()
             return .null
         }
@@ -1729,16 +1829,16 @@ public struct Parser {
             skipNewlines()
             // Check for a value
             if current.kind == .integer {
-                let valText = advance().text
-                let value = Int64(valText) ?? 0
+                let tok = advance()
+                let value = Int64(tokenInt(tok) ?? 0)
                 return .constant(type, .integer(type, value))
             } else if current.kind == .globalIdent {
-                let name = String(advance().text.dropFirst())
+                let name = tokenText(advance(), dropFirst: 1)
                 return .value(type, name)
-            } else if current.kind == .keyword && current.text == "null" {
+            } else if current.kind == .keyword && textEquals(current, "null") {
                 _ = advance()
                 return .constant(type, .null(type))
-            } else if current.kind == .keyword && current.text == "undef" {
+            } else if current.kind == .keyword && textEquals(current, "undef") {
                 _ = advance()
                 return .constant(type, .undef(type))
             }
@@ -1757,19 +1857,19 @@ public struct Parser {
 
     private mutating func parseMetadataRef() throws -> IRMetadataRef {
         if current.kind == .metadataIdent {
-            let text = advance().text
-            let numStr = String(text.dropFirst())
-            if let idx = Int(numStr) {
+            let tok = advance()
+            let sub = Token(kind: tok.kind, start: tok.start + 1, end: tok.end)
+            if let idx = tokenInt(sub) {
                 return .index(idx)
             }
-            return .string(numStr)
+            return .string(tokenText(tok, dropFirst: 1))
         }
         _ = try expect(.exclamation)
         if current.kind == .integer {
-            let idx = Int(advance().text) ?? 0
+            let idx = tokenInt(advance()) ?? 0
             return .index(idx)
         }
-        throw ParseError.unexpected("metadata ref", line: current.line, column: current.column)
+        throw ParseError.unexpected("metadata ref", line: 0, column: 0)
     }
 
     // MARK: - Attribute groups
@@ -1777,7 +1877,7 @@ public struct Parser {
     private mutating func parseAttributeGroup() throws -> IRAttributeGroup {
         _ = try expectKeyword("attributes")
         let refTok = try expect(.attrGroupRef)
-        let index = Int(String(refTok.text.dropFirst())) ?? 0
+        let index = tokenInt(Token(kind: refTok.kind, start: refTok.start + 1, end: refTok.end)) ?? 0
         _ = try expect(.equals)
         _ = try expect(.leftBrace)
 
@@ -1786,15 +1886,15 @@ public struct Parser {
         while current.kind != .rightBrace && current.kind != .eof {
             if current.kind == .string {
                 // String attribute: "key" or "key"="value"
-                let key = unquote(advance().text)
+                let key = unquote(text(advance()))
                 if consumeIf(.equals) {
-                    let value = unquote((try expect(.string)).text)
+                    let value = unquote(text(try expect(.string)))
                     attributes.append(.stringAttr(key: key, value: value))
                 } else {
                     attributes.append(.stringAttr(key: key, value: nil))
                 }
             } else if current.kind == .keyword {
-                if let attr = attributeFromKeyword(current.text) {
+                if let attr = attributeFromToken(current) {
                     attributes.append(attr)
                 }
                 _ = advance()
@@ -1836,134 +1936,180 @@ public struct Parser {
 
     private mutating func tryParseLinkage() -> IRFunction.Linkage? {
         guard current.kind == .keyword else { return nil }
-        switch current.text {
-        case "private", "internal", "linkonce", "linkonce_odr", "weak", "weak_odr",
-             "common", "appending", "extern_weak", "available_externally":
-            let text = advance().text
-            switch text {
-            case "private": return .private
-            case "internal": return .internal
-            case "linkonce": return .linkonce
-            case "linkonce_odr": return .linkonceODR
-            case "weak": return .weak
-            case "weak_odr": return .weakODR
-            case "common": return .common
-            case "appending": return .appending
-            case "extern_weak": return .externWeak
-            case "available_externally": return .available_externally
-            default: return nil
-            }
-        default:
-            return nil
-        }
+        let t = current
+        if textEquals(t, "private") { _ = advance(); return .private }
+        if textEquals(t, "internal") { _ = advance(); return .internal }
+        if textEquals(t, "linkonce") { _ = advance(); return .linkonce }
+        if textEquals(t, "linkonce_odr") { _ = advance(); return .linkonceODR }
+        if textEquals(t, "weak") { _ = advance(); return .weak }
+        if textEquals(t, "weak_odr") { _ = advance(); return .weakODR }
+        if textEquals(t, "common") { _ = advance(); return .common }
+        if textEquals(t, "appending") { _ = advance(); return .appending }
+        if textEquals(t, "extern_weak") { _ = advance(); return .externWeak }
+        if textEquals(t, "available_externally") { _ = advance(); return .available_externally }
+        return nil
     }
 
+    private static let attributeKeywords: Set<String> = [
+        "nounwind", "convergent", "mustprogress", "willreturn", "nofree",
+        "nosync", "nocallback", "argmemonly", "readnone", "readonly",
+        "writeonly", "noreturn", "noinline", "alwaysinline", "optnone",
+        "optsize", "minsize", "local_unnamed_addr", "unnamed_addr"
+    ]
+
+    private static let paramAttributeKeywords: Set<String> = [
+        "noundef", "nocapture", "nonnull", "readonly", "writeonly",
+        "signext", "zeroext", "inreg", "noalias", "immarg",
+        "returned", "nofree", "nosync"
+    ]
+
+    private static let binOpFlags: Set<String> = [
+        "nuw", "nsw", "exact", "nnan", "ninf", "nsz",
+        "arcp", "contract", "afn", "reassoc", "fast"
+    ]
+
     private func isAttributeKeyword(_ text: String) -> Bool {
-        let attrs = ["nounwind", "convergent", "mustprogress", "willreturn", "nofree",
-                     "nosync", "nocallback", "argmemonly", "readnone", "readonly",
-                     "writeonly", "noreturn", "noinline", "alwaysinline", "optnone",
-                     "optsize", "minsize", "local_unnamed_addr", "unnamed_addr"]
-        return attrs.contains(text)
+        Self.attributeKeywords.contains(text)
     }
 
     private func isParamAttributeKeyword(_ text: String) -> Bool {
-        let attrs = ["noundef", "nocapture", "nonnull", "readonly", "writeonly",
-                     "signext", "zeroext", "inreg", "noalias", "immarg",
-                     "returned", "nofree", "nosync"]
-        return attrs.contains(text)
+        Self.paramAttributeKeywords.contains(text)
     }
 
     private func isBinOpFlag(_ text: String) -> Bool {
-        let flags = ["nuw", "nsw", "exact", "nnan", "ninf", "nsz",
-                     "arcp", "contract", "afn", "reassoc", "fast"]
-        return flags.contains(text)
+        Self.binOpFlags.contains(text)
     }
 
     private func isFastMathFlag(_ text: String) -> Bool {
-        return isBinOpFlag(text)
+        Self.binOpFlags.contains(text)
     }
 
-    private func binOpFromString(_ text: String) -> IRInstruction.Opcode {
-        switch text {
-        case "add": return .add
-        case "fadd": return .fadd
-        case "sub": return .sub
-        case "fsub": return .fsub
-        case "mul": return .mul
-        case "fmul": return .fmul
-        case "udiv": return .udiv
-        case "sdiv": return .sdiv
-        case "fdiv": return .fdiv
-        case "urem": return .urem
-        case "srem": return .srem
-        case "frem": return .frem
-        case "shl": return .shl
-        case "lshr": return .lshr
-        case "ashr": return .ashr
-        case "and": return .and
-        case "or": return .or
-        case "xor": return .xor
+    private func binOpFromToken(_ t: Token) -> IRInstruction.Opcode {
+        let len = t.end - t.start
+        let fb = source[t.start]
+        switch fb {
+        case 0x61: // a
+            if len == 3 {
+                if textEquals(t, "add") { return .add }
+                if textEquals(t, "and") { return .and }
+            }
+            if textEquals(t, "ashr") { return .ashr }
+            return .add
+        case 0x66: // f
+            if len == 4 {
+                if textEquals(t, "fadd") { return .fadd }
+                if textEquals(t, "fsub") { return .fsub }
+                if textEquals(t, "fmul") { return .fmul }
+                if textEquals(t, "fdiv") { return .fdiv }
+                if textEquals(t, "frem") { return .frem }
+            }
+            return .add
+        case 0x73: // s
+            if textEquals(t, "sub") { return .sub }
+            if textEquals(t, "sdiv") { return .sdiv }
+            if textEquals(t, "srem") { return .srem }
+            if textEquals(t, "shl") { return .shl }
+            return .add
+        case 0x6D: // m
+            if textEquals(t, "mul") { return .mul }
+            return .add
+        case 0x75: // u
+            if textEquals(t, "udiv") { return .udiv }
+            if textEquals(t, "urem") { return .urem }
+            return .add
+        case 0x6C: // l
+            if textEquals(t, "lshr") { return .lshr }
+            return .add
+        case 0x6F: // o
+            if textEquals(t, "or") { return .or }
+            return .add
+        case 0x78: // x
+            if textEquals(t, "xor") { return .xor }
+            return .add
         default: return .add
         }
     }
 
-    private func cmpPredicate(_ text: String, isFP: Bool) -> Int {
+    private func cmpPredicate(_ t: Token, isFP: Bool) -> Int {
+        let len = t.end - t.start
+        let fb = source[t.start]
         if isFP {
-            switch text {
-            case "false": return 0
-            case "oeq": return 1
-            case "ogt": return 2
-            case "oge": return 3
-            case "olt": return 4
-            case "ole": return 5
-            case "one": return 6
-            case "ord": return 7
-            case "uno": return 8
-            case "ueq": return 9
-            case "ugt": return 10
-            case "uge": return 11
-            case "ult": return 12
-            case "ule": return 13
-            case "une": return 14
-            case "true": return 15
-            default: return 0
+            if len == 3 {
+                switch fb {
+                case 0x6F: // o
+                    if textEquals(t, "oeq") { return 1 }
+                    if textEquals(t, "ogt") { return 2 }
+                    if textEquals(t, "oge") { return 3 }
+                    if textEquals(t, "olt") { return 4 }
+                    if textEquals(t, "ole") { return 5 }
+                    if textEquals(t, "one") { return 6 }
+                    if textEquals(t, "ord") { return 7 }
+                case 0x75: // u
+                    if textEquals(t, "uno") { return 8 }
+                    if textEquals(t, "ueq") { return 9 }
+                    if textEquals(t, "ugt") { return 10 }
+                    if textEquals(t, "uge") { return 11 }
+                    if textEquals(t, "ult") { return 12 }
+                    if textEquals(t, "ule") { return 13 }
+                    if textEquals(t, "une") { return 14 }
+                default: break
+                }
             }
+            if textEquals(t, "false") { return 0 }
+            if textEquals(t, "true") { return 15 }
+            return 0
         } else {
-            switch text {
-            case "eq": return 32
-            case "ne": return 33
-            case "ugt": return 34
-            case "uge": return 35
-            case "ult": return 36
-            case "ule": return 37
-            case "sgt": return 38
-            case "sge": return 39
-            case "slt": return 40
-            case "sle": return 41
-            default: return 32
+            if len == 2 {
+                if textEquals(t, "eq") { return 32 }
+                if textEquals(t, "ne") { return 33 }
+            } else if len == 3 {
+                switch fb {
+                case 0x75: // u
+                    if textEquals(t, "ugt") { return 34 }
+                    if textEquals(t, "uge") { return 35 }
+                    if textEquals(t, "ult") { return 36 }
+                    if textEquals(t, "ule") { return 37 }
+                case 0x73: // s
+                    if textEquals(t, "sgt") { return 38 }
+                    if textEquals(t, "sge") { return 39 }
+                    if textEquals(t, "slt") { return 40 }
+                    if textEquals(t, "sle") { return 41 }
+                default: break
+                }
             }
+            return 32
         }
     }
 
-    private func attributeFromKeyword(_ text: String) -> IRAttribute? {
-        switch text {
-        case "nounwind": return .noUnwind
-        case "convergent": return .convergent
-        case "mustprogress": return .mustProgress
-        case "willreturn": return .willReturn
-        case "nofree": return .noFree
-        case "nosync": return .noSync
-        case "nocallback": return .noCallback
-        case "argmemonly": return .argMemOnly
-        case "readnone": return .readNone
-        case "readonly": return .readOnly
-        case "noreturn": return .noReturn
-        case "noinline": return .noInline
-        case "alwaysinline": return .alwaysInline
-        case "nocapture": return .noCapture
-        case "noalias": return .noAlias
-        case "immarg": return .immArg
-        default: return nil
+    private func attributeFromToken(_ t: Token) -> IRAttribute? {
+        let len = t.end - t.start
+        let fb = source[t.start]
+        switch fb {
+        case 0x6E: // n
+            if len == 8 && textEquals(t, "nounwind") { return .noUnwind }
+            if len == 6 && textEquals(t, "nofree") { return .noFree }
+            if len == 6 && textEquals(t, "nosync") { return .noSync }
+            if len == 10 && textEquals(t, "nocallback") { return .noCallback }
+            if len == 8 && textEquals(t, "noreturn") { return .noReturn }
+            if len == 8 && textEquals(t, "noinline") { return .noInline }
+            if len == 9 && textEquals(t, "nocapture") { return .noCapture }
+            if len == 7 && textEquals(t, "noalias") { return .noAlias }
+        case 0x63: // c
+            if textEquals(t, "convergent") { return .convergent }
+        case 0x6D: // m
+            if textEquals(t, "mustprogress") { return .mustProgress }
+        case 0x77: // w
+            if textEquals(t, "willreturn") { return .willReturn }
+        case 0x61: // a
+            if textEquals(t, "argmemonly") { return .argMemOnly }
+            if textEquals(t, "alwaysinline") { return .alwaysInline }
+        case 0x72: // r
+            if textEquals(t, "readnone") { return .readNone }
+            if textEquals(t, "readonly") { return .readOnly }
+        case 0x69: // i
+            if textEquals(t, "immarg") { return .immArg }
+        default: break
         }
+        return nil
     }
 }

@@ -103,9 +103,7 @@ final class TypeTableWriter {
         case .structure(let name, let elems, let isPacked):
             if let name = name {
                 // Named struct: first emit name, then body
-                var nameOps: [UInt64] = []
-                for b in name.utf8 { nameOps.append(UInt64(b)) }
-                writer.emitUnabbrevRecord(code: structNameCode, operands: nameOps)
+                writer.emitUnabbrevStringRecord(code: structNameCode, name)
                 // STRUCT_NAMED: [isPacked, ...elementTypes]
                 var operands: [UInt64] = [isPacked ? 1 : 0]
                 for elem in elems {
@@ -123,9 +121,7 @@ final class TypeTableWriter {
 
         case .opaque(let name):
             // Opaque struct: emit name first, then OPAQUE [ispacked]
-            var nameOps: [UInt64] = []
-            for b in name.utf8 { nameOps.append(UInt64(b)) }
-            writer.emitUnabbrevRecord(code: structNameCode, operands: nameOps)
+            writer.emitUnabbrevStringRecord(code: structNameCode, name)
             writer.emitUnabbrevRecord(code: opaqueCode, operands: [0])  // ispacked=0
         }
     }

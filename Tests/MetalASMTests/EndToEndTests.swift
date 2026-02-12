@@ -121,7 +121,7 @@ final class EndToEndTests: XCTestCase {
         // Parse
         let lexer = Lexer(source: source)
         let tokens = lexer.tokenize()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
 
         // Verify module parsed correctly
@@ -311,7 +311,7 @@ extension EndToEndTests {
         // Verify parsing succeeds with opaque ptr syntax
         let lexer = Lexer(source: ir)
         let tokens = lexer.tokenize()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
         XCTAssertEqual(module.functions.count, 1)
         XCTAssertEqual(module.functions[0].name, "test_kernel")
@@ -345,5 +345,49 @@ extension EndToEndTests {
         try bcData.write(to: URL(fileURLWithPath: "/tmp/minimal_metalasm.bc"))
         print("Wrote \(bcSize) bytes of bitcode to /tmp/minimal_metalasm.bc")
         XCTAssertGreaterThan(bcSize, 0)
+    }
+
+    func testAssemblyTiming() throws {
+        // Try large IR first, fall back to small
+        let candidates = ["/tmp/debug_backwardKeyValue_ir.ll", "/tmp/air-monolithic-test/monolithic.ll"]
+        var source: String?
+        for path in candidates {
+            if FileManager.default.fileExists(atPath: path) {
+                source = try String(contentsOfFile: path, encoding: .utf8)
+                break
+            }
+        }
+        guard let source else { throw XCTSkip("No IR file found") }
+        print("IR size: \(source.count) bytes")
+
+        // Warmup
+        _ = try MetalASM.assemble(ir: source, platform: .macOS(version: 26))
+
+        // Timed runs
+        let runs = 5
+        var times: [Double] = []
+        for _ in 0..<runs {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            _ = try MetalASM.assemble(ir: source, platform: .macOS(version: 26))
+            let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            times.append(dt)
+        }
+        let avg = times.reduce(0, +) / Double(runs)
+        let best = times.min()!
+        print("Assembly: avg=\(String(format: "%.1f", avg))ms best=\(String(format: "%.1f", best))ms over \(runs) runs")
+
+        // Breakdown
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let lexer = Lexer(source: source)
+        let tokens = lexer.tokenize()
+        let t1 = CFAbsoluteTimeGetCurrent()
+        var parser = Parser(tokens: tokens, source: lexer.source)
+        let module = try parser.parse()
+        let t2 = CFAbsoluteTimeGetCurrent()
+        let bitcode = BitcodeWriter.write(module: module)
+        let t3 = CFAbsoluteTimeGetCurrent()
+
+        print("  lex=\(String(format: "%.1f", (t1-t0)*1000))ms parse=\(String(format: "%.1f", (t2-t1)*1000))ms bc=\(String(format: "%.1f", (t3-t2)*1000))ms")
+        print("  tokens=\(tokens.count) functions=\(module.functions.count)")
     }
 }

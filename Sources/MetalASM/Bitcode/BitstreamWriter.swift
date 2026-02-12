@@ -238,6 +238,32 @@ public final class BitstreamWriter {
         emitVBR(d, 6)
     }
 
+    /// Emit an unabbreviated record whose operands are UTF-8 bytes of a string.
+    /// Avoids creating an intermediate [UInt64] array.
+    @inline(__always)
+    func emitUnabbrevStringRecord(code: UInt64, _ str: String) {
+        let utf8 = str.utf8
+        emit(Self.unabbrevRecordAbbrevID, abbrevLen)
+        emitVBR(code, 6)
+        emitVBR(UInt64(utf8.count), 6)
+        for b in utf8 {
+            emitVBR(UInt64(b), 6)
+        }
+    }
+
+    /// Emit an unabbreviated record with a leading operand followed by UTF-8 bytes.
+    @inline(__always)
+    func emitUnabbrevStringRecord(code: UInt64, leading: UInt64, _ str: String) {
+        let utf8 = str.utf8
+        emit(Self.unabbrevRecordAbbrevID, abbrevLen)
+        emitVBR(code, 6)
+        emitVBR(UInt64(1 + utf8.count), 6)
+        emitVBR(leading, 6)
+        for b in utf8 {
+            emitVBR(UInt64(b), 6)
+        }
+    }
+
     /// Emit an unabbreviated record with a trailing blob (array of chars/bytes).
     /// Used for string records.
     func emitUnabbrevRecordWithBlob(code: UInt64, operands: [UInt64], blob: [UInt8]) {
@@ -290,7 +316,24 @@ public final class BitstreamWriter {
             return
         }
         var opIdx = 0
-        for enc in encodings {
+        for (encIdx, enc) in encodings.enumerated() {
+            if enc.type == 3 {
+                // Array: next encoding is the element encoding, consume remaining operands
+                let elemEnc = encodings[encIdx + 1]
+                let remaining = operands.count - opIdx
+                emitVBR(UInt64(remaining), 6)  // array count
+                while opIdx < operands.count {
+                    let val = operands[opIdx]
+                    switch elemEnc.type {
+                    case 1: emit(val, Int(elemEnc.data))
+                    case 2: emitVBR(val, Int(elemEnc.data))
+                    case 4: emit(val, 6)
+                    default: emitVBR(val, 6)
+                    }
+                    opIdx += 1
+                }
+                return  // Array consumes everything remaining
+            }
             let val = opIdx < operands.count ? operands[opIdx] : 0
             switch enc.type {
             case 1: // Fixed

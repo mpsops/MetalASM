@@ -2,327 +2,295 @@
 ///
 /// Converts a string of LLVM IR text into a sequence of `Token` values.
 /// Operates on raw UTF-8 bytes for performance — IR is pure ASCII.
+/// Uses UnsafeBufferPointer internally to eliminate bounds checking in hot loops.
 public final class Lexer {
-    private let source: [UInt8]
-    private var pos: Int = 0
+    public let source: [UInt8]
+    private let count: Int
 
     public init(source: String) {
         self.source = Array(source.utf8)
+        self.count = self.source.count
     }
 
-    // Byte constants
-    private static let NL:    UInt8 = 0x0A  // \n
-    private static let CR:    UInt8 = 0x0D  // \r
-    private static let TAB:   UInt8 = 0x09  // \t
-    private static let SPACE: UInt8 = 0x20  //
-    private static let SEMI:  UInt8 = 0x3B  // ;
-    private static let QUOTE: UInt8 = 0x22  // "
-    private static let BSLASH:UInt8 = 0x5C  // \
-    private static let AT:    UInt8 = 0x40  // @
-    private static let PCT:   UInt8 = 0x25  // %
-    private static let BANG:  UInt8 = 0x21  // !
-    private static let HASH:  UInt8 = 0x23  // #
-    private static let DOLLAR:UInt8 = 0x24  // $
-    private static let LPAREN:UInt8 = 0x28  // (
-    private static let RPAREN:UInt8 = 0x29  // )
-    private static let LBRACE:UInt8 = 0x7B  // {
-    private static let RBRACE:UInt8 = 0x7D  // }
-    private static let LBRACK:UInt8 = 0x5B  // [
-    private static let RBRACK:UInt8 = 0x5D  // ]
-    private static let LANGLE:UInt8 = 0x3C  // <
-    private static let RANGLE:UInt8 = 0x3E  // >
-    private static let COMMA: UInt8 = 0x2C  // ,
-    private static let EQ:    UInt8 = 0x3D  // =
-    private static let STAR:  UInt8 = 0x2A  // *
-    private static let DOT:   UInt8 = 0x2E  // .
-    private static let MINUS: UInt8 = 0x2D  // -
-    private static let USCORE:UInt8 = 0x5F  // _
-    private static let COLON: UInt8 = 0x3A  // :
-    private static let _0:    UInt8 = 0x30
-    private static let _9:    UInt8 = 0x39
-    private static let _a:    UInt8 = 0x61
-    private static let _c:    UInt8 = 0x63
-    private static let _e:    UInt8 = 0x65
-    private static let _f:    UInt8 = 0x66
-    private static let _x:    UInt8 = 0x78
-    private static let _z:    UInt8 = 0x7A
-    private static let _A:    UInt8 = 0x41
-    private static let _E:    UInt8 = 0x45
-    private static let _F:    UInt8 = 0x46
-    private static let _H:    UInt8 = 0x48
-    private static let _K:    UInt8 = 0x4B
-    private static let _L:    UInt8 = 0x4C
-    private static let _M:    UInt8 = 0x4D
-    private static let _X:    UInt8 = 0x58
-    private static let _Z:    UInt8 = 0x5A
-
+    /// Build String from byte range in the source buffer.
     @inline(__always)
-    private static func isDigit(_ b: UInt8) -> Bool { b >= _0 && b <= _9 }
-
-    @inline(__always)
-    private static func isLetter(_ b: UInt8) -> Bool {
-        (b >= _a && b <= _z) || (b >= _A && b <= _Z)
-    }
-
-    @inline(__always)
-    private static func isHexDigit(_ b: UInt8) -> Bool {
-        isDigit(b) || (b >= _a && b <= _f) || (b >= _A && b <= _F)
-    }
-
-    @inline(__always)
-    private static func isIdentChar(_ b: UInt8) -> Bool {
-        isLetter(b) || isDigit(b) || b == USCORE || b == DOT || b == DOLLAR || b == MINUS
-    }
-
-    private var count: Int { source.count }
-
-    @inline(__always)
-    private func byte(_ i: Int) -> UInt8 { source[i] }
-
-    // Build String from byte range
-    @inline(__always)
-    private func text(_ start: Int, _ end: Int) -> String {
+    public func text(_ start: Int, _ end: Int) -> String {
         String(decoding: source[start..<end], as: UTF8.self)
     }
+
+    /// Get the text of a token.
+    @inline(__always)
+    public func text(_ token: Token) -> String {
+        String(decoding: source[token.start..<token.end], as: UTF8.self)
+    }
+
+    // MARK: - Lookup table for identifier characters
+
+    /// 256-byte lookup table: 1 if byte is valid in an identifier, 0 otherwise.
+    /// Valid: [a-zA-Z0-9_.$-]
+    private static let identTable: [UInt8] = {
+        var t = [UInt8](repeating: 0, count: 256)
+        for b in UInt8(ascii: "a")...UInt8(ascii: "z") { t[Int(b)] = 1 }
+        for b in UInt8(ascii: "A")...UInt8(ascii: "Z") { t[Int(b)] = 1 }
+        for b in UInt8(ascii: "0")...UInt8(ascii: "9") { t[Int(b)] = 1 }
+        t[Int(UInt8(ascii: "_"))] = 1
+        t[Int(UInt8(ascii: "."))] = 1
+        t[Int(UInt8(ascii: "$"))] = 1
+        t[Int(UInt8(ascii: "-"))] = 1
+        return t
+    }()
 
     // MARK: - Public API
 
     /// Tokenize the entire source into an array of tokens.
     public func tokenize() -> [Token] {
-        var tokens: [Token] = []
-        tokens.reserveCapacity(count / 6)  // rough estimate
-        while true {
-            let tok = nextToken()
-            tokens.append(tok)
-            if tok.kind == .eof { break }
+        source.withUnsafeBufferPointer { buf in
+            guard let ptr = buf.baseAddress else { return [] }
+            var tokens: [Token] = []
+            tokens.reserveCapacity(count / 6)
+            var pos = 0
+            let count = self.count
+            let ident = Self.identTable
+
+            while true {
+                let tok = Self.nextToken(ptr: ptr, pos: &pos, count: count, ident: ident)
+                tokens.append(tok)
+                if tok.kind == .eof { break }
+            }
+            return tokens
         }
-        return tokens
     }
 
-    // MARK: - Token production
+    // MARK: - Token production (all static, operating on raw pointer)
 
-    func nextToken() -> Token {
-        skipWhitespaceAndComments()
+    @inline(__always)
+    private static func nextToken(
+        ptr: UnsafePointer<UInt8>, pos: inout Int, count: Int,
+        ident: [UInt8]
+    ) -> Token {
+        skipWhitespaceAndComments(ptr: ptr, pos: &pos, count: count)
 
         guard pos < count else {
-            return Token(kind: .eof, text: "")
+            return Token.eof
         }
 
-        let ch = byte(pos)
+        let ch = ptr[pos]
 
         switch ch {
-        case Self.NL:
+        case 0x0A: // \n
             pos += 1
-            return Token(kind: .newline, text: "\n")
+            return Token(kind: .newline, start: pos - 1, end: pos)
 
-        case Self.LPAREN:  pos += 1; return Token(kind: .leftParen, text: "(")
-        case Self.RPAREN:  pos += 1; return Token(kind: .rightParen, text: ")")
-        case Self.LBRACE:  pos += 1; return Token(kind: .leftBrace, text: "{")
-        case Self.RBRACE:  pos += 1; return Token(kind: .rightBrace, text: "}")
-        case Self.LBRACK:  pos += 1; return Token(kind: .leftBracket, text: "[")
-        case Self.RBRACK:  pos += 1; return Token(kind: .rightBracket, text: "]")
-        case Self.LANGLE:  pos += 1; return Token(kind: .leftAngle, text: "<")
-        case Self.RANGLE:  pos += 1; return Token(kind: .rightAngle, text: ">")
-        case Self.COMMA:   pos += 1; return Token(kind: .comma, text: ",")
-        case Self.EQ:      pos += 1; return Token(kind: .equals, text: "=")
-        case Self.STAR:    pos += 1; return Token(kind: .star, text: "*")
+        case 0x28: pos += 1; return Token(kind: .leftParen, start: pos - 1, end: pos)   // (
+        case 0x29: pos += 1; return Token(kind: .rightParen, start: pos - 1, end: pos)  // )
+        case 0x7B: pos += 1; return Token(kind: .leftBrace, start: pos - 1, end: pos)   // {
+        case 0x7D: pos += 1; return Token(kind: .rightBrace, start: pos - 1, end: pos)  // }
+        case 0x5B: pos += 1; return Token(kind: .leftBracket, start: pos - 1, end: pos) // [
+        case 0x5D: pos += 1; return Token(kind: .rightBracket, start: pos - 1, end: pos)// ]
+        case 0x3C: pos += 1; return Token(kind: .leftAngle, start: pos - 1, end: pos)   // <
+        case 0x3E: pos += 1; return Token(kind: .rightAngle, start: pos - 1, end: pos)  // >
+        case 0x2C: pos += 1; return Token(kind: .comma, start: pos - 1, end: pos)       // ,
+        case 0x3D: pos += 1; return Token(kind: .equals, start: pos - 1, end: pos)      // =
+        case 0x2A: pos += 1; return Token(kind: .star, start: pos - 1, end: pos)        // *
 
-        case Self.DOT:
-            if pos + 2 < count && byte(pos+1) == Self.DOT && byte(pos+2) == Self.DOT {
-                pos += 3
-                return Token(kind: .dotDotDot, text: "...")
+        case 0x2E: // .
+            if pos + 2 < count && ptr[pos+1] == 0x2E && ptr[pos+2] == 0x2E {
+                let start = pos; pos += 3
+                return Token(kind: .dotDotDot, start: start, end: pos)
             }
-            return lexNumber()
+            return lexNumber(ptr: ptr, pos: &pos, count: count)
 
-        case Self.QUOTE:
-            return lexString()
+        case 0x22: // "
+            return lexString(ptr: ptr, pos: &pos, count: count)
 
-        case Self.AT:
-            return lexGlobalIdent()
+        case 0x40: // @
+            return lexGlobalIdent(ptr: ptr, pos: &pos, count: count, ident: ident)
 
-        case Self.PCT:
-            return lexLocalIdent()
+        case 0x25: // %
+            return lexLocalIdent(ptr: ptr, pos: &pos, count: count, ident: ident)
 
-        case Self.BANG:
-            return lexMetadata()
+        case 0x21: // !
+            return lexMetadata(ptr: ptr, pos: &pos, count: count, ident: ident)
 
-        case Self.HASH:
-            return lexAttrGroupRef()
+        case 0x23: // #
+            return lexAttrGroupRef(ptr: ptr, pos: &pos, count: count)
 
-        case Self.DOLLAR:
-            return lexComdatRef()
+        case 0x24: // $
+            return lexComdatRef(ptr: ptr, pos: &pos, count: count, ident: ident)
 
-        case Self.MINUS, Self._0...Self._9:
-            return lexNumber()
+        case 0x2D, 0x30...0x39: // - or 0-9
+            return lexNumber(ptr: ptr, pos: &pos, count: count)
 
-        case Self._c:
-            if pos + 1 < count && byte(pos+1) == Self.QUOTE {
-                pos += 1  // skip 'c'
-                let str = lexString()
-                return Token(kind: .string, text: "c" + str.text)
+        case 0x63: // c
+            if pos + 1 < count && ptr[pos+1] == 0x22 {
+                let start = pos; pos += 1
+                _ = lexString(ptr: ptr, pos: &pos, count: count)
+                return Token(kind: .string, start: start, end: pos)
             }
-            return lexKeywordOrIdent()
+            return lexKeywordOrIdent(ptr: ptr, pos: &pos, count: count, ident: ident)
 
         default:
-            if Self.isLetter(ch) || ch == Self.USCORE {
-                return lexKeywordOrIdent()
+            if (ch >= 0x61 && ch <= 0x7A) || (ch >= 0x41 && ch <= 0x5A) || ch == 0x5F {
+                return lexKeywordOrIdent(ptr: ptr, pos: &pos, count: count, ident: ident)
             }
             pos += 1
-            return Token(kind: .keyword, text: text(pos-1, pos))
+            return Token(kind: .keyword, start: pos-1, end: pos)
         }
     }
 
     // MARK: - Lexing helpers
 
-    private func skipWhitespaceAndComments() {
+    @inline(__always)
+    private static func skipWhitespaceAndComments(
+        ptr: UnsafePointer<UInt8>, pos: inout Int, count: Int
+    ) {
         while pos < count {
-            let ch = byte(pos)
-            if ch == Self.SPACE || ch == Self.TAB || ch == Self.CR {
+            let ch = ptr[pos]
+            if ch == 0x20 || ch == 0x09 || ch == 0x0D { // space, tab, CR
                 pos += 1
-            } else if ch == Self.SEMI {
+            } else if ch == 0x3B { // ;
                 pos += 1
-                while pos < count && byte(pos) != Self.NL {
-                    pos += 1
-                }
+                while pos < count && ptr[pos] != 0x0A { pos += 1 }
             } else {
                 break
             }
         }
     }
 
-    private func lexString() -> Token {
+    @inline(__always)
+    @discardableResult
+    private static func lexString(
+        ptr: UnsafePointer<UInt8>, pos: inout Int, count: Int
+    ) -> Token {
         let start = pos
-        pos += 1  // skip opening quote
-        while pos < count && byte(pos) != Self.QUOTE {
-            if byte(pos) == Self.BSLASH {
+        pos += 1 // skip opening quote
+        while pos < count && ptr[pos] != 0x22 {
+            if ptr[pos] == 0x5C { // backslash
                 pos += 1
                 if pos < count { pos += 1 }
             } else {
                 pos += 1
             }
         }
-        if pos < count {
-            pos += 1  // skip closing quote
-        }
-        return Token(kind: .string, text: text(start, pos))
+        if pos < count { pos += 1 } // skip closing quote
+        return Token(kind: .string, start: start, end: pos)
     }
 
-    private func lexGlobalIdent() -> Token {
+    @inline(__always)
+    private static func lexGlobalIdent(
+        ptr: UnsafePointer<UInt8>, pos: inout Int, count: Int, ident: [UInt8]
+    ) -> Token {
         let start = pos
-        pos += 1  // skip @
-        if pos < count && byte(pos) == Self.QUOTE {
-            _ = lexString()  // advances past the quoted name
-            return Token(kind: .globalIdent, text: text(start, pos))
+        pos += 1 // skip @
+        if pos < count && ptr[pos] == 0x22 {
+            _ = lexString(ptr: ptr, pos: &pos, count: count)
+            return Token(kind: .globalIdent, start: start, end: pos)
         }
-        while pos < count && Self.isIdentChar(byte(pos)) {
-            pos += 1
-        }
-        return Token(kind: .globalIdent, text: text(start, pos))
+        while pos < count && ident[Int(ptr[pos])] != 0 { pos += 1 }
+        return Token(kind: .globalIdent, start: start, end: pos)
     }
 
-    private func lexLocalIdent() -> Token {
+    @inline(__always)
+    private static func lexLocalIdent(
+        ptr: UnsafePointer<UInt8>, pos: inout Int, count: Int, ident: [UInt8]
+    ) -> Token {
         let start = pos
-        pos += 1  // skip %
-        if pos < count && byte(pos) == Self.QUOTE {
-            _ = lexString()
-            return Token(kind: .localIdent, text: text(start, pos))
+        pos += 1 // skip %
+        if pos < count && ptr[pos] == 0x22 {
+            _ = lexString(ptr: ptr, pos: &pos, count: count)
+            return Token(kind: .localIdent, start: start, end: pos)
         }
-        while pos < count && Self.isIdentChar(byte(pos)) {
-            pos += 1
-        }
-        return Token(kind: .localIdent, text: text(start, pos))
+        while pos < count && ident[Int(ptr[pos])] != 0 { pos += 1 }
+        return Token(kind: .localIdent, start: start, end: pos)
     }
 
-    private func lexMetadata() -> Token {
+    @inline(__always)
+    private static func lexMetadata(
+        ptr: UnsafePointer<UInt8>, pos: inout Int, count: Int, ident: [UInt8]
+    ) -> Token {
         let start = pos
-        pos += 1  // skip !
-
-        if pos < count && byte(pos) == Self.QUOTE {
-            _ = lexString()
-            return Token(kind: .metadataString, text: text(start, pos))
-        } else if pos < count && byte(pos) == Self.LBRACE {
-            return Token(kind: .exclamation, text: "!")
+        pos += 1 // skip !
+        if pos < count && ptr[pos] == 0x22 {
+            _ = lexString(ptr: ptr, pos: &pos, count: count)
+            return Token(kind: .metadataString, start: start, end: pos)
+        } else if pos < count && ptr[pos] == 0x7B {
+            return Token(kind: .exclamation, start: start, end: start + 1)
         } else {
-            while pos < count && Self.isIdentChar(byte(pos)) {
-                pos += 1
-            }
-            return Token(kind: .metadataIdent, text: text(start, pos))
+            while pos < count && ident[Int(ptr[pos])] != 0 { pos += 1 }
+            return Token(kind: .metadataIdent, start: start, end: pos)
         }
     }
 
-    private func lexAttrGroupRef() -> Token {
+    @inline(__always)
+    private static func lexAttrGroupRef(
+        ptr: UnsafePointer<UInt8>, pos: inout Int, count: Int
+    ) -> Token {
         let start = pos
-        pos += 1  // skip #
-        while pos < count && Self.isDigit(byte(pos)) {
-            pos += 1
-        }
-        return Token(kind: .attrGroupRef, text: text(start, pos))
+        pos += 1 // skip #
+        while pos < count && ptr[pos] >= 0x30 && ptr[pos] <= 0x39 { pos += 1 }
+        return Token(kind: .attrGroupRef, start: start, end: pos)
     }
 
-    private func lexComdatRef() -> Token {
+    @inline(__always)
+    private static func lexComdatRef(
+        ptr: UnsafePointer<UInt8>, pos: inout Int, count: Int, ident: [UInt8]
+    ) -> Token {
         let start = pos
-        pos += 1  // skip $
-        while pos < count && Self.isIdentChar(byte(pos)) {
-            pos += 1
-        }
-        return Token(kind: .comdatRef, text: text(start, pos))
+        pos += 1 // skip $
+        while pos < count && ident[Int(ptr[pos])] != 0 { pos += 1 }
+        return Token(kind: .comdatRef, start: start, end: pos)
     }
 
-    private func lexNumber() -> Token {
+    @inline(__always)
+    private static func lexNumber(
+        ptr: UnsafePointer<UInt8>, pos: inout Int, count: Int
+    ) -> Token {
         let start = pos
 
-        // Handle negative sign
-        if pos < count && byte(pos) == Self.MINUS {
-            pos += 1
-        }
+        if pos < count && ptr[pos] == 0x2D { pos += 1 } // minus
 
         // Check for hex: 0x
-        if pos + 1 < count && byte(pos) == Self._0 && (byte(pos+1) == Self._x || byte(pos+1) == Self._X) {
+        if pos + 1 < count && ptr[pos] == 0x30 && (ptr[pos+1] == 0x78 || ptr[pos+1] == 0x58) {
             pos += 2
             var isTypedHexFloat = false
             if pos < count {
-                let ch = byte(pos)
-                if ch == Self._H || ch == Self._K || ch == Self._L || ch == Self._M {
-                    pos += 1
-                    isTypedHexFloat = true
+                let ch = ptr[pos]
+                if ch == 0x48 || ch == 0x4B || ch == 0x4C || ch == 0x4D { // H K L M
+                    pos += 1; isTypedHexFloat = true
                 }
             }
-            while pos < count && Self.isHexDigit(byte(pos)) {
-                pos += 1
+            while pos < count {
+                let ch = ptr[pos]
+                if (ch >= 0x30 && ch <= 0x39) || (ch >= 0x61 && ch <= 0x66) || (ch >= 0x41 && ch <= 0x46) {
+                    pos += 1
+                } else { break }
             }
-            let kind: Token.Kind = isTypedHexFloat ? .float_ : .integer
-            return Token(kind: kind, text: text(start, pos))
+            return Token(kind: isTypedHexFloat ? .float_ : .integer, start: start, end: pos)
         }
 
-        // Decimal number, possibly float
+        // Decimal, possibly float
         var isFloat = false
         while pos < count {
-            let ch = byte(pos)
-            if Self.isDigit(ch) {
-                pos += 1
-            } else if ch == Self.DOT || ch == Self._e || ch == Self._E {
-                isFloat = true
-                pos += 1
-            } else {
-                break
-            }
+            let ch = ptr[pos]
+            if ch >= 0x30 && ch <= 0x39 { pos += 1 }
+            else if ch == 0x2E || ch == 0x65 || ch == 0x45 { isFloat = true; pos += 1 }
+            else { break }
         }
-
-        return Token(kind: isFloat ? .float_ : .integer, text: text(start, pos))
+        return Token(kind: isFloat ? .float_ : .integer, start: start, end: pos)
     }
 
-    private func lexKeywordOrIdent() -> Token {
+    @inline(__always)
+    private static func lexKeywordOrIdent(
+        ptr: UnsafePointer<UInt8>, pos: inout Int, count: Int, ident: [UInt8]
+    ) -> Token {
         let start = pos
-        while pos < count && Self.isIdentChar(byte(pos)) {
-            pos += 1
-        }
+        while pos < count && ident[Int(ptr[pos])] != 0 { pos += 1 }
 
         // Check if this is a label (followed by ':')
-        if pos < count && byte(pos) == Self.COLON {
+        if pos < count && ptr[pos] == 0x3A {
             pos += 1
-            return Token(kind: .label, text: text(start, pos))
+            return Token(kind: .label, start: start, end: pos)
         }
-
-        return Token(kind: .keyword, text: text(start, pos))
+        return Token(kind: .keyword, start: start, end: pos)
     }
 }

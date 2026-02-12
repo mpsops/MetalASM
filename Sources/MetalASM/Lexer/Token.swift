@@ -1,16 +1,22 @@
 /// A token produced by the LLVM IR lexer.
 public struct Token {
     public var kind: Kind
-    public var text: String
-    public var line: Int
-    public var column: Int
+    /// Byte range [start, end) in the source buffer.
+    public var start: Int
+    public var end: Int
 
-    public init(kind: Kind, text: String, line: Int = 0, column: Int = 0) {
+    public init(kind: Kind, start: Int, end: Int) {
         self.kind = kind
-        self.text = text
-        self.line = line
-        self.column = column
+        self.start = start
+        self.end = end
     }
+
+    /// Sentinel EOF token.
+    public static let eof = Token(kind: .eof, start: 0, end: 0)
+
+    /// Length in bytes.
+    @inline(__always)
+    public var count: Int { end - start }
 
     public enum Kind: Equatable {
         // Literals

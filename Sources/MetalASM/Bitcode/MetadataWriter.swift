@@ -42,9 +42,7 @@ final class MetadataWriter {
 
         for (idx, name) in standardMetadataKinds.enumerated() {
             // KIND record: [kind_id, ...name_chars]
-            var operands: [UInt64] = [UInt64(idx)]
-            for b in name.utf8 { operands.append(UInt64(b)) }
-            writer.emitUnabbrevRecord(code: kindCode, operands: operands)
+            writer.emitUnabbrevStringRecord(code: kindCode, leading: UInt64(idx), name)
         }
 
         writer.exitBlock()
@@ -56,9 +54,7 @@ final class MetadataWriter {
 
         for tag in standardOperandBundleTags {
             // OPERAND_BUNDLE_TAG record (code 1): [...name_chars]
-            var operands: [UInt64] = []
-            for b in tag.utf8 { operands.append(UInt64(b)) }
-            writer.emitUnabbrevRecord(code: 1, operands: operands)
+            writer.emitUnabbrevStringRecord(code: 1, tag)
         }
 
         writer.exitBlock()
@@ -69,9 +65,7 @@ final class MetadataWriter {
         writer.enterSubblock(blockID: singlethreadBlockID, abbrevLen: 2)
 
         // UnknownCode1 record: "singlethread"
-        var operands: [UInt64] = []
-        for b in "singlethread".utf8 { operands.append(UInt64(b)) }
-        writer.emitUnabbrevRecord(code: 1, operands: operands)
+        writer.emitUnabbrevStringRecord(code: 1, "singlethread")
 
         writer.exitBlock()
     }
@@ -162,9 +156,7 @@ final class MetadataWriter {
 
         // --- Phase 3: Emit metadata strings ---
         for str in metadataStrings {
-            var operands: [UInt64] = []
-            for b in str.utf8 { operands.append(UInt64(b)) }
-            writer.emitUnabbrevRecord(code: stringOldCode, operands: operands)
+            writer.emitUnabbrevStringRecord(code: stringOldCode, str)
         }
 
         // --- Phase 4: Emit METADATA_VALUE records ---
@@ -224,9 +216,7 @@ final class MetadataWriter {
 
         // --- Phase 6: Emit named metadata ---
         for named in module.namedMetadata {
-            var nameOps: [UInt64] = []
-            for b in named.name.utf8 { nameOps.append(UInt64(b)) }
-            writer.emitUnabbrevRecord(code: nameCode, operands: nameOps)
+            writer.emitUnabbrevStringRecord(code: nameCode, named.name)
 
             // NAMED_NODE operands also use metadata_id + 1
             var nodeOps: [UInt64] = []

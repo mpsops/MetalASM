@@ -75,6 +75,12 @@ final class FunctionWriter {
     static let abbrevBrCond: UInt64 = 13    // INST_BR conditional: [bbIdx, bbIdx, relID]
     static let abbrevRet: UInt64 = 14       // INST_RET void: []
     static let abbrevPhi2: UInt64 = 15      // INST_PHI 2-entry: [typeID, val, bb, val, bb]
+    static let abbrevAlloca: UInt64 = 16   // INST_ALLOCA: [typeID, cntTypeID, cntID, align]
+    static let abbrevGEP: UInt64 = 17      // INST_GEP: [inbounds, typeID, ...relIDs] (variable via Array)
+    static let abbrevShuffleVec: UInt64 = 18 // INST_SHUFFLEVEC: [relID, relID, relID]
+    static let abbrevRetVal: UInt64 = 19   // INST_RET with value: [relID]
+    static let abbrevUnreachable: UInt64 = 20 // INST_UNREACHABLE: []
+    static let abbrevCall: UInt64 = 21     // INST_CALL: [paramattr, flags, fnty, fnid, ...args] via Array
 
     /// Define abbreviations for common instruction patterns.
     /// Must be called right after entering FUNCTION_BLOCK.
@@ -160,6 +166,44 @@ final class FunctionWriter {
             (2, 6),                        // VBR6: bb0
             (2, 8),                        // VBR8: val1
             (2, 6),                        // VBR6: bb1
+        ])
+        // Abbrev 16: ALLOCA [code, typeID, cntTypeID, cntID, align]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instAllocaCode)),
+            (2, 6),                        // VBR6: alloca type ID
+            (2, 6),                        // VBR6: count type ID
+            (2, 8),                        // VBR8: count value ID
+            (2, 6),                        // VBR6: align encoded
+        ])
+        // Abbrev 17: GEP [code, inbounds, typeID, array of VBR8 relIDs]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instGEPCode)),
+            (1, 1),                        // Fixed1: inbounds
+            (2, 6),                        // VBR6: source type ID
+            (3, nil),                      // Array
+            (2, 8),                        // VBR8: each relID
+        ])
+        // Abbrev 18: SHUFFLEVEC [code, relID, relID, relID]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instShuffleVecCode)),
+            (2, 8),
+            (2, 8),
+            (2, 8),
+        ])
+        // Abbrev 19: RET with value [code, relID]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instRetCode)),
+            (2, 8),                        // VBR8: value relID
+        ])
+        // Abbrev 20: UNREACHABLE [code]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instUnreachableCode)),
+        ])
+        // Abbrev 21: CALL [code, array of VBR8]
+        writer.emitDefineAbbrev(operandEncodings: [
+            (0, UInt64(instCallCode)),
+            (3, nil),                      // Array
+            (2, 8),                        // VBR8: each operand
         ])
     }
 
@@ -467,7 +511,7 @@ final class FunctionWriter {
                 writer.emitAbbreviatedRecord(abbrevID: abbrevRet, operands: [])
             } else if let op = inst.operands.first {
                 let valID = resolveOperand(op)
-                writer.emitUnabbrevRecord(code: instRetCode, relativeID(valID))
+                writer.emitAbbreviatedRecord(abbrevID: abbrevRetVal, operands: [relativeID(valID)])
             }
 
         case .br:
@@ -509,7 +553,7 @@ final class FunctionWriter {
                 countID,
                 alignEncoded
             ]
-            writer.emitUnabbrevRecord(code: instAllocaCode, operands: operands)
+            writer.emitAbbreviatedRecord(abbrevID: abbrevAlloca, operands: operands)
 
         case .load:
             if let op = inst.operands.first {
@@ -541,7 +585,7 @@ final class FunctionWriter {
                 let valID = resolveOperand(op)
                 operands.append(relativeID(valID))
             }
-            writer.emitUnabbrevRecord(code: instGEPCode, operands: operands)
+            writer.emitAbbreviatedRecord(abbrevID: abbrevGEP, operands: operands)
 
         case .bitcast, .zext, .sext, .trunc, .fpToUI, .fpToSI, .uiToFP, .siToFP,
              .fpTrunc, .fpExt, .ptrToInt, .intToPtr, .addrSpaceCast:
@@ -618,7 +662,7 @@ final class FunctionWriter {
                 operands.append(relativeID(argID))
             }
 
-            writer.emitUnabbrevRecord(code: instCallCode, operands: operands)
+            writer.emitAbbreviatedRecord(abbrevID: abbrevCall, operands: operands)
 
         case .phi:
             // INST_PHI: [ty, val0, bb0, val1, bb1, ...]
@@ -687,8 +731,8 @@ final class FunctionWriter {
                 let vec1 = resolveOperand(inst.operands[0])
                 let vec2 = resolveOperand(inst.operands[1])
                 let mask = resolveOperand(inst.operands[2])
-                writer.emitUnabbrevRecord(code: instShuffleVecCode,
-                    relativeID(vec1), relativeID(vec2), relativeID(mask))
+                writer.emitAbbreviatedRecord(abbrevID: abbrevShuffleVec, operands: [
+                    relativeID(vec1), relativeID(vec2), relativeID(mask)])
             }
 
         case .switchInst:
@@ -715,14 +759,14 @@ final class FunctionWriter {
                     }
                     i += 2
                 }
-                writer.emitUnabbrevRecord(code: instSwitchCode, operands: operands)
+                writer.emitUnabbrevRecord(code: instSwitchCode, operands: operands) // switch is rare, keep unabbrev
             }
 
         case .unreachable:
-            writer.emitUnabbrevRecord(code: instUnreachableCode)
+            writer.emitAbbreviatedRecord(abbrevID: abbrevUnreachable, operands: [])
 
         default:
-            writer.emitUnabbrevRecord(code: instUnreachableCode)
+            writer.emitAbbreviatedRecord(abbrevID: abbrevUnreachable, operands: [])
         }
     }
 

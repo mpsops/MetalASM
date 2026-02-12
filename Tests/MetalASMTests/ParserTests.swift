@@ -17,7 +17,7 @@ final class ParserTests: XCTestCase {
 
         let lexer = Lexer(source: source)
         let tokens = lexer.tokenize()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
 
         XCTAssertEqual(module.sourceFilename, "test")
@@ -37,7 +37,7 @@ final class ParserTests: XCTestCase {
 
         let lexer = Lexer(source: source)
         let tokens = lexer.tokenize()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
 
         XCTAssertEqual(module.functions.count, 1)
@@ -53,7 +53,7 @@ final class ParserTests: XCTestCase {
 
         let lexer = Lexer(source: source)
         let tokens = lexer.tokenize()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
 
         XCTAssertEqual(module.globals.count, 1)
@@ -68,7 +68,7 @@ final class ParserTests: XCTestCase {
 
         let lexer = Lexer(source: source)
         let tokens = lexer.tokenize()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
 
         XCTAssertEqual(module.structTypes.count, 1)
@@ -87,7 +87,7 @@ final class ParserTests: XCTestCase {
 
         let lexer = Lexer(source: source)
         let tokens = lexer.tokenize()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
 
         XCTAssertEqual(module.attributeGroups.count, 1)
@@ -104,7 +104,7 @@ final class ParserTests: XCTestCase {
 
         let lexer = Lexer(source: source)
         let tokens = lexer.tokenize()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
 
         XCTAssertGreaterThanOrEqual(module.metadataNodes.count, 1)
@@ -121,7 +121,7 @@ final class ParserTests: XCTestCase {
 
         let lexer = Lexer(source: source)
         let tokens = lexer.tokenize()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
 
         // Verify key properties
@@ -173,7 +173,7 @@ final class ParserTests: XCTestCase {
 
         let lexer = Lexer(source: source)
         let tokens = lexer.tokenize()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
 
         let testFn = module.functions.first { $0.name == "test" }

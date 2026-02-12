@@ -24,7 +24,7 @@ public enum MetalASM {
         let lexer = Lexer(source: ir)
         let tokens = lexer.tokenize()
         let t1 = CFAbsoluteTimeGetCurrent()
-        var parser = Parser(tokens: tokens)
+        var parser = Parser(tokens: tokens, source: lexer.source)
         let module = try parser.parse()
         let t2 = CFAbsoluteTimeGetCurrent()
 
