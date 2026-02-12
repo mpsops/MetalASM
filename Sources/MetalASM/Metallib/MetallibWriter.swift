@@ -314,15 +314,17 @@ public struct MetallibWriter {
             writeU32LE(&b, 8, UInt32(version))
             return b
         case .iOS(let version):
+            // iOS metallibs use the same platform bytes as macOS.
+            // Confirmed by comparing metal-as CLI output for iOS targets.
             var b = [UInt8](repeating: 0, count: 12)
-            b[0] = 0x06   // ios target
+            b[0] = 0x01   // same as macOS
             b[1] = 0x80   // flags
             b[2] = 0x02   // container version lo
             b[3] = 0x00   // container version hi
             b[4] = 0x09   // file type lo
             b[5] = 0x00   // file type hi
             b[6] = 0x00   // reserved
-            b[7] = 0x83   // os type (ios)
+            b[7] = 0x81   // same as macOS
             writeU32LE(&b, 8, UInt32(version))
             return b
         }
