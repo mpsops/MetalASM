@@ -305,12 +305,7 @@ public final class BitcodeWriter {
             let initID: UInt64
             if let init_ = global.initializer {
                 // Look up the initializer in the module constants map
-                let key: String
-                switch init_ {
-                case .undef: key = "\(global.valueType):undef"
-                case .zeroInitializer, .null: key = "\(global.valueType):null"
-                default: key = "\(global.valueType):unknown"
-                }
+                let key = constantKey(for: init_, type: global.valueType, map: moduleConstants)
                 if let valID = moduleConstants.valueMap[key] {
                     initID = UInt64(valID) + 1 // 1-based
                 } else {
@@ -403,12 +398,25 @@ public final class BitcodeWriter {
     struct ModuleConstantMap {
         enum ConstantKind {
             case integer(UInt64)  // signed VBR encoded
+            case float32(UInt32)  // raw bit pattern
+            case float64(UInt64)  // raw bit pattern
+            case float16(UInt16)  // raw bit pattern
+            case aggregate([Int]) // value IDs of elements
             case null
             case undef
         }
         var entries: [(IRType, ConstantKind)] = []
         var valueMap: [String: Int] = [:]      // "type:value" → value ID
         var baseValueID: Int = 0               // first value ID for module constants
+
+        /// Add a constant and return its value ID. Deduplicates by key.
+        mutating func addConstant(key: String, type: IRType, kind: ConstantKind) -> Int {
+            if let existing = valueMap[key] { return existing }
+            let id = baseValueID + entries.count
+            valueMap[key] = id
+            entries.append((type, kind))
+            return id
+        }
     }
 
     /// Build the module constant map (metadata integers + global initializers)
@@ -444,30 +452,93 @@ public final class BitcodeWriter {
             }
         }
 
-        // Add global variable initializers (undef, zeroinit)
+        // Add global variable initializers
         for global in module.globals {
             if let init_ = global.initializer {
-                let key: String
-                let kind: ModuleConstantMap.ConstantKind
-                switch init_ {
-                case .undef:
-                    key = "\(global.valueType):undef"
-                    kind = .undef
-                case .zeroInitializer, .null:
-                    key = "\(global.valueType):null"
-                    kind = .null
-                default:
-                    continue // skip complex initializers for now
-                }
-                if map.valueMap[key] == nil {
-                    let id = map.baseValueID + map.entries.count
-                    map.valueMap[key] = id
-                    map.entries.append((global.valueType, kind))
-                }
+                _ = addConstantToMap(&map, constant: init_, type: global.valueType)
             }
         }
 
         return map
+    }
+
+    /// Recursively add a constant (and its sub-constants) to the module constant map.
+    /// Returns the value ID assigned to this constant.
+    @discardableResult
+    private static func addConstantToMap(
+        _ map: inout ModuleConstantMap,
+        constant: IRConstant,
+        type: IRType
+    ) -> Int {
+        switch constant {
+        case .undef:
+            let key = "\(type):undef"
+            return map.addConstant(key: key, type: type, kind: .undef)
+
+        case .zeroInitializer, .null:
+            let key = "\(type):null"
+            return map.addConstant(key: key, type: type, kind: .null)
+
+        case .integer(_, let val):
+            let encoded = val >= 0 ? UInt64(val) << 1 : (UInt64(bitPattern: -val) << 1) | 1
+            let key = "\(type):\(encoded)"
+            return map.addConstant(key: key, type: type, kind: .integer(encoded))
+
+        case .float32(let v):
+            let key = "f32:\(v.bitPattern)"
+            return map.addConstant(key: key, type: .float32, kind: .float32(v.bitPattern))
+
+        case .float64(let v):
+            let key = "f64:\(v.bitPattern)"
+            return map.addConstant(key: key, type: .float64, kind: .float64(v.bitPattern))
+
+        case .float16(let bits):
+            let key = "f16:\(bits)"
+            return map.addConstant(key: key, type: .float16, kind: .float16(bits))
+
+        case .arrayValue(_, let elems):
+            // First, recursively add all element constants
+            let elemType: IRType
+            if case .array(let et, _) = type { elemType = et } else { elemType = .float32 }
+            var elemIDs: [Int] = []
+            for elem in elems {
+                let id = addConstantToMap(&map, constant: elem, type: elemType)
+                elemIDs.append(id)
+            }
+            // Then add the aggregate itself
+            let key = "\(type):agg:\(elemIDs)"
+            return map.addConstant(key: key, type: type, kind: .aggregate(elemIDs))
+
+        default:
+            // Unsupported constant type — treat as undef
+            let key = "\(type):undef"
+            return map.addConstant(key: key, type: type, kind: .undef)
+        }
+    }
+
+    /// Generate the lookup key for a constant (must match the key used in addConstantToMap).
+    private static func constantKey(
+        for constant: IRConstant, type: IRType, map: ModuleConstantMap
+    ) -> String {
+        switch constant {
+        case .undef: return "\(type):undef"
+        case .zeroInitializer, .null: return "\(type):null"
+        case .integer(_, let val):
+            let encoded = val >= 0 ? UInt64(val) << 1 : (UInt64(bitPattern: -val) << 1) | 1
+            return "\(type):\(encoded)"
+        case .float32(let v): return "f32:\(v.bitPattern)"
+        case .float64(let v): return "f64:\(v.bitPattern)"
+        case .float16(let bits): return "f16:\(bits)"
+        case .arrayValue(_, let elems):
+            let elemType: IRType
+            if case .array(let et, _) = type { elemType = et } else { elemType = .float32 }
+            let elemIDs = elems.map { elem -> Int in
+                let k = constantKey(for: elem, type: elemType, map: map)
+                return map.valueMap[k] ?? 0
+            }
+            return "\(type):agg:\(elemIDs)"
+        default: return "\(type):undef"
+        }
     }
 
     /// Emit the CONSTANTS_BLOCK for the given module constant map.
@@ -488,11 +559,21 @@ public final class BitcodeWriter {
             }
             switch kind {
             case .integer(let encoded):
-                writer.emitUnabbrevRecord(code: 4, encoded)
+                writer.emitUnabbrevRecord(code: 4, encoded)  // CST_CODE_INTEGER
+            case .float32(let bits):
+                writer.emitUnabbrevRecord(code: 6, UInt64(bits))  // CST_CODE_FLOAT
+            case .float64(let bits):
+                writer.emitUnabbrevRecord(code: 6, bits)  // CST_CODE_FLOAT
+            case .float16(let bits):
+                writer.emitUnabbrevRecord(code: 6, UInt64(bits))  // CST_CODE_FLOAT
+            case .aggregate(let elemIDs):
+                // CST_CODE_AGGREGATE: [val, val, ...]
+                let operands = elemIDs.map { UInt64($0) }
+                writer.emitUnabbrevRecord(code: 7, operands: operands)  // CST_CODE_AGGREGATE
             case .null:
-                writer.emitUnabbrevRecord(code: 2)
+                writer.emitUnabbrevRecord(code: 2)  // CST_CODE_NULL
             case .undef:
-                writer.emitUnabbrevRecord(code: 3)
+                writer.emitUnabbrevRecord(code: 3)  // CST_CODE_UNDEF
             }
         }
 

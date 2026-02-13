@@ -1713,6 +1713,19 @@ public struct Parser {
             // Skip unknown
             skipToNextLine()
             return .undef(type)
+        case .leftBracket:
+            // Array literal: [type val, type val, ...]
+            _ = advance() // consume [
+            var elements: [IRConstant] = []
+            while current.kind != .rightBracket && current.kind != .eof {
+                let elemType = try parseType()
+                let elem = try parseConstantValue(type: elemType)
+                elements.append(elem)
+                if !consumeIf(.comma) { break }
+                skipNewlines()
+            }
+            _ = try expect(.rightBracket)
+            return .arrayValue(type, elements)
         default:
             return .undef(type)
         }

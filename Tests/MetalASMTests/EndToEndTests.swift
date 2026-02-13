@@ -275,6 +275,108 @@ final class EndToEndTests: XCTestCase {
         XCTAssertGreaterThan(ratio, 0.8, "Our metallib is too small compared to reference")
         XCTAssertLessThan(ratio, 1.2, "Our metallib is too large compared to reference")
     }
+
+    /// Test that global constant arrays (addrspace(2)) are serialized correctly.
+    /// This is the NF4 codebook pattern: a kernel reads from a constant array.
+    /// The kernel looks up output[tid] = CODEBOOK[input[tid] & 0x3].
+    func testConstantArrayInitializer() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // A simple kernel with a constant array in addrspace(2).
+        // It reads a uint index from input, looks up a float in the codebook, writes to output.
+        let ir = """
+        source_filename = "codebook_test"
+        target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+        target triple = "air64_v28-apple-macosx26.0.0"
+
+        @CODEBOOK = internal addrspace(2) constant [4 x float] [
+          float 1.0, float 2.0, float 3.0, float 4.0
+        ]
+
+        define void @codebook_lookup(
+          i8 addrspace(1)* noundef "air-buffer-no-alias" %input_raw,
+          i8 addrspace(1)* noundef "air-buffer-no-alias" %output_raw,
+          i32 %tid_scalar
+        ) {
+        entry:
+          %input = bitcast i8 addrspace(1)* %input_raw to i32 addrspace(1)*
+          %output = bitcast i8 addrspace(1)* %output_raw to float addrspace(1)*
+          %idx_ptr = getelementptr i32, i32 addrspace(1)* %input, i32 %tid_scalar
+          %idx = load i32, i32 addrspace(1)* %idx_ptr
+          %masked = and i32 %idx, 3
+          %cb_ptr = getelementptr [4 x float], [4 x float] addrspace(2)* @CODEBOOK, i32 0, i32 %masked
+          %val = load float, float addrspace(2)* %cb_ptr
+          %out_ptr = getelementptr float, float addrspace(1)* %output, i32 %tid_scalar
+          store float %val, float addrspace(1)* %out_ptr
+          ret void
+        }
+
+        !air.kernel = !{!1}
+        !llvm.module.flags = !{!10, !11, !12, !13, !14, !15, !16}
+        !air.version = !{!20}
+        !air.language_version = !{!21}
+        !air.compile_options = !{!30}
+        !1 = !{void (i8 addrspace(1)*, i8 addrspace(1)*, i32)* @codebook_lookup, !2, !3}
+        !2 = !{}
+        !3 = !{!4, !5, !6}
+        !4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"input"}
+        !5 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"output"}
+        !6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+        !10 = !{i32 1, !"wchar_size", i32 4}
+        !11 = !{i32 7, !"air.max_device_buffers", i32 31}
+        !12 = !{i32 7, !"air.max_constant_buffers", i32 31}
+        !13 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+        !14 = !{i32 7, !"air.max_textures", i32 128}
+        !15 = !{i32 7, !"air.max_read_write_textures", i32 8}
+        !16 = !{i32 7, !"air.max_samplers", i32 16}
+        !20 = !{i32 2, i32 8, i32 0}
+        !21 = !{!"Metal", i32 4, i32 0, i32 0}
+        !30 = !{!"air.compile.fast_math_enable"}
+        """
+
+        let metallib = try MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal device")
+        }
+
+        let library = try device.makeLibrary(data: asDispatchData(metallib))
+        let fn = library.makeFunction(name: "codebook_lookup")
+        XCTAssertNotNil(fn, "codebook_lookup function not found")
+        let pipeline = try device.makeComputePipelineState(function: fn!)
+
+        // Input: indices [0, 1, 2, 3]
+        let count = 4
+        var inputData: [UInt32] = [0, 1, 2, 3]
+        let inputBuf = device.makeBuffer(bytes: &inputData, length: count * 4, options: .storageModeShared)!
+        let outputBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+
+        // Clear output to NaN so we can detect if nothing was written
+        let outPtr = outputBuf.contents().bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count { outPtr[i] = .nan }
+
+        let queue = device.makeCommandQueue()!
+        let cmdBuf = queue.makeCommandBuffer()!
+        let encoder = cmdBuf.makeComputeCommandEncoder()!
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuf, offset: 0, index: 0)
+        encoder.setBuffer(outputBuf, offset: 0, index: 1)
+        encoder.dispatchThreads(
+            MTLSize(width: count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+        encoder.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        // Expected: [1.0, 2.0, 3.0, 4.0] from codebook lookup
+        let expected: [Float] = [1.0, 2.0, 3.0, 4.0]
+        for i in 0..<count {
+            XCTAssertEqual(outPtr[i], expected[i], accuracy: 0.001,
+                "Codebook lookup at index \(i): got \(outPtr[i]), expected \(expected[i])")
+        }
+        #endif
+    }
 }
 
 // GPU pipeline test for simple kernels
