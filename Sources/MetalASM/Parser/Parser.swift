@@ -1592,6 +1592,19 @@ public struct Parser {
                 return try parseConstantGEP(type: type)
             } else if textEquals(current, "bitcast") {
                 return try parseConstantCast(type: type)
+            } else if textEquals(current, "splat") {
+                // splat (T val) — replicate scalar constant across all vector lanes
+                _ = advance() // consume 'splat'
+                _ = try expect(.leftParen)
+                let (_, elemOp) = try parseTypedOperand()
+                _ = try expect(.rightParen)
+                guard case .vector(let elemType, let count) = type,
+                      case .constant(let c) = elemOp else {
+                    return .constant(.undef(type))
+                }
+                _ = elemType  // already encoded in c.type
+                let elements = [IRConstant](repeating: c, count: count)
+                return .constant(.vectorValue(type, elements))
             }
             throw ParseError.unexpected("operand '\(text(current))'", line: 0, column: 0)
 
