@@ -602,8 +602,12 @@ final class FunctionWriter {
             if inst.operands.count >= 2 {
                 let lhs = resolveOperand(inst.operands[0])
                 let rhs = resolveOperand(inst.operands[1])
-                writer.emitAbbreviatedRecord(abbrevID: abbrevBinop, operands: [
-                    relativeID(lhs), relativeID(rhs), UInt64(binopOpcode(inst.opcode))])
+                let isFP = inst.opcode == .fadd || inst.opcode == .fsub ||
+                           inst.opcode == .fmul || inst.opcode == .fdiv || inst.opcode == .frem
+                // FP binops require a fast-math flags field (0 = no flags); integer binops do not.
+                var binopOps: [UInt64] = [relativeID(lhs), relativeID(rhs), UInt64(binopOpcode(inst.opcode))]
+                if isFP { binopOps.append(0) }
+                writer.emitUnabbrevRecord(code: Self.instBinopCode, operands: binopOps)
             }
 
         case .icmp, .fcmp:

@@ -6,11 +6,21 @@ let package = Package(
     platforms: [.macOS(.v13), .iOS(.v16)],
     products: [
         .library(name: "MetalASM", targets: ["MetalASM"]),
+        .library(name: "MetalASMBridge", type: .dynamic, targets: ["MetalASMBridge"]),
     ],
     targets: [
         .target(
             name: "MetalASM",
             path: "Sources/MetalASM"
+        ),
+        .target(
+            name: "MetalASMBridge",
+            dependencies: ["MetalASM"],
+            path: "Sources/MetalASMBridge",
+            linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("Foundation"),
+            ]
         ),
         .testTarget(
             name: "MetalASMTests",

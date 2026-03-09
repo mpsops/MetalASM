@@ -270,10 +270,13 @@ public final class Lexer {
 
         // Decimal, possibly float
         var isFloat = false
+        var prevWasExponent = false
         while pos < count {
             let ch = ptr[pos]
-            if ch >= 0x30 && ch <= 0x39 { pos += 1 }
-            else if ch == 0x2E || ch == 0x65 || ch == 0x45 { isFloat = true; pos += 1 }
+            if ch >= 0x30 && ch <= 0x39 { pos += 1; prevWasExponent = false }
+            else if ch == 0x2E { isFloat = true; pos += 1; prevWasExponent = false }
+            else if ch == 0x65 || ch == 0x45 { isFloat = true; pos += 1; prevWasExponent = true }
+            else if prevWasExponent && (ch == 0x2B || ch == 0x2D) { pos += 1; prevWasExponent = false } // +/- after e/E
             else { break }
         }
         return Token(kind: isFloat ? .float_ : .integer, start: start, end: pos)
