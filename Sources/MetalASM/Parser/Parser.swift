@@ -837,14 +837,17 @@ public struct Parser {
         // Parse argument list
         _ = try expect(.leftParen)
         var argOperands: [IRInstruction.Operand] = []
+        var argTypes: [IRType] = []
         skipNewlines()
         if current.kind != .rightParen {
-            let (_, argOp) = try parseTypedOperand()
+            let (argTy, argOp) = try parseTypedOperand()
             argOperands.append(argOp)
+            argTypes.append(argTy)
             while consumeIf(.comma) {
                 skipNewlines()
-                let (_, argOp) = try parseTypedOperand()
+                let (argTy, argOp) = try parseTypedOperand()
                 argOperands.append(argOp)
+                argTypes.append(argTy)
             }
         }
         _ = try expect(.rightParen)
@@ -854,9 +857,9 @@ public struct Parser {
             _ = advance()
         }
 
-        // Build function value
+        // Build function value — use actual argument types for forward references
         let fnValue = resolveGlobalValue(fnName, type: .pointer(
-            pointee: .function(ret: returnType, params: argOperands.map { _ in .void }, isVarArg: false),
+            pointee: .function(ret: returnType, params: argTypes, isVarArg: false),
             addressSpace: 0
         ))
 

@@ -23,6 +23,7 @@ public func applyAirTransforms(module: IRModule) {
 
     transformStructPhis(module: module)
     transformBarrierRename(module: module)
+    transformLLVMIntrinsicRename(module: module)
     transformTGGlobalGEPs(module: module)
     transformMMATypedPtrs(module: module)
     transformAirSystemValues(module: module)
@@ -281,6 +282,43 @@ private func transformBarrierRename(module: IRModule) {
     }
 }
 
+// MARK: - Transform 1.5: LLVM intrinsic → AIR intrinsic renaming
+
+/// Map LLVM math intrinsics to their AIR equivalents.
+/// e.g. llvm.maxnum.f32 → air.fast_fmax.f32, llvm.minnum.f32 → air.fast_fmin.f32
+private let llvmToAirIntrinsics: [(String, String)] = [
+    ("llvm.maxnum.f32", "air.fmax.f32"),
+    ("llvm.minnum.f32", "air.fmin.f32"),
+    ("llvm.maxnum.f16", "air.fmax.f16"),
+    ("llvm.minnum.f16", "air.fmin.f16"),
+]
+
+private func transformLLVMIntrinsicRename(module: IRModule) {
+    let nameMap = Dictionary(llvmToAirIntrinsics, uniquingKeysWith: { _, b in b })
+    // Rename declarations and strip LLVM intrinsic attributes
+    for fn in module.functions where fn.isDeclaration {
+        if let airName = nameMap[fn.name] {
+            fn.name = airName
+            fn.attributeGroupIndex = nil
+        }
+    }
+    // Rename call sites
+    for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .call {
+                guard let calleeOp = inst.operands.last,
+                      case .value(let calleeVal) = calleeOp,
+                      let airName = nameMap[calleeVal.name] else { continue }
+                calleeVal.name = airName
+            }
+        }
+    }
+
+    // Remove attribute groups that are no longer referenced by any function
+    let usedGroupIndices = Set(module.functions.compactMap { $0.attributeGroupIndex })
+    module.attributeGroups.removeAll { !usedGroupIndices.contains($0.index) }
+}
+
 // MARK: - Transform 2: MMA load/store elimination + multiply-accumulate fixup
 //
 // air.simdgroup_matrix_8x8_load/store crash the Metal GPU shader compiler XPC service.
@@ -340,10 +378,20 @@ private func transformMMATypedPtrs(module: IRModule) {
     }
 
     // Convert remaining opaque pointer params to typed pointers based on usage.
-    // Only needed when MMA intrinsics are present (emitOpaqueAsTyped converts all
-    // opaque ptrs to float*, but addrspace(2) constant buffers load i32).
+    // Metal AIR (LLVM 14) requires typed pointers — opaque ptrs crash the GPU JIT
+    // when complex ops (typed GEPs) reference them. IRTransform converts param
+    // types; emitOpaqueAsTyped catches remaining opaque ptr types (GEP results,
+    // intermediates) at bitcode emission time. Both gates live here.
     let hasMMADecl = module.functions.contains { $0.name.hasPrefix("air.simdgroup_matrix_8x8_") }
-    guard hasMMADecl else { return }
+    let hasTGByteGlobal = module.globals.contains { g in
+        g.addressSpace == 3 && {
+            if case .array(let e, _) = g.valueType, e == .i8 { return true }
+            return false
+        }()
+    }
+    let needsTypedPtrs = hasMMADecl || hasTGByteGlobal
+    TypeTableWriter.emitOpaqueAsTyped = needsTypedPtrs
+    guard needsTypedPtrs else { return }
 
     for fn in module.functions where !fn.isDeclaration {
         // Map param name → index for quick lookup
@@ -455,31 +503,204 @@ private func transformMMATypedPtrs(module: IRModule) {
 // MARK: - Transform 3: Threadgroup global GEP rewrite
 
 private func transformTGGlobalGEPs(module: IRModule) {
-    // Find all addrspace(3) globals with array type
-    var tgGlobals: [(name: String, arrayType: IRType, count: Int)] = []
+    // Two kinds of addrspace(3) globals:
+    //   1. [N x i8] byte-addressed scratch (e.g. @global_smem) → convert to kernel param
+    //   2. [N x float] MMA buffers (e.g. @__tg_dot_*) → preamble GEP for typed pointer
+
+    var byteGlobals: [IRGlobal] = []       // → preamble GEP (keep as globals)
+    var mmaGlobals: [(name: String, arrayType: IRType, count: Int)] = []  // → preamble GEP
+
     for g in module.globals where g.addressSpace == 3 {
-        if case .array(_, let n) = g.valueType {
-            tgGlobals.append((name: g.name, arrayType: g.valueType, count: n))
+        if case .array(let elemTy, let n) = g.valueType {
+            if elemTy == .i8 {
+                byteGlobals.append(g)
+            } else {
+                mmaGlobals.append((name: g.name, arrayType: g.valueType, count: n))
+            }
         }
     }
-    guard !tgGlobals.isEmpty else { return }
 
-    let tgGlobalSet = Set(tgGlobals.map { $0.name })
+    // --- Part 1: Preamble GEP for [N x i8] globals (keep as globals, driver allocates TG memory) ---
+    if !byteGlobals.isEmpty {
+        let i8TGPtr = IRType.pointer(pointee: .i8, addressSpace: 3)
 
+        for fn in module.functions where !fn.isDeclaration {
+            guard let entryBB = fn.basicBlocks.first else { continue }
+
+            var usedByteGlobals: [IRGlobal] = []
+            for g in byteGlobals {
+                let used = fn.basicBlocks.contains { bb in
+                    bb.instructions.contains { inst in
+                        inst.operands.contains { op in
+                            if case .value(let v) = op, v.name == g.name { return true }
+                            return false
+                        }
+                    }
+                }
+                if used { usedByteGlobals.append(g) }
+            }
+            guard !usedByteGlobals.isEmpty else { continue }
+
+            var preambleInstrs: [IRInstruction] = []
+            var baseSSAs: [String: String] = [:]
+
+            for g in usedByteGlobals {
+                let ssaName = "__base_\(g.name)"
+                baseSSAs[g.name] = ssaName
+                let baseInst = IRInstruction(
+                    opcode: .getelementptr,
+                    type: i8TGPtr,
+                    name: ssaName,
+                    operands: [
+                        .value(IRValue(type: .pointer(pointee: g.valueType, addressSpace: 3),
+                                       name: g.name)),
+                        .constant(.integer(.i64, 0)),
+                        .constant(.integer(.i64, 0)),
+                    ],
+                    attributes: {
+                        var a = IRInstruction.InstructionAttributes()
+                        a.inBounds = true
+                        a.gepSourceType = g.valueType
+                        return a
+                    }()
+                )
+                preambleInstrs.append(baseInst)
+            }
+
+            if !preambleInstrs.isEmpty {
+                entryBB.instructions = preambleInstrs + entryBB.instructions
+            }
+
+            let preambleNames = Set(preambleInstrs.map { $0.name })
+
+            // Replace uses of byte globals with preamble SSA (typed i8*)
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions where !preambleNames.contains(inst.name) {
+                    for i in inst.operands.indices {
+                        if case .value(let v) = inst.operands[i],
+                           let ssaName = baseSSAs[v.name] {
+                            // Skip the preamble GEP's own first operand (the global itself)
+                            if inst.opcode == .getelementptr && i == 0 {
+                                if case .array(_, _) = inst.attributes.gepSourceType {
+                                    continue
+                                }
+                            }
+                            inst.operands[i] = .value(IRValue(type: i8TGPtr, name: ssaName))
+                        }
+                    }
+                }
+            }
+
+            // Fix GEP result types from opaquePointer(3) to typed i8*(3)
+            var gepResultNames: Set<String> = []
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    if inst.opcode == .getelementptr,
+                       case .opaquePointer(3) = inst.type {
+                        inst.type = i8TGPtr
+                        gepResultNames.insert(inst.name)
+                    }
+                }
+            }
+            // Propagate typed pointer to downstream uses
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    for i in inst.operands.indices {
+                        if case .value(let v) = inst.operands[i],
+                           gepResultNames.contains(v.name),
+                           case .opaquePointer(3) = v.type {
+                            inst.operands[i] = .value(IRValue(type: i8TGPtr, name: v.name))
+                        }
+                    }
+                }
+            }
+
+            // Insert bitcasts: store/load of non-i8 types through i8*(3)
+            for bb in fn.basicBlocks {
+                var newInsts: [IRInstruction] = []
+                var castMap: [String: (name: String, type: IRType)] = [:]
+                let byteSSANames = Set(baseSSAs.values)
+                for inst in bb.instructions {
+                    if inst.opcode == .store,
+                       inst.operands.count >= 2,
+                       case .value(let ptrVal) = inst.operands[1],
+                       gepResultNames.contains(ptrVal.name) || byteSSANames.contains(ptrVal.name) {
+                        let storedType: IRType
+                        switch inst.operands[0] {
+                        case .value(let v): storedType = v.type
+                        case .constant(let c): storedType = c.type
+                        default: storedType = .i8
+                        }
+                        if storedType != .i8 {
+                            let key = ptrVal.name
+                            let cast: (name: String, type: IRType)
+                            if let existing = castMap[key], existing.type == IRType.pointer(pointee: storedType, addressSpace: 3) {
+                                cast = existing
+                            } else {
+                                let castName = "__bc_\(ptrVal.name)_\(newInsts.count)"
+                                let castType = IRType.pointer(pointee: storedType, addressSpace: 3)
+                                let bitcast = IRInstruction(
+                                    opcode: .bitcast,
+                                    type: castType,
+                                    name: castName,
+                                    operands: [.value(IRValue(type: i8TGPtr, name: ptrVal.name))],
+                                    attributes: IRInstruction.InstructionAttributes()
+                                )
+                                newInsts.append(bitcast)
+                                cast = (castName, castType)
+                                castMap[key] = cast
+                            }
+                            inst.operands[1] = .value(IRValue(type: cast.type, name: cast.name))
+                        }
+                    }
+                    if inst.opcode == .load,
+                       inst.operands.count >= 1,
+                       case .value(let ptrVal) = inst.operands[0],
+                       gepResultNames.contains(ptrVal.name) || byteSSANames.contains(ptrVal.name) {
+                        let loadedType = inst.type
+                        if loadedType != .i8 {
+                            let key = ptrVal.name
+                            let cast: (name: String, type: IRType)
+                            if let existing = castMap[key], existing.type == IRType.pointer(pointee: loadedType, addressSpace: 3) {
+                                cast = existing
+                            } else {
+                                let castName = "__bc_\(ptrVal.name)_\(newInsts.count)"
+                                let castType = IRType.pointer(pointee: loadedType, addressSpace: 3)
+                                let bitcast = IRInstruction(
+                                    opcode: .bitcast,
+                                    type: castType,
+                                    name: castName,
+                                    operands: [.value(IRValue(type: i8TGPtr, name: ptrVal.name))],
+                                    attributes: IRInstruction.InstructionAttributes()
+                                )
+                                newInsts.append(bitcast)
+                                cast = (castName, castType)
+                                castMap[key] = cast
+                            }
+                            inst.operands[0] = .value(IRValue(type: cast.type, name: cast.name))
+                        }
+                    }
+                    newInsts.append(inst)
+                }
+                bb.instructions = newInsts
+            }
+        }
+    }
+
+    // --- Part 2: Preamble GEP for MMA globals (keep as globals, add typed pointer) ---
+    guard !mmaGlobals.isEmpty else { return }
+
+    let mmaGlobalSet = Set(mmaGlobals.map { $0.name })
     let floatTGPtr = IRType.pointer(pointee: .float32, addressSpace: 3)
 
     for fn in module.functions where !fn.isDeclaration {
         guard let entryBB = fn.basicBlocks.first else { continue }
 
-        // Check if any TG global is used in any instruction.
-        // ALL uses need a preamble GEP to produce a typed float* base.
-        // GEP bases with scalar source type (float) can't be rewritten to array type
-        // without adjusting indices, so we always use the preamble approach.
         var needsPreamble: Set<String> = []
         for bb in fn.basicBlocks {
             for inst in bb.instructions {
                 for op in inst.operands {
-                    if case .value(let v) = op, tgGlobalSet.contains(v.name) {
+                    if case .value(let v) = op, mmaGlobalSet.contains(v.name) {
                         needsPreamble.insert(v.name)
                     }
                 }
@@ -487,9 +708,9 @@ private func transformTGGlobalGEPs(module: IRModule) {
         }
 
         var preambleInstrs: [IRInstruction] = []
-        var baseSSAs: [String: String] = [:]  // globalName → preamble SSA name
+        var baseSSAs: [String: String] = [:]
 
-        for g in tgGlobals where needsPreamble.contains(g.name) {
+        for g in mmaGlobals where needsPreamble.contains(g.name) {
             let ssaName = "__base_\(g.name)"
             baseSSAs[g.name] = ssaName
             let baseInst = IRInstruction(
@@ -520,18 +741,16 @@ private func transformTGGlobalGEPs(module: IRModule) {
         var ssaTypeMap: [String: IRType] = [:]
         for name in preambleNames { ssaTypeMap[name] = floatTGPtr }
 
-        // Pass A: replace uses of TG globals with preamble SSA (typed float*).
-        // Skip GEP bases that already use the correct array source type.
+        // Replace uses of TG globals with preamble SSA (typed float*)
         for bb in fn.basicBlocks {
             for inst in bb.instructions where !preambleNames.contains(inst.name) {
                 for i in inst.operands.indices {
                     if case .value(let v) = inst.operands[i],
-                       tgGlobalSet.contains(v.name),
+                       mmaGlobalSet.contains(v.name),
                        let ssaName = baseSSAs[v.name] {
-                        // Skip if this is a GEP base (operand 0) that already has array source type
                         if inst.opcode == .getelementptr && i == 0 {
                             if case .array(_, _) = inst.attributes.gepSourceType {
-                                continue  // Already correct array-typed GEP
+                                continue
                             }
                         }
                         inst.operands[i] = .value(IRValue(type: floatTGPtr, name: ssaName))
@@ -540,7 +759,7 @@ private func transformTGGlobalGEPs(module: IRModule) {
             }
         }
 
-        // Pass B: fix up stale operand types.
+        // Fix stale operand types
         for bb in fn.basicBlocks {
             for inst in bb.instructions {
                 for i in inst.operands.indices {
@@ -806,6 +1025,20 @@ private func transformAirSystemValues(module: IRModule) {
                     .string("air.arg_type_name"), .string("uint3"),
                     .string("air.arg_name"), .string("pid"),
                 ]
+            } else if isTGBufferType(argType) {
+                // Threadgroup buffer — Metal pattern: air.buffer with address_space 3
+                // location_index 0 is shared with device buffers but distinguished by addrspace
+                operands = [
+                    .constant(.i32, .integer(.i32, Int64(idx))),
+                    .string("air.buffer"),
+                    .string("air.location_index"), .constant(.i32, .integer(.i32, 0)), .constant(.i32, .integer(.i32, 1)),
+                    .string("air.read_write"),
+                    .string("air.address_space"), .constant(.i32, .integer(.i32, 3)),
+                    .string("air.arg_type_size"), .constant(.i32, .integer(.i32, 1)),
+                    .string("air.arg_type_align_size"), .constant(.i32, .integer(.i32, 1)),
+                    .string("air.arg_type_name"), .string("char"),
+                    .string("air.arg_name"), .string(argName),
+                ]
             } else if isDeviceBufferType(argType) {
                 // Device buffer
                 operands = [
@@ -880,6 +1113,14 @@ private func isDeviceBufferType(_ t: IRType) -> Bool {
     switch t {
     case .opaquePointer(addressSpace: 1): return true
     case .pointer(_, addressSpace: 1): return true
+    default: return false
+    }
+}
+
+private func isTGBufferType(_ t: IRType) -> Bool {
+    switch t {
+    case .opaquePointer(addressSpace: 3): return true
+    case .pointer(_, addressSpace: 3): return true
     default: return false
     }
 }

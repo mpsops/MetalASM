@@ -48,6 +48,12 @@ final class ValueEnumerator {
         switch type {
         case .pointer(let pointee, _):
             enumerateType(pointee)
+        case .opaquePointer:
+            // When emitOpaqueAsTyped is set, opaque pointers become typed float*
+            // in the type table — ensure float32 is enumerated before the pointer.
+            if TypeTableWriter.emitOpaqueAsTyped {
+                enumerateType(.float32)
+            }
         case .array(let elem, _):
             enumerateType(elem)
         case .vector(let elem, _):

@@ -44,9 +44,8 @@ public final class BitcodeWriter {
             }
         }
 
-        // Detect MMA intrinsics — need typed pointers for GPU JIT
-        let hasMMA = module.functions.contains { $0.name.hasPrefix("air.simdgroup_matrix_8x8_") }
-        TypeTableWriter.emitOpaqueAsTyped = hasMMA
+        // TypeTableWriter.emitOpaqueAsTyped is set by IRTransform (single source
+        // of truth for the hasMMA || hasTGByteGlobal condition). Reset after use.
         defer { TypeTableWriter.emitOpaqueAsTyped = false }
 
         let te = CFAbsoluteTimeGetCurrent()

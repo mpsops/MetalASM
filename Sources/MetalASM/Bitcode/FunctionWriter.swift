@@ -589,7 +589,7 @@ final class FunctionWriter {
             }
 
         case .getelementptr:
-            // INST_GEP: [inbounds, type, base, ...indices]
+            // INST_GEP: [inbounds, typeID, relBase, relIdx1, ...]
             var operands: [UInt64] = [
                 inst.attributes.inBounds ? 1 : 0,
                 UInt64(enumerator.typeIndex(inst.attributes.gepSourceType ?? inst.type))
