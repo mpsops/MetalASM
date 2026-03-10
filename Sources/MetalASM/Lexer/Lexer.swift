@@ -255,7 +255,7 @@ public final class Lexer {
             var isTypedHexFloat = false
             if pos < count {
                 let ch = ptr[pos]
-                if ch == 0x48 || ch == 0x4B || ch == 0x4C || ch == 0x4D { // H K L M
+                if ch == 0x48 || ch == 0x4B || ch == 0x4C || ch == 0x4D || ch == 0x52 { // H K L M R
                     pos += 1; isTypedHexFloat = true
                 }
             }

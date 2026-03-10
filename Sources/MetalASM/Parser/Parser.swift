@@ -1503,7 +1503,7 @@ public struct Parser {
         case .float16:
             return .constant(.float16(UInt16(Float(asDouble).bitPattern & 0xFFFF)))
         case .bfloat16:
-            return .constant(.float16(UInt16(Float(asDouble).bitPattern >> 16)))
+            return .constant(.bfloat16(UInt16(Float(asDouble).bitPattern >> 16)))
         default:
             return .constant(.float64(asDouble))
         }
@@ -1553,6 +1553,9 @@ public struct Parser {
                 if source[tok.start + 2] == 0x48 { // 0xH - half precision
                     let bits = UInt16(tokenHexUInt64(tok, dropFirst: 3) ?? 0)
                     return .constant(.float16(bits))
+                } else if source[tok.start + 2] == 0x52 { // 0xR - bfloat16
+                    let bits = UInt16(tokenHexUInt64(tok, dropFirst: 3) ?? 0)
+                    return .constant(.bfloat16(bits))
                 } else { // 0x - double precision
                     if let bits = tokenHexUInt64(tok, dropFirst: 2) {
                         let asDouble = Double(bitPattern: bits)
@@ -1704,6 +1707,9 @@ public struct Parser {
                 if source[tok.start + 2] == 0x48 { // 0xH - half precision
                     let bits = UInt16(tokenHexUInt64(tok, dropFirst: 3) ?? 0)
                     return .float16(bits)
+                } else if source[tok.start + 2] == 0x52 { // 0xR - bfloat16
+                    let bits = UInt16(tokenHexUInt64(tok, dropFirst: 3) ?? 0)
+                    return .bfloat16(bits)
                 } else { // 0x - double precision
                     if let bits = tokenHexUInt64(tok, dropFirst: 2) {
                         let asDouble = Double(bitPattern: bits)

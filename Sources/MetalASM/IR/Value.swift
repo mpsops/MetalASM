@@ -24,6 +24,7 @@ public indirect enum IRConstant: Hashable {
     case float32(Float)
     case float64(Double)
     case float16(UInt16)  // stored as raw bits
+    case bfloat16(UInt16) // stored as raw bits
     case null(IRType)
     case undef(IRType)
     case zeroInitializer(IRType)
@@ -45,6 +46,7 @@ public indirect enum IRConstant: Hashable {
         case .float32: return .float32
         case .float64: return .float64
         case .float16: return .float16
+        case .bfloat16: return .bfloat16
         case .null(let t): return t
         case .undef(let t): return t
         case .zeroInitializer(let t): return t

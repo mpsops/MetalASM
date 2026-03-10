@@ -416,7 +416,8 @@ private func transformMMATypedPtrs(module: IRModule) {
             return false
         }()
     }
-    let needsTypedPtrs = hasMMADecl || hasTGByteGlobal
+    let hasAtomicDecl = module.functions.contains { $0.name.hasPrefix("air.atomic.") }
+    let needsTypedPtrs = hasMMADecl || hasTGByteGlobal || hasAtomicDecl
     TypeTableWriter.emitOpaqueAsTyped = needsTypedPtrs
     guard needsTypedPtrs else { return }
 
@@ -441,7 +442,8 @@ private func transformMMATypedPtrs(module: IRModule) {
                    case .value(let v) = op, let idx = paramIndices[v.name],
                    case .opaquePointer(_) = fn.parameterTypes[idx],
                    let srcTy = inst.attributes.gepSourceType {
-                    paramPointeeTypes[idx] = srcTy
+                    // Metal has no i1 memory type — booleans are i8 in memory
+                    paramPointeeTypes[idx] = (srcTy == .int(bits: 1)) ? .int(bits: 8) : srcTy
                 }
             }
         }
@@ -467,6 +469,38 @@ private func transformMMATypedPtrs(module: IRModule) {
                            let idx = paramIndices[v.name],
                            v.type != fn.parameterTypes[idx] {
                             inst.operands[j] = .value(IRValue(type: fn.parameterTypes[idx], name: v.name))
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update GEP result types: if the base pointer is now typed,
+        // the GEP result should also be typed (using gepSourceType).
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .getelementptr {
+                if case .opaquePointer(let addrSpace) = inst.type,
+                   let srcTy = inst.attributes.gepSourceType {
+                    // Metal has no i1 memory type — remap to i8
+                    let pointee = (srcTy == .int(bits: 1)) ? IRType.int(bits: 8) : srcTy
+                    if srcTy == .int(bits: 1) {
+                        inst.attributes.gepSourceType = .int(bits: 8)
+                    }
+                    let typedPtr = IRType.pointer(pointee: pointee, addressSpace: addrSpace)
+                    inst.type = typedPtr
+                    // Propagate to uses
+                    let gepName = inst.name
+                    if !gepName.isEmpty {
+                        for bb2 in fn.basicBlocks {
+                            for inst2 in bb2.instructions {
+                                for j in inst2.operands.indices {
+                                    if case .value(let v) = inst2.operands[j],
+                                       v.name == gepName,
+                                       case .opaquePointer(_) = v.type {
+                                        inst2.operands[j] = .value(IRValue(type: typedPtr, name: v.name))
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1001,6 +1035,44 @@ private func transformAirSystemValues(module: IRModule) {
             }
         }
 
+        // Pass 5b: rewrite scalar (non-pointer) params to constant buffer pointers.
+        // Metal requires all kernel params to be buffers or system values. Scalar
+        // params (float, i32) from Triton are passed via setBytes which maps to
+        // addrspace(2) constant buffers. Rewrite: float %x → ptr addrspace(2) %x,
+        // and insert a load at the start of the entry block.
+        do {
+            var scalarPreamble: [IRInstruction] = []
+            for i in 0..<origParamCount {
+                let paramType = fn.parameterTypes[i]
+                let scalarType: IRType
+                switch paramType {
+                case .float32: scalarType = .float32
+                case .i32:     scalarType = .i32
+                default: continue
+                }
+                let oldName = fn.parameterNames[i]
+                let loadName = oldName.isEmpty ? "scalar_\(i)" : oldName
+                let ptrName = "\(loadName)_ptr"
+                let ptrType = IRType.pointer(pointee: scalarType, addressSpace: 2)
+                fn.parameterTypes[i] = ptrType
+                fn.parameterNames[i] = ptrName
+                let loadInst = IRInstruction(
+                    opcode: .load, type: scalarType, name: loadName,
+                    operands: [.value(IRValue(type: ptrType, name: ptrName))]
+                )
+                loadInst.attributes.alignment = 4
+                scalarPreamble.append(loadInst)
+            }
+            if !scalarPreamble.isEmpty, let entryBB = fn.basicBlocks.first {
+                entryBB.instructions.insert(contentsOf: scalarPreamble, at: 0)
+                // Update fn.type and fn.parameters to match modified parameterTypes
+                fn.type = .function(ret: fn.returnType, params: fn.parameterTypes, isVarArg: false)
+                for i in 0..<fn.parameters.count {
+                    fn.parameters[i] = IRValue(type: fn.parameterTypes[i], name: fn.parameterNames[i])
+                }
+            }
+        }
+
         // Pass 6: emit !air.kernel metadata for this function
         let allTypes = fn.parameterTypes
         let allNames = fn.parameterNames
@@ -1217,8 +1289,8 @@ private func ensureVersionMetadata(module: IRModule) {
         let idx = module.metadataNodes.count
         module.metadataNodes.append(IRMetadataNode(index: idx, operands: [
             .string("Metal"),
-            .constant(.i32, .integer(.i32, 4)),
-            .constant(.i32, .integer(.i32, 0)),
+            .constant(.i32, .integer(.i32, 3)),
+            .constant(.i32, .integer(.i32, 2)),
             .constant(.i32, .integer(.i32, 0)),
         ]))
         module.namedMetadata.append(IRNamedMetadata(name: "air.language_version", operands: [idx]))

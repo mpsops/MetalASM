@@ -352,6 +352,7 @@ public final class BitcodeWriter {
             case float32(UInt32)  // raw bit pattern
             case float64(UInt64)  // raw bit pattern
             case float16(UInt16)  // raw bit pattern
+            case bfloat16(UInt16) // raw bit pattern
             case aggregate([Int]) // value IDs of elements
             case null
             case undef
@@ -447,6 +448,10 @@ public final class BitcodeWriter {
             let key = "f16:\(bits)"
             return map.addConstant(key: key, type: .float16, kind: .float16(bits))
 
+        case .bfloat16(let bits):
+            let key = "bf16:\(bits)"
+            return map.addConstant(key: key, type: .bfloat16, kind: .bfloat16(bits))
+
         case .arrayValue(_, let elems):
             // First, recursively add all element constants
             let elemType: IRType
@@ -480,6 +485,7 @@ public final class BitcodeWriter {
         case .float32(let v): return "f32:\(v.bitPattern)"
         case .float64(let v): return "f64:\(v.bitPattern)"
         case .float16(let bits): return "f16:\(bits)"
+        case .bfloat16(let bits): return "bf16:\(bits)"
         case .arrayValue(_, let elems):
             let elemType: IRType
             if case .array(let et, _) = type { elemType = et } else { elemType = .float32 }
@@ -516,6 +522,8 @@ public final class BitcodeWriter {
             case .float64(let bits):
                 writer.emitUnabbrevRecord(code: 6, bits)  // CST_CODE_FLOAT
             case .float16(let bits):
+                writer.emitUnabbrevRecord(code: 6, UInt64(bits))  // CST_CODE_FLOAT
+            case .bfloat16(let bits):
                 writer.emitUnabbrevRecord(code: 6, UInt64(bits))  // CST_CODE_FLOAT
             case .aggregate(let elemIDs):
                 // CST_CODE_AGGREGATE: [val, val, ...]

@@ -380,6 +380,9 @@ final class FunctionWriter {
             case .float16(let bits):
                 writer.emitUnabbrevRecord(code: cstFloatCode, UInt64(bits))
 
+            case .bfloat16(let bits):
+                writer.emitUnabbrevRecord(code: cstFloatCode, UInt64(bits))
+
             case .null:
                 writer.emitUnabbrevRecord(code: cstNullCode)
 
@@ -438,6 +441,8 @@ final class FunctionWriter {
                     case .float32(let f):
                         operands.append(UInt64(f.bitPattern))
                     case .float16(let bits):
+                        operands.append(UInt64(bits))
+                    case .bfloat16(let bits):
                         operands.append(UInt64(bits))
                     default:
                         operands.append(resolveConstant(elem))
