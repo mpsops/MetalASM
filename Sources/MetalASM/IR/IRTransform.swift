@@ -287,10 +287,37 @@ private func transformBarrierRename(module: IRModule) {
 /// Map LLVM math intrinsics to their AIR equivalents.
 /// e.g. llvm.maxnum.f32 → air.fast_fmax.f32, llvm.minnum.f32 → air.fast_fmin.f32
 private let llvmToAirIntrinsics: [(String, String)] = [
+    // min/max
     ("llvm.maxnum.f32", "air.fmax.f32"),
     ("llvm.minnum.f32", "air.fmin.f32"),
     ("llvm.maxnum.f16", "air.fmax.f16"),
     ("llvm.minnum.f16", "air.fmin.f16"),
+    // trig
+    ("llvm.sin.f32",    "air.fast_sin.f32"),
+    ("llvm.cos.f32",    "air.fast_cos.f32"),
+    ("llvm.sin.f16",    "air.fast_sin.f16"),
+    ("llvm.cos.f16",    "air.fast_cos.f16"),
+    // exp/log
+    ("llvm.exp.f32",    "air.fast_exp.f32"),
+    ("llvm.log.f32",    "air.fast_log.f32"),
+    ("llvm.exp2.f32",   "air.fast_exp2.f32"),
+    ("llvm.log2.f32",   "air.fast_log2.f32"),
+    ("llvm.exp.f16",    "air.fast_exp.f16"),
+    ("llvm.log.f16",    "air.fast_log.f16"),
+    ("llvm.exp2.f16",   "air.fast_exp2.f16"),
+    ("llvm.log2.f16",   "air.fast_log2.f16"),
+    // sqrt/abs/floor/ceil
+    ("llvm.sqrt.f32",   "air.fast_sqrt.f32"),
+    ("llvm.fabs.f32",   "air.fabs.f32"),
+    ("llvm.floor.f32",  "air.fast_floor.f32"),
+    ("llvm.ceil.f32",   "air.fast_ceil.f32"),
+    ("llvm.sqrt.f16",   "air.fast_sqrt.f16"),
+    ("llvm.fabs.f16",   "air.fabs.f16"),
+    ("llvm.floor.f16",  "air.fast_floor.f16"),
+    ("llvm.ceil.f16",   "air.fast_ceil.f16"),
+    // fma
+    ("llvm.fma.f32",    "air.fma.f32"),
+    ("llvm.fma.f16",    "air.fma.f16"),
 ]
 
 private func transformLLVMIntrinsicRename(module: IRModule) {
