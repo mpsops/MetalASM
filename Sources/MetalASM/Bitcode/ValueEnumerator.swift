@@ -114,6 +114,9 @@ final class ValueEnumerator {
 
         // 3b. Enumerate metadata and label types (always needed by LLVM)
         enumerateType(.metadata)
+        if module.functions.contains(where: { $0.basicBlocks.count > 1 }) {
+            enumerateType(.label)
+        }
 
         // 4. Enumerate types used in metadata
         for node in module.metadataNodes {

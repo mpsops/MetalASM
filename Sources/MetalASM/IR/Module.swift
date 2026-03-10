@@ -21,8 +21,12 @@ public final class IRModule {
     /// Functions (both definitions and declarations).
     public var functions: [IRFunction]
 
-    /// Attribute groups.
+    /// Attribute groups (fn-level and per-param, indexed by group.index).
     public var attributeGroups: [IRAttributeGroup]
+
+    /// PARAMATTR_BLOCK entries: each is a list of group indices that form a combined attr list.
+    /// INST_CALL op0 = 1-based index into this array. Empty = no attributes.
+    public var paramAttrLists: [[Int]]
 
     /// Metadata nodes.
     public var metadataNodes: [IRMetadataNode]
@@ -42,6 +46,7 @@ public final class IRModule {
         self.globals = []
         self.functions = []
         self.attributeGroups = []
+        self.paramAttrLists = []
         self.metadataNodes = []
         self.namedMetadata = []
         self.moduleFlags = []

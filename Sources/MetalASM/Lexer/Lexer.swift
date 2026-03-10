@@ -279,6 +279,11 @@ public final class Lexer {
             else if prevWasExponent && (ch == 0x2B || ch == 0x2D) { pos += 1; prevWasExponent = false } // +/- after e/E
             else { break }
         }
+        // Check for numeric label (e.g. "65:" in basic block labels)
+        if !isFloat && pos < count && ptr[pos] == 0x3A /* ':' */ {
+            pos += 1
+            return Token(kind: .label, start: start, end: pos)
+        }
         return Token(kind: isFloat ? .float_ : .integer, start: start, end: pos)
     }
 

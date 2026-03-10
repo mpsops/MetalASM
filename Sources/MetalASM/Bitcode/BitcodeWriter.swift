@@ -17,7 +17,6 @@ public final class BitcodeWriter {
     static let functionCode: UInt64 = 8
     static let aliasCode: UInt64 = 9  // not used
     static let gcNameCode: UInt64 = 11
-    static let vstOffsetCode: UInt64 = 13
     static let sourceFilenameCode: UInt64 = 16
 
     // PARAMATTR_GROUP_BLOCK record codes
@@ -31,11 +30,6 @@ public final class BitcodeWriter {
     static let paramAttrBlockID: UInt64 = 9
     static let paramAttrGroupBlockID: UInt64 = 10
 
-    // MODULE_CODE_GLOBALVAR fields
-    // [strtab offset, strtab size, type, isconst, initid, linkage, align,
-    //  section, visibility, tls, unnamed_addr, externally_initialized,
-    //  dllstorageclass, comdat, addrspace, preemptionspecifier]
-
     /// Timing breakdown for the last write() call.
     public static var _bcBreakdown: String = ""
 
@@ -43,96 +37,77 @@ public final class BitcodeWriter {
     ///
     /// Returns the raw bitcode bytes starting with "BC\xC0\xDE".
     public static func write(module: IRModule) -> [UInt8] {
+        // Ensure paramAttrLists is populated for all attribute groups.
+        if module.paramAttrLists.isEmpty && !module.attributeGroups.isEmpty {
+            for group in module.attributeGroups {
+                module.paramAttrLists.append([group.index])
+            }
+        }
+
+        // Detect MMA intrinsics — need typed pointers for GPU JIT
+        let hasMMA = module.functions.contains { $0.name.hasPrefix("air.simdgroup_matrix_8x8_") }
+        TypeTableWriter.emitOpaqueAsTyped = hasMMA
+        defer { TypeTableWriter.emitOpaqueAsTyped = false }
+
         let te = CFAbsoluteTimeGetCurrent()
         let enumerator = ValueEnumerator(module: module)
         let te1 = CFAbsoluteTimeGetCurrent()
-        // Rough estimate: ~8 bytes per instruction
         let instCount = module.functions.reduce(0) { $0 + $1.basicBlocks.reduce(0) { $0 + $1.instructions.count } }
         let writer = BitstreamWriter(capacity: instCount * 8 + 4096)
 
         // Emit magic
         writer.emitBitcodeMagic()
 
-        // IDENTIFICATION_BLOCK (block ID 13)
-        writer.enterSubblock(blockID: 13, abbrevLen: 5)
-        // STRING record (code 1): producer string (empty)
-        writer.emitUnabbrevRecord(code: 1, operands: [])
-        // EPOCH record (code 2): bitcode epoch = 0
-        writer.emitUnabbrevRecord(code: 2, operands: [0])
-        writer.exitBlock()
+        // IDENTIFICATION_BLOCK
+            writer.enterSubblock(blockID: 13, abbrevLen: 5)
+            writer.emitUnabbrevStringRecord(code: 1, "MetalASM")
+            writer.emitUnabbrevRecord(code: 2, operands: [0])
+            writer.exitBlock()
 
-        // MODULE_BLOCK
-        writer.enterSubblock(blockID: moduleBlockID, abbrevLen: 4)
+            // MODULE_BLOCK
+            writer.enterSubblock(blockID: moduleBlockID, abbrevLen: 4)
+            writer.emitUnabbrevRecord(code: moduleVersionCode, operands: [1])
 
-        // Module version (1 = uses VST for names, 2 = uses STRTAB)
-        // We use version 1 since we emit VALUE_SYMTAB, not STRTAB
-        writer.emitUnabbrevRecord(code: moduleVersionCode, operands: [1])
+            writeParamAttrGroupBlock(to: writer, module: module)
+            writeParamAttrBlock(to: writer, module: module)
+            TypeTableWriter.write(to: writer, enumerator: enumerator)
 
-        // Attribute groups
-        writeParamAttrGroupBlock(to: writer, module: module)
-
-        // Parameter attributes
-        writeParamAttrBlock(to: writer, module: module)
-
-        // Type table
-        TypeTableWriter.write(to: writer, enumerator: enumerator)
-
-        // Triple
-        if !module.targetTriple.isEmpty {
-            writer.emitUnabbrevStringRecord(code: tripleCode, module.targetTriple)
-        }
-
-        // Data layout
-        if !module.dataLayout.isEmpty {
-            writer.emitUnabbrevStringRecord(code: datalayoutCode, module.dataLayout)
-        }
-
-        // Source filename
-        if !module.sourceFilename.isEmpty {
-            writer.emitUnabbrevStringRecord(code: sourceFilenameCode, module.sourceFilename)
-        }
-
-        // Build module constant map first (needed for global var initIDs)
-        let moduleConstants = buildModuleConstantMap(module: module, enumerator: enumerator)
-
-        // Global variables
-        writeGlobalVars(to: writer, module: module, enumerator: enumerator, moduleConstants: moduleConstants)
-
-        // Function declarations (MODULE_CODE_FUNCTION for each function)
-        writeFunctionDecls(to: writer, module: module, enumerator: enumerator)
-
-        // Module-level value symbol table
-        writeModuleVST(to: writer, module: module, enumerator: enumerator)
-
-        // Module-level constants block (for metadata references + global initializers)
-        emitModuleConstantsBlock(to: writer, enumerator: enumerator, moduleConstants: moduleConstants)
-
-        // Metadata kind block (standard LLVM metadata kind IDs)
-        MetadataWriter.writeMetadataKindBlock(to: writer)
-
-        // Metadata block (module-level, before function bodies)
-        MetadataWriter.write(to: writer, module: module, enumerator: enumerator, moduleConstants: moduleConstants)
-
-        // Operand bundle tags block
-        MetadataWriter.writeOperandBundleTagsBlock(to: writer)
-
-        // Block 26 (singlethread execution width info)
-        MetadataWriter.writeSinglethreadBlock(to: writer)
-
-        // Function bodies
-        let tf = CFAbsoluteTimeGetCurrent()
-        for fn in module.functions {
-            if !fn.isDeclaration {
-                FunctionWriter.write(to: writer, function: fn, enumerator: enumerator, moduleConstantCount: moduleConstants.entries.count)
+            if !module.targetTriple.isEmpty {
+                writer.emitUnabbrevStringRecord(code: tripleCode, module.targetTriple)
             }
-        }
-        let tf1 = CFAbsoluteTimeGetCurrent()
+            if !module.dataLayout.isEmpty {
+                writer.emitUnabbrevStringRecord(code: datalayoutCode, module.dataLayout)
+            }
+            if !module.sourceFilename.isEmpty {
+                writer.emitUnabbrevStringRecord(code: sourceFilenameCode, module.sourceFilename)
+            }
 
-        writer.exitBlock() // end MODULE_BLOCK
+            let moduleConstants = buildModuleConstantMap(module: module, enumerator: enumerator)
 
-        let result = writer.finalize()
+            writeGlobalVars(to: writer, module: module, enumerator: enumerator,
+                            moduleConstants: moduleConstants)
+            writeFunctionDecls(to: writer, module: module, enumerator: enumerator)
+
+            emitModuleConstantsBlock(to: writer, enumerator: enumerator, moduleConstants: moduleConstants)
+            MetadataWriter.writeMetadataKindBlock(to: writer)
+            MetadataWriter.write(to: writer, module: module, enumerator: enumerator, moduleConstants: moduleConstants)
+            MetadataWriter.writeOperandBundleTagsBlock(to: writer)
+            MetadataWriter.writeSinglethreadBlock(to: writer)
+
+            let tf = CFAbsoluteTimeGetCurrent()
+            for fn in module.functions {
+                if !fn.isDeclaration {
+                    FunctionWriter.write(to: writer, function: fn, enumerator: enumerator, moduleConstantCount: moduleConstants.entries.count)
+                }
+            }
+            let tf1 = CFAbsoluteTimeGetCurrent()
+
+            writeModuleVST(to: writer, module: module, enumerator: enumerator)
+            writer.exitBlock() // end MODULE_BLOCK
+
         _bcBreakdown = String(format: "enum=%.0fms fn=%.0fms", (te1-te)*1000, (tf1-tf)*1000)
-        return result
+
+        return writer.finalize()
     }
 
     // MARK: - Attribute blocks
@@ -145,10 +120,11 @@ public final class BitcodeWriter {
         for group in module.attributeGroups {
             // PARAMATTR_GRP_CODE_ENTRY: [group_id, param_index, ...attrs]
             // group_id is 1-based in bitcode
-            // param_index = 0xFFFFFFFF for function-level attributes
+            // param_index = 0xFFFFFFFF for function-level; 0..N for per-param
+            let paramIndex: UInt64 = group.paramIndex.map { UInt64($0) } ?? 0xFFFFFFFF
             var operands: [UInt64] = [
                 UInt64(group.index + 1),   // 1-based group ID
-                UInt64(0xFFFFFFFF),        // function-level attributes
+                paramIndex,
             ]
 
             for attr in group.attributes {
@@ -271,16 +247,26 @@ public final class BitcodeWriter {
     }
 
     private static func writeParamAttrBlock(to writer: BitstreamWriter, module: IRModule) {
-        guard !module.attributeGroups.isEmpty else { return }
+        // Emit from paramAttrLists if present, otherwise fall back to one-entry-per-group
+        let hasLists = !module.paramAttrLists.isEmpty
+        guard hasLists || !module.attributeGroups.isEmpty else { return }
 
         writer.enterSubblock(blockID: paramAttrBlockID, abbrevLen: 4)
 
-        // For each function, emit a PARAMATTR_CODE_ENTRY that references attribute groups
-        // For now, emit one entry per attribute group
-        for group in module.attributeGroups {
-            writer.emitUnabbrevRecord(code: paramAttrEntryCode, operands: [
-                UInt64(group.index + 1) // 1-based index
-            ])
+        if hasLists {
+            // Each paramAttrList is a set of group indices that form a combined attr list.
+            // PARAMATTR_CODE_ENTRY: [group_id_1, group_id_2, ...] (all 1-based)
+            for list in module.paramAttrLists {
+                let operands = list.map { UInt64($0 + 1) }
+                writer.emitUnabbrevRecord(code: paramAttrEntryCode, operands: operands)
+            }
+        } else {
+            // Fallback: one entry per attribute group (fn-level only)
+            for group in module.attributeGroups {
+                writer.emitUnabbrevRecord(code: paramAttrEntryCode, operands: [
+                    UInt64(group.index + 1)
+                ])
+            }
         }
 
         writer.exitBlock()
@@ -295,44 +281,27 @@ public final class BitcodeWriter {
         moduleConstants: ModuleConstantMap = ModuleConstantMap()
     ) {
         for global in module.globals {
-            // MODULE_CODE_GLOBALVAR: [type, isconst, initid, linkage, alignment,
-            //   section, visibility, tls, unnamed_addr, ext_init, dllstorageclass,
-            //   comdat, addrspace, preemption]
             let typeIdx = enumerator.typeIndex(global.type)
             let isConst: UInt64 = global.isConstant ? 1 : 0
-
-            // Init ID: 0 = no initializer, otherwise 1-based value ID
             let initID: UInt64
             if let init_ = global.initializer {
-                // Look up the initializer in the module constants map
                 let key = constantKey(for: init_, type: global.valueType, map: moduleConstants)
                 if let valID = moduleConstants.valueMap[key] {
-                    initID = UInt64(valID) + 1 // 1-based
+                    initID = UInt64(valID) + 1
                 } else {
                     initID = 0
                 }
             } else {
                 initID = 0
             }
-
             let linkage = encodeLinkage(global.linkage)
             let align = log2Align(global.alignment ?? 0)
-
             writer.emitUnabbrevRecord(code: globalVarCode, operands: [
-                UInt64(typeIdx),       // pointer type
-                isConst,               // isconst
-                initID,                // initid
-                linkage,               // linkage
-                UInt64(align),         // alignment
-                0,                     // section
-                0,                     // visibility (default)
-                0,                     // thread local mode
-                global.unnamedAddr ? 1 : (global.localUnnamedAddr ? 2 : 0),  // unnamed_addr
+                UInt64(typeIdx), isConst, initID, linkage, UInt64(align),
+                0, 0, 0,
+                global.unnamedAddr ? 1 : (global.localUnnamedAddr ? 2 : 0),
                 global.externallyInitialized ? 1 : 0,
-                0,                     // dll storage class
-                0,                     // comdat
-                UInt64(global.addressSpace),
-                0,                     // preemption specifier
+                0, 0, UInt64(global.addressSpace), 0,
             ])
         }
     }
@@ -345,33 +314,18 @@ public final class BitcodeWriter {
         enumerator: ValueEnumerator
     ) {
         for fn in module.functions {
-            // MODULE_CODE_FUNCTION: [type, callingconv, isproto, linkage, paramattr,
-            //   alignment, section, visibility, gc, unnamed_addr, prologuedata,
-            //   dllstorageclass, comdat, prefixdata, personalityfn, preemption,
-            //   addrspace, ...]
             let typeIdx = enumerator.typeIndex(fn.type)
             let isProto: UInt64 = fn.isDeclaration ? 1 : 0
             let linkage = encodeLinkage(fn.linkage)
             let paramAttr: UInt64 = fn.attributeGroupIndex.map { UInt64($0 + 1) } ?? 0
-
             writer.emitUnabbrevRecord(code: functionCode, operands: [
                 UInt64(typeIdx),
                 UInt64(fn.callingConvention.rawValue),
-                isProto,
-                linkage,
-                paramAttr,
+                isProto, linkage, paramAttr,
                 UInt64(log2Align(fn.alignment ?? 0)),
-                0,  // section
-                0,  // visibility
-                0,  // gc
+                0, 0, 0,
                 fn.unnamedAddr ? 1 : (fn.localUnnamedAddr ? 2 : 0),
-                0,  // prologuedata
-                0,  // dllstorageclass
-                0,  // comdat
-                0,  // prefixdata
-                0,  // personalityfn
-                0,  // preemption
-                UInt64(fn.addressSpace),
+                0, 0, 0, 0, 0, 0, UInt64(fn.addressSpace),
             ])
         }
     }
@@ -383,12 +337,10 @@ public final class BitcodeWriter {
         module: IRModule,
         enumerator: ValueEnumerator
     ) {
-        writer.enterSubblock(blockID: 14, abbrevLen: 4) // VALUE_SYMTAB_BLOCK
-
+        writer.enterSubblock(blockID: 14, abbrevLen: 4)
         for entry in enumerator.globalValues {
             writer.emitUnabbrevStringRecord(code: 1, leading: UInt64(entry.valueID), entry.name)
         }
-
         writer.exitBlock()
     }
 

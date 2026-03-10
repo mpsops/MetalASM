@@ -23,6 +23,12 @@ final class TypeTableWriter {
     static let functionCode: UInt64 = 21  // function type (new style)
     static let tokenCode: UInt64 = 22
     static let bfloatCode: UInt64 = 23
+    /// TYPE_CODE_OPAQUE_POINTER (LLVM 17 opaque pointer, "ptr").
+    static let opaquePtrCode: UInt64 = 25
+
+    /// When true, emit opaquePointer as typed pointer (float*).
+    /// Set by BitcodeWriter when MMA intrinsics are detected.
+    static var emitOpaqueAsTyped = false
 
     /// TYPE_BLOCK ID.
     static let blockID: UInt64 = 17
@@ -71,8 +77,20 @@ final class TypeTableWriter {
         case .token:
             writer.emitUnabbrevRecord(code: tokenCode, operands: [])
 
+        case .opaquePointer(let addrSpace):
+            if TypeTableWriter.emitOpaqueAsTyped {
+                // Emit as typed pointer (float*) — required when MMA intrinsics are present
+                let floatIdx = enumerator.typeIndex(.float32)
+                writer.emitUnabbrevRecord(code: pointerCode, operands: [
+                    UInt64(floatIdx), UInt64(addrSpace)
+                ])
+            } else {
+                // Standard opaque pointer encoding
+                writer.emitUnabbrevRecord(code: opaquePtrCode, operands: [UInt64(addrSpace)])
+            }
+
         case .pointer(let pointee, let addrSpace):
-            // POINTER: [pointee_type_id, address_space]
+            // Typed pointer (legacy AIR style) → POINTER: [pointee_type_id, address_space]
             writer.emitUnabbrevRecord(code: pointerCode, operands: [
                 UInt64(enumerator.typeIndex(pointee)),
                 UInt64(addrSpace)

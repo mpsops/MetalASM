@@ -66,8 +66,13 @@ public struct IRAttributeGroup {
     /// The attributes in this group.
     public var attributes: [IRAttribute]
 
-    public init(index: Int, attributes: [IRAttribute]) {
+    /// Parameter index for per-param groups (0 = arg 0, 1 = arg 1, etc.).
+    /// nil = function-level attributes (encoded as 0xFFFFFFFF in bitcode).
+    public var paramIndex: Int?
+
+    public init(index: Int, attributes: [IRAttribute], paramIndex: Int? = nil) {
         self.index = index
         self.attributes = attributes
+        self.paramIndex = paramIndex
     }
 }

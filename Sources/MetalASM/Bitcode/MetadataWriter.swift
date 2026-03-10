@@ -86,6 +86,12 @@ final class MetadataWriter {
 
         let sortedNodes = module.metadataNodes.sorted { $0.index < $1.index }
 
+        // Map from node.index → sequential position in sortedNodes (used for cross-references)
+        var nodeIndexToPosition: [Int: Int] = [:]
+        for (pos, node) in sortedNodes.enumerated() {
+            nodeIndexToPosition[node.index] = pos
+        }
+
         // --- Phase 1: Collect metadata strings ---
         var metadataStrings: [String] = []
         var stringToIndex: [String: Int] = [:]
@@ -180,8 +186,9 @@ final class MetadataWriter {
                     operands.append(UInt64(stringToIndex[s]!) + 1)
 
                 case .metadata(let idx):
-                    // Reference to another node: ID = stringCount + valueCount + nodeIndex
-                    operands.append(UInt64(stringCount + valueCount + idx) + 1)
+                    // Reference to another node: ID = stringCount + valueCount + position
+                    let pos = nodeIndexToPosition[idx] ?? idx
+                    operands.append(UInt64(stringCount + valueCount + pos) + 1)
 
                 case .constant(let type, let constant):
                     // Reference to the METADATA_VALUE we emitted
@@ -218,10 +225,11 @@ final class MetadataWriter {
         for named in module.namedMetadata {
             writer.emitUnabbrevStringRecord(code: nameCode, named.name)
 
-            // NAMED_NODE operands also use metadata_id + 1
+            // NAMED_NODE operands also use metadata_id + 1 (but NOT +1 for named nodes per LLVM spec)
             var nodeOps: [UInt64] = []
             for idx in named.operands {
-                nodeOps.append(UInt64(stringCount + valueCount + idx))
+                let pos = nodeIndexToPosition[idx] ?? idx
+                nodeOps.append(UInt64(stringCount + valueCount + pos))
             }
             writer.emitUnabbrevRecord(code: namedNodeCode, operands: nodeOps)
         }

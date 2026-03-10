@@ -533,7 +533,7 @@ public struct Parser {
             }
 
             _ = try expect(.leftBrace)
-            fn.basicBlocks = try parseFunctionBody()
+            fn.basicBlocks = try parseFunctionBody(numParams: fn.parameters.count)
             _ = try expect(.rightBrace)
             localValues = [:]
         }
@@ -596,12 +596,12 @@ public struct Parser {
 
     // MARK: - Function body
 
-    private mutating func parseFunctionBody() throws -> [IRBasicBlock] {
+    private mutating func parseFunctionBody(numParams: Int = 0) throws -> [IRBasicBlock] {
         var blocks: [IRBasicBlock] = []
         skipNewlines()
 
-        // First block may have an implicit label
-        var currentBlock = IRBasicBlock(name: "entry")
+        // First block may have an implicit label — LLVM numbers it after the last param
+        var currentBlock = IRBasicBlock(name: "\(numParams)")
         var isFirstBlock = true
 
         while current.kind != .rightBrace && current.kind != .eof {
@@ -1331,9 +1331,9 @@ public struct Parser {
                     let spaceTok = try expect(.integer)
                     let addrSpace = tokenInt(spaceTok) ?? 0
                     _ = try expect(.rightParen)
-                    baseType = .pointer(pointee: .i8, addressSpace: addrSpace)
+                    baseType = .opaquePointer(addressSpace: addrSpace)
                 } else {
-                    baseType = .pointer(pointee: .i8, addressSpace: 0)
+                    baseType = .opaquePointer(addressSpace: 0)
                 }
             }
             else if fb == 0x6F && textEquals(tt, "opaque") { _ = advance(); baseType = .opaque(name: "opaque") }
@@ -1991,7 +1991,7 @@ public struct Parser {
 
     private static let binOpFlags: Set<String> = [
         "nuw", "nsw", "exact", "nnan", "ninf", "nsz",
-        "arcp", "contract", "afn", "reassoc", "fast"
+        "arcp", "contract", "afn", "reassoc", "fast", "disjoint"
     ]
 
     private func isAttributeKeyword(_ text: String) -> Bool {

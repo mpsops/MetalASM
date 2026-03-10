@@ -1,7 +1,7 @@
 /// LLVM IR type representation.
 ///
-/// Supports the typed pointer model used by Metal AIR (LLVM ~4.0 era),
-/// NOT the modern opaque pointer model.
+/// Supports both the typed pointer model (Metal AIR LLVM ~4.0 era)
+/// and LLVM 17 opaque pointers ("ptr").
 public indirect enum IRType: Hashable {
     case void
     case int(bits: Int)          // i1, i8, i16, i32, i64
@@ -10,6 +10,7 @@ public indirect enum IRType: Hashable {
     case float32                 // float
     case float64                 // double
     case pointer(pointee: IRType, addressSpace: Int)  // typed pointer: T addrspace(N)*
+    case opaquePointer(addressSpace: Int)             // LLVM 17 opaque pointer: ptr [addrspace(N)]
     case array(element: IRType, count: Int)            // [N x T]
     case vector(element: IRType, count: Int)           // <N x T>
     case structure(name: String?, elements: [IRType], isPacked: Bool)  // { T1, T2 } or <{ T1, T2 }>

@@ -253,8 +253,11 @@ final class FunctionWriter {
             case .getelementptr(_, _, let base, let indices):
                 registerConstant(base)
                 for idx in indices { registerConstant(idx) }
-            case .vectorValue(_, let elems), .arrayValue(_, let elems), .structValue(_, let elems):
+            case .arrayValue(_, let elems), .structValue(_, let elems):
                 for elem in elems { registerConstant(elem) }
+            case .vectorValue:
+                // Vector elements are encoded inline via DATA record; don't register them separately
+                break
             default:
                 break
             }
@@ -425,12 +428,22 @@ final class FunctionWriter {
                 writer.emitUnabbrevRecord(code: code, operands: operands)
 
             case .vectorValue(_, let elems):
-                // AGGREGATE: [val, val, ...]
+                // Use CST_CODE_DATA (code 22) for integer/float vectors: stores element values
+                // directly without value ID references, matching metal-as output.
                 var operands: [UInt64] = []
                 for elem in elems {
-                    operands.append(resolveConstant(elem))
+                    switch elem {
+                    case .integer(_, let v):
+                        operands.append(v >= 0 ? UInt64(v) : UInt64(bitPattern: v))
+                    case .float32(let f):
+                        operands.append(UInt64(f.bitPattern))
+                    case .float16(let bits):
+                        operands.append(UInt64(bits))
+                    default:
+                        operands.append(resolveConstant(elem))
+                    }
                 }
-                writer.emitUnabbrevRecord(code: cstAggregateCode, operands: operands)
+                writer.emitUnabbrevRecord(code: cstDataCode, operands: operands)
 
             case .arrayValue(_, let elems):
                 var operands: [UInt64] = []
@@ -619,23 +632,62 @@ final class FunctionWriter {
             }
 
         case .call:
-            // INST_CALL: [paramattr, cc, fnty, fnid, ...args]
+            // INST_CALL: [paramattr, cc_flags, fnty, fnid, ...args, [bundle_count]]
             var operands: [UInt64] = []
-            // Param attribute list ID (0 = no attributes)
-            operands.append(0)
+            // Param attribute list ID (0 = no attributes).
+            if let groupIdx = inst.attributes.funcAttributes.first {
+                operands.append(UInt64(groupIdx + 1))
+            } else {
+                operands.append(0)
+            }
+
+            // Detect AIR MMA intrinsic calls — they require operand bundle encoding
+            var calleeName: String? = nil
+            if let fnOp = inst.operands.last, case .value(let fnVal) = fnOp {
+                calleeName = fnVal.name
+            }
+            // MMA load/multiply_accumulate use operand bundle encoding (bit17 + sentinel 254)
+            // MMA store uses normal call encoding (no bit17, no sentinel)
+            let isMMAWithBundles = calleeName.map {
+                $0.hasPrefix("air.simdgroup_matrix_8x8_load") ||
+                $0.hasPrefix("air.simdgroup_matrix_8x8_multiply_accumulate")
+            } ?? false
+            let isMMAStore = calleeName.map {
+                $0.hasPrefix("air.simdgroup_matrix_8x8_store")
+            } ?? false
+
             // Calling convention flags:
             // bit 0: tail call
-            // bit 1-3: calling convention (shifted by 1)
+            // bits 13:1: calling convention
+            // bit 14: must-tail
             // bit 15: explicit type
+            // bit 17: hasOperandBundles (required for AIR MMA load/mul, NOT store)
             var flags: UInt64 = 0
             if inst.attributes.tailCall == .tail || inst.attributes.tailCall == .mustTail { flags |= 1 }
+            if inst.attributes.tailCall == .mustTail { flags |= (1 << 14) }
             flags |= (1 << 15) // explicit type
+            if isMMAWithBundles {
+                flags |= (1 << 17) | 1  // hasOperandBundles + tail
+            }
+            if isMMAStore {
+                flags |= 1  // tail (reference Metal compiler always sets tail for MMA store)
+            }
             operands.append(flags)
 
-            // Function type — resolve from the function declaration, not the call-site placeholder
-            if let fnOp = inst.operands.last {
+            // Function type: 254 sentinel for MMA load/mul, direct type for everything else
+            if isMMAWithBundles {
+                operands.append(254)
+                // After sentinel, emit the actual function type index
+                if let fnOp = inst.operands.last, case .value(let fnVal) = fnOp,
+                   let fnDecl = enumerator.findFunction(named: fnVal.name) {
+                    if case .pointer(let pointee, _) = fnDecl.type, case .function = pointee {
+                        operands.append(UInt64(enumerator.typeIndex(pointee)))
+                    } else if case .function = fnDecl.type {
+                        operands.append(UInt64(enumerator.typeIndex(fnDecl.type)))
+                    }
+                }
+            } else if let fnOp = inst.operands.last {
                 if case .value(let fnVal) = fnOp {
-                    // Look up the actual function declaration to get the correct function type
                     if let fnDecl = enumerator.findFunction(named: fnVal.name) {
                         if case .pointer(let pointee, _) = fnDecl.type, case .function = pointee {
                             operands.append(UInt64(enumerator.typeIndex(pointee)))
@@ -665,6 +717,9 @@ final class FunctionWriter {
                 let argID = resolveOperand(inst.operands[i])
                 operands.append(relativeID(argID))
             }
+
+            // Note: ref bc does NOT have trailing bundle_count despite bit17 being set
+            // Apple's format may not use it, or bundle_count=0 is implied by omission
 
             writer.emitAbbreviatedRecord(abbrevID: abbrevCall, operands: operands)
 
@@ -766,10 +821,38 @@ final class FunctionWriter {
                 writer.emitUnabbrevRecord(code: instSwitchCode, operands: operands) // switch is rare, keep unabbrev
             }
 
+        case .extractValue:
+            // INST_EXTRACTVAL (26): [agg_relID, idx0, idx1, ...]
+            if inst.operands.count >= 2 {
+                let agg = resolveOperand(inst.operands[0])
+                var operands: [UInt64] = [relativeID(agg)]
+                for i in 1..<inst.operands.count {
+                    if case .intLiteral(let idx) = inst.operands[i] {
+                        operands.append(UInt64(idx))
+                    }
+                }
+                writer.emitUnabbrevRecord(code: instExtractValCode, operands: operands)
+            }
+
+        case .insertValue:
+            // INST_INSERTVAL (27): [agg_relID, val_relID, idx0, idx1, ...]
+            if inst.operands.count >= 3 {
+                let agg = resolveOperand(inst.operands[0])
+                let val = resolveOperand(inst.operands[1])
+                var operands: [UInt64] = [relativeID(agg), relativeID(val)]
+                for i in 2..<inst.operands.count {
+                    if case .intLiteral(let idx) = inst.operands[i] {
+                        operands.append(UInt64(idx))
+                    }
+                }
+                writer.emitUnabbrevRecord(code: instInsertValCode, operands: operands)
+            }
+
         case .unreachable:
             writer.emitAbbreviatedRecord(abbrevID: abbrevUnreachable, operands: [])
 
         default:
+            print("[FunctionWriter] WARNING: unhandled opcode \(inst.opcode) — emitting unreachable")
             writer.emitAbbreviatedRecord(abbrevID: abbrevUnreachable, operands: [])
         }
     }

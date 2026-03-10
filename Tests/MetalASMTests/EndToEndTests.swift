@@ -423,32 +423,6 @@ extension EndToEndTests {
 
 // Quick test for llvm-dis compatibility
 extension EndToEndTests {
-    func testMinimalIRDisassembly() throws {
-        let ir = try String(contentsOfFile: "/tmp/gemm_simple.ll", encoding: .utf8)
-        
-        let metallib = try MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
-        try metallib.write(to: URL(fileURLWithPath: "/tmp/minimal_metalasm.metallib"))
-        
-        // Extract bitcode from metallib
-        let bytes = [UInt8](metallib)
-        var bcOffset = 0
-        var bcSize = 0
-        for i in 0..<(bytes.count - 4) {
-            if bytes[i] == 0xDE && bytes[i+1] == 0xC0 && bytes[i+2] == 0x17 && bytes[i+3] == 0x0B {
-                let off = Int(bytes[i+8]) | (Int(bytes[i+9]) << 8) | (Int(bytes[i+10]) << 16) | (Int(bytes[i+11]) << 24)
-                let sz = Int(bytes[i+12]) | (Int(bytes[i+13]) << 8) | (Int(bytes[i+14]) << 16) | (Int(bytes[i+15]) << 24)
-                bcOffset = i + off
-                bcSize = sz
-                break
-            }
-        }
-        
-        let bcData = Data(bytes[bcOffset..<(bcOffset + bcSize)])
-        try bcData.write(to: URL(fileURLWithPath: "/tmp/minimal_metalasm.bc"))
-        print("Wrote \(bcSize) bytes of bitcode to /tmp/minimal_metalasm.bc")
-        XCTAssertGreaterThan(bcSize, 0)
-    }
-
     func testAssemblyTiming() throws {
         // Try large IR first, fall back to small
         let candidates = ["/tmp/debug_backwardKeyValue_ir.ll", "/tmp/air-monolithic-test/monolithic.ll"]
@@ -491,5 +465,686 @@ extension EndToEndTests {
 
         print("  lex=\(String(format: "%.1f", (t1-t0)*1000))ms parse=\(String(format: "%.1f", (t2-t1)*1000))ms bc=\(String(format: "%.1f", (t3-t2)*1000))ms")
         print("  tokens=\(tokens.count) functions=\(module.functions.count)")
+    }
+
+    func testAddKernelTritonIR() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        ; ModuleID = 'LLVMDialectModule'
+        source_filename = "LLVMDialectModule"
+        target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+        target triple = "air64_v28-apple-macosx26.0.0"
+
+        define void @add_kernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ptr addrspace(1) %2, i32 %tid_x, i32 %tgid_x) {
+          %block_offset = mul i32 %tgid_x, 128
+          %idx = add i32 %block_offset, %tid_x
+          %p0 = getelementptr float, ptr addrspace(1) %0, i32 %idx
+          %v0 = load float, ptr addrspace(1) %p0, align 4
+          %p1 = getelementptr float, ptr addrspace(1) %1, i32 %idx
+          %v1 = load float, ptr addrspace(1) %p1, align 4
+          %sum = fadd float %v0, %v1
+          %p2 = getelementptr float, ptr addrspace(1) %2, i32 %idx
+          store float %sum, ptr addrspace(1) %p2, align 4
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !air.kernel = !{!1}
+        !air.version = !{!8}
+
+        !0 = !{i32 7, !"frame-pointer", i32 0}
+        !1 = !{ptr @add_kernel, !2, !3}
+        !2 = !{}
+        !3 = !{!4, !5, !6, !10, !11}
+        !4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"a"}
+        !5 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"b"}
+        !6 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"c"}
+        !10 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_x"}
+        !11 = !{i32 4, !"air.threadgroup_position_in_grid", !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"tgid_x"}
+        !8 = !{i32 2, i32 8, i32 0}
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/triton_test.metallib"))
+        if let bc = extractBitcode(from: data) {
+            try bc.write(to: URL(fileURLWithPath: "/tmp/triton_test.bc"))
+        }
+        print("testAddKernelTritonIR: \(data.count) bytes")
+        XCTAssertGreaterThan(data.count, 100)
+
+        // Verify the metallib loads on GPU
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "add_kernel")
+        XCTAssertNotNil(fn, "add_kernel function not found in library")
+        let pso = try device.makeComputePipelineState(function: fn!)
+        XCTAssertGreaterThan(pso.maxTotalThreadsPerThreadgroup, 0)
+        print("testAddKernelTritonIR: PSO OK, maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
+        #endif
+    }
+
+    func testZZDotKernelIR() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let llPath = "/tmp/dot_kernel_final.ll"
+        guard FileManager.default.fileExists(atPath: llPath) else {
+            throw XCTSkip("dot_kernel_final.ll not found at \(llPath)")
+        }
+        let irText = try String(contentsOfFile: llPath, encoding: .utf8)
+
+        // Debug: parse and apply transforms, inspect preamble GEPs
+        let lexer = Lexer(source: irText)
+        let tokens = lexer.tokenize()
+        var parser = Parser(tokens: tokens, source: lexer.source)
+        let module = try parser.parse()
+        print("Globals: \(module.globals.map { "@\($0.name) addrspace(\($0.addressSpace))" })")
+        applyAirTransforms(module: module)
+        if let fn = module.functions.first(where: { !$0.isDeclaration }) {
+            // Print all call instructions with operands
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions where inst.opcode == .call {
+                    if case .value(let callee) = inst.operands.last, callee.name.contains("simdgroup") {
+                        print("CALL \(callee.name):")
+                        for (i, op) in inst.operands.dropLast().enumerated() {
+                            switch op {
+                            case .value(let v): print("  arg[\(i)]: name=\(v.name), type=\(v.type)")
+                            case .constant(let c): print("  arg[\(i)]: const \(c)")
+                            default: print("  arg[\(i)]: \(op)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Find any opaque ptrs in instructions
+        if let fn = module.functions.first(where: { !$0.isDeclaration }) {
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    if case .opaquePointer(let as_) = inst.type {
+                        print("[OPQ] inst %\(inst.name) result opaquePointer(\(as_)): \(inst.opcode)")
+                    }
+                    for (i, op) in inst.operands.enumerated() {
+                        if case .value(let v) = op, case .opaquePointer(let as_) = v.type {
+                            print("[OPQ] inst %\(inst.name) op[\(i)] \(v.name) opaquePointer(\(as_))")
+                        }
+                    }
+                }
+            }
+        }
+        // Also dump type table
+        let ve2 = ValueEnumerator(module: module)
+        let opqTypes = ve2.types.enumerated().filter { if case .opaquePointer(_) = $0.element { return true }; return false }
+        print("[TypeTable opaque] \(opqTypes.map { "[\($0.offset)] \($0.element)" })")
+
+        let data = try MetalASM.assemble(ir: irText)
+        try data.write(to: URL(fileURLWithPath: "/tmp/dot_kernel_test.metallib"))
+        if let bc = extractBitcode(from: data) {
+            try bc.write(to: URL(fileURLWithPath: "/tmp/dot_kernel_test.bc"))
+        }
+        print("testZZDotKernelIR: \(data.count) bytes")
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "dot_kernel")
+        XCTAssertNotNil(fn, "dot_kernel function not found")
+        let pso = try device.makeComputePipelineState(function: fn!)
+        print("testZZDotKernelIR: PSO OK, maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
+        #endif
+    }
+
+    /// Hybrid test: metal-as compiled MMA bc wrapped in our metallib format.
+    /// If this passes but testMMALoadMinimal fails → crash is in our bitcode encoding.
+    /// If this also fails → crash is in our metallib format.
+    func testMMAHybrid() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // mma_ref.bc = metal-as compiled from mma_minimal.ll (has !air.version metadata)
+        let bcPath = "/tmp/mma_ref.bc"
+        guard FileManager.default.fileExists(atPath: bcPath) else {
+            throw XCTSkip("Need /tmp/mma_ref.bc — run: metal-as /tmp/mma_minimal.ll -o /tmp/mma_ref.bc")
+        }
+        // mma_ref.bc is already a bitcode wrapper (metal-as output) — use wrapAIR
+        let bc = try [UInt8](Data(contentsOf: URL(fileURLWithPath: bcPath)))
+        let data = MetalASM.wrapAIR(bc, kernelNames: ["mma_kernel"])
+        try data.write(to: URL(fileURLWithPath: "/tmp/mma_hybrid.metallib"))
+        print("testMMAHybrid: \(data.count) bytes")
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "mma_kernel")
+        XCTAssertNotNil(fn)
+        let pso = try device.makeComputePipelineState(function: fn!)
+        print("testMMAHybrid: PSO OK, maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
+        #endif
+    }
+
+    /// Minimal test: just simdgroup_matrix_8x8_load with typed float* from TG global.
+    func testMMALoadMinimal() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Test: does mmaLoad cause crash?
+        let ir = """
+        @__tg = internal addrspace(3) global [64 x float] undef, align 4
+        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+        define void @mma_kernel(ptr addrspace(1) %buf, i32 %tid_x, i32 %tid_y, i32 %tid_z) {
+          %base = getelementptr inbounds [64 x float], ptr addrspace(3) @__tg, i64 0, i64 0
+          %v = tail call fast <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3) %base, <2 x i64> <i64 8, i64 8>, <2 x i64> <i64 1, i64 8>, <2 x i64> zeroinitializer)
+          %c = tail call fast <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float> %v, <64 x float> %v, <64 x float> %v)
+          %gep = getelementptr float, ptr addrspace(1) %buf, i32 %tid_x
+          %s = extractelement <64 x float> %c, i32 0
+          store float %s, ptr addrspace(1) %gep, align 4
+          ret void
+        }
+        !air.kernel = !{!0}
+        !air.version = !{!7}
+        !air.language_version = !{!8}
+        !llvm.module.flags = !{!9, !10, !11, !12, !13, !14}
+        !0 = !{void (ptr addrspace(1), i32, i32, i32)* @mma_kernel, !1, !2}
+        !1 = !{}
+        !2 = !{!3, !4, !5, !6}
+        !3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"buf"}
+        !4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_x"}
+        !5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_y"}
+        !6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_z"}
+        !7 = !{i32 2, i32 8, i32 0}
+        !8 = !{!"Metal", i32 4, i32 0, i32 0}
+        !9 = !{i32 7, !"air.max_device_buffers", i32 31}
+        !10 = !{i32 7, !"air.max_constant_buffers", i32 31}
+        !11 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+        !12 = !{i32 7, !"air.max_textures", i32 128}
+        !13 = !{i32 7, !"air.max_read_write_textures", i32 8}
+        !14 = !{i32 7, !"air.max_samplers", i32 16}
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/mma_minimal.metallib"))
+        if let bc = extractBitcode(from: data) { try bc.write(to: URL(fileURLWithPath: "/tmp/mma_minimal.bc")) }
+        print("testMMALoadMinimal: \(data.count) bytes")
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "mma_kernel")
+        XCTAssertNotNil(fn)
+        let pso = try device.makeComputePipelineState(function: fn!)
+        print("testMMALoadMinimal: PSO OK, maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
+        #endif
+    }
+
+    /// Same as testMMALoadMinimal but using version 1 (VALUE_SYMTAB) format.
+    func testMMALoadMinimalV1() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        @__tg = internal addrspace(3) global [64 x float] undef, align 4
+        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+        define void @mma_kernel(ptr addrspace(1) %buf, i32 %tid_x, i32 %tid_y, i32 %tid_z) {
+          %base = getelementptr inbounds [64 x float], ptr addrspace(3) @__tg, i64 0, i64 0
+          %v = tail call fast <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3) %base, <2 x i64> <i64 8, i64 8>, <2 x i64> <i64 1, i64 8>, <2 x i64> zeroinitializer)
+          %c = tail call fast <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float> %v, <64 x float> %v, <64 x float> %v)
+          %gep = getelementptr float, ptr addrspace(1) %buf, i32 %tid_x
+          %s = extractelement <64 x float> %c, i32 0
+          store float %s, ptr addrspace(1) %gep, align 4
+          ret void
+        }
+        !air.kernel = !{!0}
+        !air.version = !{!7}
+        !air.language_version = !{!8}
+        !llvm.module.flags = !{!9, !10, !11, !12, !13, !14}
+        !0 = !{void (ptr addrspace(1), i32, i32, i32)* @mma_kernel, !1, !2}
+        !1 = !{}
+        !2 = !{!3, !4, !5, !6}
+        !3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"buf"}
+        !4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_x"}
+        !5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_y"}
+        !6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_z"}
+        !7 = !{i32 2, i32 8, i32 0}
+        !8 = !{!"Metal", i32 4, i32 0, i32 0}
+        !9 = !{i32 7, !"air.max_device_buffers", i32 31}
+        !10 = !{i32 7, !"air.max_constant_buffers", i32 31}
+        !11 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+        !12 = !{i32 7, !"air.max_textures", i32 128}
+        !13 = !{i32 7, !"air.max_read_write_textures", i32 8}
+        !14 = !{i32 7, !"air.max_samplers", i32 16}
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/mma_minimal_v1.metallib"))
+        if let bc = extractBitcode(from: data) { try bc.write(to: URL(fileURLWithPath: "/tmp/mma_minimal_v1.bc")) }
+        print("testMMALoadMinimalV1: \(data.count) bytes")
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "mma_kernel")
+        XCTAssertNotNil(fn)
+        let pso = try device.makeComputePipelineState(function: fn!)
+        print("testMMALoadMinimalV1: PSO OK, maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
+        #endif
+    }
+
+    /// Test MMA store intrinsic (void return).
+    func testMMAStoreMinimal() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        @__tg = internal addrspace(3) global [64 x float] undef, align 4
+        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(<64 x float>, ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        define void @mma_kernel(ptr addrspace(1) %buf, i32 %tid_x, i32 %tid_y, i32 %tid_z) {
+          %base = getelementptr inbounds [64 x float], ptr addrspace(3) @__tg, i64 0, i64 0
+          %v = tail call fast <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3) %base, <2 x i64> <i64 8, i64 8>, <2 x i64> <i64 1, i64 8>, <2 x i64> zeroinitializer)
+          call void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(<64 x float> %v, ptr addrspace(3) %base, <2 x i64> <i64 8, i64 8>, <2 x i64> <i64 1, i64 8>, <2 x i64> zeroinitializer)
+          ret void
+        }
+        !air.kernel = !{!0}
+        !air.version = !{!7}
+        !llvm.module.flags = !{!9}
+        !0 = !{void (ptr addrspace(1), i32, i32, i32)* @mma_kernel, !1, !2}
+        !1 = !{}
+        !2 = !{!3, !4, !5, !6}
+        !3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"buf"}
+        !4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_x"}
+        !5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_y"}
+        !6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_z"}
+        !7 = !{i32 2, i32 8, i32 0}
+        !9 = !{i32 7, !"frame-pointer", i32 0}
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/mma_store_test.metallib"))
+        if let bc = extractBitcode(from: data) { try bc.write(to: URL(fileURLWithPath: "/tmp/mma_store_test.bc")) }
+        print("testMMAStoreMinimal: \(data.count) bytes")
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "mma_kernel")
+        XCTAssertNotNil(fn)
+        let pso = try device.makeComputePipelineState(function: fn!)
+        print("testMMAStoreMinimal: PSO OK, maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
+        #endif
+    }
+
+    // MARK: - GEMM kernel (loop + MMA)
+
+    /// Test the actual GEMM kernel IR from Triton (loop + MMA intrinsics).
+    func testGEMMKernelIR() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let llPath = "/tmp/dot_kernel_final.ll"
+        guard FileManager.default.fileExists(atPath: llPath) else {
+            throw XCTSkip("GEMM IR not found at \(llPath)")
+        }
+        let ir = try String(contentsOfFile: llPath, encoding: .utf8)
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/gemm_test.metallib"))
+        if let bc = extractBitcode(from: data) { try bc.write(to: URL(fileURLWithPath: "/tmp/gemm_test.bc")) }
+        print("testGEMMKernelIR: \(data.count) bytes")
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        print("testGEMMKernelIR: functionNames = \(lib.functionNames)")
+        let fn = lib.makeFunction(name: "matmul_kernel")
+        XCTAssertNotNil(fn, "matmul_kernel not found in \(lib.functionNames)")
+        let pso = try device.makeComputePipelineState(function: fn!)
+        print("testGEMMKernelIR: PSO OK, maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
+        #endif
+    }
+
+    /// Minimal: 2D grid + MMA. Each TG does 8x8 ones matmul, stores to different offsets via pid_x.
+    func testMMA2DKernel() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let llPath = "/tmp/mma_2d_kernel.ll"
+        guard FileManager.default.fileExists(atPath: llPath) else {
+            throw XCTSkip("mma_2d_kernel.ll not found")
+        }
+        let ir = try String(contentsOfFile: llPath, encoding: .utf8)
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/mma_2d_test.metallib"))
+        print("testMMA2DKernel: \(data.count) bytes")
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "mma_2d_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        print("testMMA2DKernel: PSO OK")
+
+        // 2 TGs of 32 threads, output = 128 floats
+        let outBuf = device.makeBuffer(length: 128 * 4, options: .storageModeShared)!
+        memset(outBuf.contents(), 0xFF, 128 * 4) // fill with NaN to detect unwritten
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let result = outBuf.contents().bindMemory(to: Float.self, capacity: 128)
+        // TG0 writes to [0..63], TG1 writes to [64..127]
+        // 8x8 ones matmul → each element = 8.0
+        print("testMMA2DKernel: TG0[0..3] = \(result[0]), \(result[1]), \(result[2]), \(result[3])")
+        print("testMMA2DKernel: TG1[64..67] = \(result[64]), \(result[65]), \(result[66]), \(result[67])")
+        for i in 0..<32 {
+            XCTAssertEqual(result[i], 8.0, accuracy: 1e-3, "TG0[\(i)]")
+        }
+        for i in 64..<96 {
+            XCTAssertEqual(result[i], 8.0, accuracy: 1e-3, "TG1[\(i)]")
+        }
+        #endif
+    }
+
+    /// Test 2D tiled dot (MMA) with multiple threadgroups — verifies pid_m/pid_n + MMA.
+    func testDot2DKernel() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let llPath = "/tmp/dot_kernel_dot_2d.ll"
+        guard FileManager.default.fileExists(atPath: llPath) else {
+            throw XCTSkip("dot_2d IR not found")
+        }
+        let ir = try String(contentsOfFile: llPath, encoding: .utf8)
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/dot_2d_test.metallib"))
+        if let bc = extractBitcode(from: data) { try bc.write(to: URL(fileURLWithPath: "/tmp/dot_2d_test.bc")) }
+        print("testDot2DKernel: \(data.count) bytes")
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "dot_2d")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        print("testDot2DKernel: PSO OK")
+
+        // A = ones(32x16), B = ones(16x32), C should = 16.0 everywhere
+        let M = 32, N = 32, K = 16
+        let aBuf = device.makeBuffer(length: M * K * 4, options: .storageModeShared)!
+        let bBuf = device.makeBuffer(length: K * N * 4, options: .storageModeShared)!
+        let cBuf = device.makeBuffer(length: M * N * 4, options: .storageModeShared)!
+        let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: M * K)
+        let bPtr = bBuf.contents().bindMemory(to: Float.self, capacity: K * N)
+        let cPtr = cBuf.contents().bindMemory(to: Float.self, capacity: M * N)
+        for i in 0..<(M*K) { aPtr[i] = 1.0 }
+        for i in 0..<(K*N) { bPtr[i] = 1.0 }
+        for i in 0..<(M*N) { cPtr[i] = 0.0 }
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(aBuf, offset: 0, index: 0)
+        enc.setBuffer(bBuf, offset: 0, index: 1)
+        enc.setBuffer(cBuf, offset: 0, index: 2)
+        // 2x2 threadgroups, 128 threads each (4 warps)
+        enc.dispatchThreadgroups(MTLSize(width: 2, height: 2, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        var maxErr: Float = 0
+        for i in 0..<M {
+            for j in 0..<N {
+                let err = abs(cPtr[i * N + j] - 16.0)
+                maxErr = max(maxErr, err)
+                if err > 0.01 {
+                    print("testDot2DKernel: MISMATCH C[\(i),\(j)] = \(cPtr[i * N + j]) (expected 16.0)")
+                }
+            }
+        }
+        print("testDot2DKernel: max_err = \(maxErr)")
+        // Print per-tile summary
+        for ti in stride(from: 0, to: M, by: 16) {
+            for tj in stride(from: 0, to: N, by: 16) {
+                var tileSum: Float = 0
+                for i in ti..<ti+16 { for j in tj..<tj+16 { tileSum += abs(cPtr[i*N+j]) } }
+                print("  tile[\(ti),\(tj)] sum=\(tileSum)")
+            }
+        }
+        XCTAssertLessThan(maxErr, 0.01, "2D dot max_err=\(maxErr)")
+        #endif
+    }
+
+    /// Test struct phi with extractvalue/insertvalue in a loop.
+    func testStructPhiKernel() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let llPath = "/tmp/struct_phi_kernel.ll"
+        guard FileManager.default.fileExists(atPath: llPath) else {
+            throw XCTSkip("struct_phi_kernel.ll not found")
+        }
+        let ir = try String(contentsOfFile: llPath, encoding: .utf8)
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/struct_phi_test.metallib"))
+        if let bc = extractBitcode(from: data) { try bc.write(to: URL(fileURLWithPath: "/tmp/struct_phi_test.bc")) }
+        print("testStructPhiKernel: \(data.count) bytes")
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "struct_phi_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        print("testStructPhiKernel: PSO OK")
+
+        let count = 32
+        let outBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        memset(outBuf.contents(), 0, count * 4)
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let result = outBuf.contents().bindMemory(to: Float.self, capacity: count)
+        print("testStructPhiKernel: result[0..3] = \(result[0]), \(result[1]), \(result[2]), \(result[3])")
+        // Thread i: sum = 4*i (4 iterations adding tid each time)
+        XCTAssertEqual(result[0], 0.0, accuracy: 1e-3, "thread 0: 4*0=0")
+        XCTAssertEqual(result[1], 4.0, accuracy: 1e-3, "thread 1: 4*1=4")
+        XCTAssertEqual(result[2], 8.0, accuracy: 1e-3, "thread 2: 4*2=8")
+        XCTAssertEqual(result[3], 12.0, accuracy: 1e-3, "thread 3: 4*3=12")
+        #endif
+    }
+
+    /// Test 2D grid dispatch: pid_x and pid_y are independent (not diagonal).
+    func testPidDumpKernel() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let llPath = "/tmp/pid_dump_kernel.ll"
+        guard FileManager.default.fileExists(atPath: llPath) else {
+            throw XCTSkip("pid_dump_kernel.ll not found")
+        }
+        let ir = try String(contentsOfFile: llPath, encoding: .utf8)
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/pid_dump_test.metallib"))
+        print("testPidDumpKernel: \(data.count) bytes")
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "pid_dump_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        print("testPidDumpKernel: PSO OK")
+
+        // Dispatch 4x4 grid, 1 thread per threadgroup
+        // value[pid_x * 4 + pid_y] = pid_x * 10 + pid_y + 100
+        let outBuf = device.makeBuffer(length: 16 * 4, options: .storageModeShared)!
+        memset(outBuf.contents(), 0, 16 * 4)
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: 4, height: 4, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let result = outBuf.contents().bindMemory(to: Float.self, capacity: 16)
+        for px in 0..<4 {
+            for py in 0..<4 {
+                let idx = px * 4 + py
+                let expected = Float(px * 10 + py + 100)
+                print("testPidDumpKernel: [\(px),\(py)] = \(result[idx]) (expected \(expected))")
+                XCTAssertEqual(result[idx], expected, accuracy: 1e-3,
+                              "pid_x=\(px) pid_y=\(py)")
+            }
+        }
+        #endif
+    }
+
+    /// Test loop + MMA (no struct phi) — isolates MMA-in-loop from struct phi issue.
+    func testLoopMMAKernel() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let llPath = "/tmp/loop_mma_kernel.ll"
+        guard FileManager.default.fileExists(atPath: llPath) else {
+            throw XCTSkip("loop_mma_kernel.ll not found")
+        }
+        let ir = try String(contentsOfFile: llPath, encoding: .utf8)
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/loop_mma_test.metallib"))
+        if let bc = extractBitcode(from: data) { try bc.write(to: URL(fileURLWithPath: "/tmp/loop_mma_test.bc")) }
+        print("testLoopMMAKernel: \(data.count) bytes")
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        print("testLoopMMAKernel: functionNames = \(lib.functionNames)")
+        let fn = lib.makeFunction(name: "loop_mma_kernel")
+        XCTAssertNotNil(fn, "loop_mma_kernel not found")
+        let pso = try device.makeComputePipelineState(function: fn!)
+        print("testLoopMMAKernel: PSO OK")
+
+        // Run: 32 threads, each writes C[tid]. 2 iters of ones @ ones = each element should be 2*8 = 16
+        let count = 32
+        let outBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        memset(outBuf.contents(), 0, count * 4)
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let result = outBuf.contents().bindMemory(to: Float.self, capacity: count)
+        print("testLoopMMAKernel: result[0..3] = \(result[0]), \(result[1]), \(result[2]), \(result[3])")
+        // Each element: 2 iterations × 8 (8×8 ones matmul) = 16
+        XCTAssertEqual(result[0], 16.0, accuracy: 1e-3)
+        #endif
+    }
+
+    /// Test the reference toolchain's .air for the GEMM kernel — isolates MetalASM bitcode issue.
+    func testGEMMRefAIR() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let airPath = "/tmp/gemm_ref.air"
+        guard FileManager.default.fileExists(atPath: airPath) else {
+            throw XCTSkip("Reference .air not found at \(airPath)")
+        }
+        let airData = try Data(contentsOf: URL(fileURLWithPath: airPath))
+        let metallib = MetalASM.wrapAIR(Array(airData), kernelNames: ["matmul_kernel"])
+        try metallib.write(to: URL(fileURLWithPath: "/tmp/gemm_ref2.metallib"))
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(metallib))
+        let fn = lib.makeFunction(name: "matmul_kernel")
+        XCTAssertNotNil(fn, "matmul_kernel not found in ref metallib")
+        let pso = try device.makeComputePipelineState(function: fn!)
+        print("testGEMMRefAIR: PSO OK, maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
+        #endif
+    }
+
+    // MARK: - Loop kernel (br/phi)
+
+    /// Test kernel with a simple loop (br + phi instructions).
+    /// sum_kernel: out[tid] = in[0] + in[1] + in[2] + in[3]
+    func testLoopKernel() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        define void @sum_kernel(ptr addrspace(1) %in, ptr addrspace(1) %out, i32 %tid) {
+        entry:
+          br label %loop
+
+        loop:
+          %i = phi i32 [ 0, %entry ], [ %i_next, %loop ]
+          %acc = phi float [ 0.0, %entry ], [ %acc_next, %loop ]
+          %ptr = getelementptr float, ptr addrspace(1) %in, i32 %i
+          %val = load float, ptr addrspace(1) %ptr, align 4
+          %acc_next = fadd float %acc, %val
+          %i_next = add i32 %i, 1
+          %cond = icmp slt i32 %i_next, 4
+          br i1 %cond, label %loop, label %exit
+
+        exit:
+          %out_ptr = getelementptr float, ptr addrspace(1) %out, i32 %tid
+          store float %acc_next, ptr addrspace(1) %out_ptr, align 4
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !air.kernel = !{!1}
+        !air.version = !{!8}
+
+        !0 = !{i32 7, !"frame-pointer", i32 0}
+        !1 = !{ptr @sum_kernel, !2, !3}
+        !2 = !{}
+        !3 = !{!4, !5, !6}
+        !4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"in"}
+        !5 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+        !6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+        !8 = !{i32 2, i32 8, i32 0}
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        try data.write(to: URL(fileURLWithPath: "/tmp/loop_test.metallib"))
+        if let bc = extractBitcode(from: data) { try bc.write(to: URL(fileURLWithPath: "/tmp/loop_test.bc")) }
+        print("testLoopKernel: \(data.count) bytes")
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "sum_kernel")
+        XCTAssertNotNil(fn, "sum_kernel not found")
+        let pso = try device.makeComputePipelineState(function: fn!)
+        print("testLoopKernel: PSO OK")
+
+        // Run it: in = [1, 2, 3, 4], expect out[0] = 10
+        let inBuf = device.makeBuffer(length: 4 * 4, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: 4, options: .storageModeShared)!
+        let inp = inBuf.contents().bindMemory(to: Float.self, capacity: 4)
+        inp[0] = 1; inp[1] = 2; inp[2] = 3; inp[3] = 4
+        outBuf.contents().bindMemory(to: Float.self, capacity: 1).pointee = 0
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let result = outBuf.contents().bindMemory(to: Float.self, capacity: 1).pointee
+        print("testLoopKernel: result = \(result)")
+        XCTAssertEqual(result, 10.0, accuracy: 1e-5, "1+2+3+4 should be 10")
+        #endif
     }
 }

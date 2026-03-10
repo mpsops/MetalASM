@@ -28,6 +28,27 @@ public enum MetalASM {
         let module = try parser.parse()
         let t2 = CFAbsoluteTimeGetCurrent()
 
+        // Phase 1.5: Apply Air compatibility transforms
+        applyAirTransforms(module: module)
+
+        // Debug: check for opaque pointers after transforms
+        let ve_dbg = ValueEnumerator(module: module)
+        let opqTypes = ve_dbg.types.filter { if case .opaquePointer(_) = $0 { return true }; return false }
+        if !opqTypes.isEmpty { print("[assemble] WARNING: opaque ptr types remain: \(opqTypes)") }
+
+        // Debug: dump metadata
+        if ProcessInfo.processInfo.environment["METALASM_DUMP_IR"] != nil {
+            var dump = ""
+            for fn in module.functions {
+                dump += "fn: \(fn.name)(\(fn.parameterTypes.map { "\($0)" }.joined(separator: ", ")))\n"
+            }
+            for (i, md) in module.metadataNodes.enumerated() {
+                dump += "!\(i) = !{\(md.operands.map { "\($0)" }.joined(separator: ", "))}\n"
+            }
+            try? dump.write(toFile: "/tmp/metalasm_debug.txt", atomically: true, encoding: .utf8)
+            print("[assemble] dumped debug info to /tmp/metalasm_debug.txt")
+        }
+
         // Phase 2: Serialize IR to LLVM bitcode
         let bitcodeBytes = BitcodeWriter.write(module: module)
         let t3 = CFAbsoluteTimeGetCurrent()

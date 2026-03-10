@@ -71,14 +71,17 @@ public struct MetallibWriter {
             buildEntryHeader(entry: entry, bitcodeSize: wrappedBitcode.count)
         }
 
-        // Build section 0: entry count (u32) + entry sizes (u32 each) + all entry tag data
+        // Build section 0: entry count (u32) + per entry: [entry_size (u32) + entry_body]
+        // entry_size = sizeof(tag_data) + sizeof(ENDT=4) + sizeof(ENDT=4)
+        // entry_body = tag_data + ENDT + ENDT  (two raw ENDT tags, no size prefix)
         var section0 = Data()
         appendU32(&section0, UInt32(entries.count))
         for header in entryHeaders {
-            appendU32(&section0, UInt32(header.count))
-        }
-        for header in entryHeaders {
+            let entrySize = UInt32(header.count + 4 + 4)  // tags + ENDT + ENDT
+            appendU32(&section0, entrySize)
             section0.append(contentsOf: header)
+            section0.append(contentsOf: Array("ENDT".utf8))  // first ENDT
+            section0.append(contentsOf: Array("ENDT".utf8))  // second ENDT
         }
 
         // Section 1: function list (u32 size + ENDT)
@@ -144,10 +147,11 @@ public struct MetallibWriter {
         var section0 = Data()
         appendU32(&section0, UInt32(entries.count))
         for header in entryHeaders {
-            appendU32(&section0, UInt32(header.count))
-        }
-        for header in entryHeaders {
+            let entrySize = UInt32(header.count + 4 + 4)  // tags + ENDT + ENDT
+            appendU32(&section0, entrySize)
             section0.append(contentsOf: header)
+            section0.append(contentsOf: Array("ENDT".utf8))  // first ENDT
+            section0.append(contentsOf: Array("ENDT".utf8))  // second ENDT
         }
 
         let section1 = buildENDTSection()
@@ -249,8 +253,9 @@ public struct MetallibWriter {
         writeU16LE(&versData, 6, entry.metalVersionMinor)
         appendTag(&tags, name: "VERS", data: versData)
 
-        // ENDT tag (just the 4-byte tag name, no size/data)
-        tags.append(contentsOf: Array("ENDT".utf8))
+        // Note: ENDT is NOT included here — it's accounted for in the entry_size field
+        // (entry_size = sizeof(size_field=4) + sizeof(tags) + sizeof(ENDT=4))
+        // The actual ENDT comes from S1 section.
 
         return tags
     }
