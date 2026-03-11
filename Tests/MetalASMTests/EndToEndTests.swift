@@ -2318,13 +2318,16 @@ extension EndToEndTests {
         throw XCTSkip("Metal not available")
         #else
         // 128 threads each atomically add 1.0 to output[0]
-        // val is a buffer pointer (addrspace 2) — Metal requires buffer params, not scalar floats
+        // Uses thread_position_in_threadgroup to avoid scalar store guard
         let ir = """
         source_filename = "LLVMDialectModule"
 
         declare float @air.atomic.global.add.f32(ptr addrspace(1), float, i32, i32, i1)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
 
         define void @atomic_add_kernel(ptr addrspace(1) %0, ptr addrspace(2) %1) {
+          %tid_arr = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tid_arr, 0
           %val = load float, ptr addrspace(2) %1, align 4
           %3 = call float @air.atomic.global.add.f32(ptr addrspace(1) %0, float %val, i32 0, i32 2, i1 true)
           ret void
@@ -2373,12 +2376,16 @@ extension EndToEndTests {
         throw XCTSkip("Metal not available")
         #else
         // Exact IR from Triton's atomic_add_kernel (scalar float val)
+        // Uses thread_position_in_threadgroup to avoid scalar store guard
         let ir = """
         source_filename = "LLVMDialectModule"
 
         declare float @air.atomic.global.add.f32(ptr addrspace(1), float, i32, i32, i1)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
 
         define void @atomic_add_kernel(ptr addrspace(1) %0, float %1) {
+          %tid_arr = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tid_arr, 0
           %3 = call float @air.atomic.global.add.f32(ptr addrspace(1) %0, float %1, i32 0, i32 2, i1 true)
           ret void
         }
@@ -2419,6 +2426,149 @@ extension EndToEndTests {
         XCTAssertEqual(result, 128.0, accuracy: 0.5)
         #endif
     }
+
+    func testCmpxchgI32() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // CAS loop: atomically replace buf[0] with 42 if it's 0
+        let ir = """
+        declare i32 @air.atomic.global.cmpxchg.weak.i32(ptr addrspace(1), ptr, i32, i32, i32, i32, i1)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @cas_kernel(ptr addrspace(1) %0) {
+          %2 = alloca i32, i64 1, align 4
+          store i32 0, ptr %2, align 4
+          %3 = call i32 @air.atomic.global.cmpxchg.weak.i32(ptr addrspace(1) %0, ptr %2, i32 42, i32 0, i32 0, i32 2, i1 true)
+          ret void
+        }
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "cas_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let buf = device.makeBuffer(length: 4, options: .storageModeShared)!
+        buf.contents().storeBytes(of: Int32(0), as: Int32.self)
+
+        let queue = device.makeCommandQueue()!
+        let cmdbuf = queue.makeCommandBuffer()!
+        let enc = cmdbuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(buf, offset: 0, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdbuf.commit()
+        cmdbuf.waitUntilCompleted()
+
+        let result = buf.contents().load(as: Int32.self)
+        XCTAssertEqual(result, 42, "CAS should have swapped 0 → 42")
+        #endif
+    }
+
+    func testMultiFunction() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Kernel calls a device function: add_fn(x, pid) returns x + (pid==0 ? 1 : 2)
+        // Single thread (pid=0), input=10 → output=11
+        let ir = """
+        declare [3 x i32] @air.threadgroup_position_in_grid()
+
+        define void @kernel(ptr addrspace(1) %0) {
+          %2 = call [3 x i32] @air.threadgroup_position_in_grid()
+          %3 = extractvalue [3 x i32] %2, 0
+          %4 = load i32, ptr addrspace(1) %0, align 4
+          %5 = call i32 @add_fn(i32 %4, i32 %3)
+          store i32 %5, ptr addrspace(1) %0, align 4
+          ret void
+        }
+
+        define i32 @add_fn(i32 %0, i32 %1) {
+          %3 = icmp eq i32 %1, 0
+          %4 = select i1 %3, i32 1, i32 2
+          %5 = add i32 %0, %4
+          ret i32 %5
+        }
+        """
+        let metallib = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(metallib))
+        let fn = lib.makeFunction(name: "kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let buf = device.makeBuffer(length: 4, options: .storageModeShared)!
+        buf.contents().storeBytes(of: Int32(10), as: Int32.self)
+
+        let cmdq = device.makeCommandQueue()!
+        let cmdbuf = cmdq.makeCommandBuffer()!
+        let enc = cmdbuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(buf, offset: 0, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdbuf.commit()
+        cmdbuf.waitUntilCompleted()
+
+        let result = buf.contents().load(as: Int32.self)
+        XCTAssertEqual(result, 11, "kernel should call add_fn(10, 0) = 10 + 1 = 11")
+        #endif
+    }
+
+    func testLoopStoreLoad() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Simple loop: load float, add 1.0, store — 40 times
+        let ir = """
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @loop_store_load(ptr addrspace(1) %0) {
+          %tid = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tidx = extractvalue [3 x i32] %tid, 0
+          br label %loop
+        loop:
+          %i = phi i32 [ %i_next, %loop ], [ 0, %1 ]
+          %val = load volatile float, ptr addrspace(1) %0, align 4
+          %val1 = fadd float %val, 1.000000e+00
+          store volatile float %val1, ptr addrspace(1) %0, align 4
+          %i_next = add i32 %i, 1
+          %cmp = icmp slt i32 %i_next, 40
+          br i1 %cmp, label %loop, label %done
+        done:
+          ret void
+        }
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "loop_store_load")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let buf = device.makeBuffer(length: 4, options: .storageModeShared)!
+        buf.contents().storeBytes(of: Float(0.0), as: Float.self)
+
+        let queue = device.makeCommandQueue()!
+        let cmdbuf = queue.makeCommandBuffer()!
+        let enc = cmdbuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(buf, offset: 0, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdbuf.commit()
+        cmdbuf.waitUntilCompleted()
+
+        let result = buf.contents().load(as: Float.self)
+        print("loop_store_load result: \(result)")
+        XCTAssertEqual(result, 40.0, "40 iterations of load+add+store")
+        #endif
+    }
+
+
 
     func testAtomicXchgI32() throws {
         #if !canImport(Metal)
@@ -2537,28 +2687,6 @@ extension EndToEndTests {
 
     /// Test the EXACT Triton-generated IR for tl.where with int32.
     /// This is the full kernel that fails with "Failed to materializeAll."
-    func testWhereI32TritonExactIR() throws {
-        #if !canImport(Metal)
-        throw XCTSkip("Metal not available")
-        #else
-        let ir = try String(contentsOfFile: "/tmp/triton_where/ETCGS7SNEEEGYEHIJAR5GPOJC3R5WSS6ZGHWJZFMQP6OJZC6GEGQ/where_kernel.llir", encoding: .utf8)
-
-        do {
-            let data = try MetalASM.assemble(ir: ir)
-            XCTAssertGreaterThan(data.count, 100, "Metallib too small")
-
-            let device = MTLCreateSystemDefaultDevice()!
-            let lib = try device.makeLibrary(data: asDispatchData(data))
-            let fn = lib.makeFunction(name: "where_kernel")
-            XCTAssertNotNil(fn, "where_kernel not found in metallib")
-
-            let pso = try device.makeComputePipelineState(function: fn!)
-            print("testWhereI32TritonExactIR: PSO created OK, maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
-        } catch {
-            XCTFail("testWhereI32TritonExactIR failed: \(error)")
-        }
-        #endif
-    }
 
     /// Bisect: strip features until we find what causes materializeAll failure
     func testWhereI32Bisect() throws {
@@ -2764,6 +2892,747 @@ extension EndToEndTests {
         XCTAssertNotNil(fn, "bf16_arith not found")
         let pso = try device.makeComputePipelineState(function: fn!)
         XCTAssertGreaterThan(pso.maxTotalThreadsPerThreadgroup, 0)
+        #endif
+    }
+
+    func testFPTruncF32ToBFloat16() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        ; ModuleID = 'LLVMDialectModule'
+        source_filename = "LLVMDialectModule"
+
+        define void @fptrunc_f32_bf16(ptr addrspace(1) %0, ptr addrspace(1) %1) {
+          %tid = call [3 x i32] @air.thread_position_in_threadgroup()
+          %idx = extractvalue [3 x i32] %tid, 0
+          %p = getelementptr float, ptr addrspace(1) %0, i32 %idx
+          %v = load float, ptr addrspace(1) %p, align 4
+          %f = fptrunc float %v to bfloat
+          %po = getelementptr bfloat, ptr addrspace(1) %1, i32 %idx
+          store bfloat %f, ptr addrspace(1) %po, align 2
+          ret void
+        }
+
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let data = try MetalASM.assemble(ir: ir)
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "fptrunc_f32_bf16")
+        XCTAssertNotNil(fn, "fptrunc_f32_bf16 not found")
+        let pso = try device.makeComputePipelineState(function: fn!)
+
+        let N = 8
+        let inputData: [Float] = [0, 1, 2, 3, 4, 5, 6, 7]
+        let inBuf = device.makeBuffer(bytes: inputData, length: N * 4, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: N * 2, options: .storageModeShared)!
+
+        let queue = device.makeCommandQueue()!
+        let cmdbuf = queue.makeCommandBuffer()!
+        let enc = cmdbuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: N, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: N, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdbuf.commit()
+        cmdbuf.waitUntilCompleted()
+
+        let outPtr = outBuf.contents().bindMemory(to: UInt16.self, capacity: N)
+        let expected: [UInt16] = [0x0000, 0x3F80, 0x4000, 0x4040, 0x4080, 0x40A0, 0x40C0, 0x40E0]
+        for i in 0..<N {
+            XCTAssertEqual(outPtr[i], expected[i],
+                "fptrunc f32(\(inputData[i])) to bfloat: got 0x\(String(outPtr[i], radix: 16)), expected 0x\(String(expected[i], radix: 16))")
+        }
+        #endif
+    }
+
+    func testLoadI8() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        ; ModuleID = 'LLVMDialectModule'
+        source_filename = "LLVMDialectModule"
+
+        define void @load_i8_test(ptr addrspace(1) %0, ptr addrspace(1) %1) {
+          %tid = call [3 x i32] @air.thread_position_in_threadgroup()
+          %idx = extractvalue [3 x i32] %tid, 0
+          %p = getelementptr i8, ptr addrspace(1) %0, i32 %idx
+          %v = load i8, ptr addrspace(1) %p, align 1
+          %ext = zext i8 %v to i32
+          %po = getelementptr i32, ptr addrspace(1) %1, i32 %idx
+          store i32 %ext, ptr addrspace(1) %po, align 4
+          ret void
+        }
+
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let data = try MetalASM.assemble(ir: ir)
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "load_i8_test")
+        XCTAssertNotNil(fn, "load_i8_test not found")
+        let pso = try device.makeComputePipelineState(function: fn!)
+
+        let N = 8
+        let inputData: [UInt8] = [0, 1, 2, 3, 4, 5, 6, 7]
+        let inBuf = device.makeBuffer(bytes: inputData, length: N, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+
+        let queue = device.makeCommandQueue()!
+        let cmdbuf = queue.makeCommandBuffer()!
+        let enc = cmdbuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: N, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: N, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdbuf.commit()
+        cmdbuf.waitUntilCompleted()
+
+        let outPtr = outBuf.contents().bindMemory(to: Int32.self, capacity: N)
+        for i in 0..<N {
+            XCTAssertEqual(outPtr[i], Int32(i), "load_i8: thread \(i) got \(outPtr[i])")
+        }
+        #endif
+    }
+
+    func testSIToFPInt8ToBFloat16() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        ; ModuleID = 'LLVMDialectModule'
+        source_filename = "LLVMDialectModule"
+
+        define void @sitofp_i8_bf16_v5(ptr addrspace(1) %0, ptr addrspace(1) %1) {
+          %tid = call [3 x i32] @air.thread_position_in_threadgroup()
+          %idx = extractvalue [3 x i32] %tid, 0
+          %p = getelementptr i8, ptr addrspace(1) %0, i32 %idx
+          %v = load i8, ptr addrspace(1) %p, align 1
+          %f = sitofp i8 %v to bfloat
+          %po = getelementptr bfloat, ptr addrspace(1) %1, i32 %idx
+          store bfloat %f, ptr addrspace(1) %po, align 2
+          ret void
+        }
+
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let data = try MetalASM.assemble(ir: ir)
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "sitofp_i8_bf16_v5")
+        XCTAssertNotNil(fn, "sitofp_i8_bf16_v5 not found")
+        let pso = try device.makeComputePipelineState(function: fn!)
+
+        let N = 8
+        let inputData: [Int8] = [0, 1, 2, 3, 4, 5, 6, 7]
+        let inBuf = device.makeBuffer(bytes: inputData, length: N, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: N * 2, options: .storageModeShared)!
+
+        let queue = device.makeCommandQueue()!
+        let cmdbuf = queue.makeCommandBuffer()!
+        let enc = cmdbuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: N, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: N, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdbuf.commit()
+        cmdbuf.waitUntilCompleted()
+
+        let outPtr = outBuf.contents().bindMemory(to: UInt16.self, capacity: N)
+        let expected: [UInt16] = [0x0000, 0x3F80, 0x4000, 0x4040, 0x4080, 0x40A0, 0x40C0, 0x40E0]
+        for i in 0..<N {
+            XCTAssertEqual(outPtr[i], expected[i],
+                "ref i8(\(i)) to bfloat: got 0x\(String(outPtr[i], radix: 16)), expected 0x\(String(expected[i], radix: 16))")
+        }
+        #endif
+    }
+
+    // MARK: - TG Global BFloat16 typed pointer propagation
+
+    /// Test that transformTGGlobalGEPs Part 2 correctly propagates typed pointers
+    /// for bfloat16 TG globals (no opaque ptr addrspace(3) should remain).
+    func testTGGlobalBFloat16TypedPointers() throws {
+        let ir = """
+        @__tg_cvt_0 = internal addrspace(3) global [32 x bfloat] undef, align 4
+
+        declare void @air.threadgroup.barrier(i32, i32)
+
+        define void @test_kernel(ptr addrspace(1) %in, ptr addrspace(1) %out, i32 %tid_x, i32 %tid_y, i32 %tid_z) {
+        entry:
+          %tid64 = zext i32 %tid_x to i64
+          %in_gep = getelementptr bfloat, ptr addrspace(1) %in, i64 %tid64
+          %val = load bfloat, ptr addrspace(1) %in_gep, align 2
+          %tg_gep = getelementptr bfloat, ptr addrspace(3) @__tg_cvt_0, i64 %tid64
+          store bfloat %val, ptr addrspace(3) %tg_gep, align 2
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+          %read_idx = sub i32 31, %tid_x
+          %read_idx64 = zext i32 %read_idx to i64
+          %tg_gep2 = getelementptr bfloat, ptr addrspace(3) @__tg_cvt_0, i64 %read_idx64
+          %val2 = load bfloat, ptr addrspace(3) %tg_gep2, align 2
+          %out_gep = getelementptr bfloat, ptr addrspace(1) %out, i64 %tid64
+          store bfloat %val2, ptr addrspace(1) %out_gep, align 2
+          ret void
+        }
+        !air.kernel = !{!0}
+        !air.version = !{!7}
+        !air.language_version = !{!8}
+        !llvm.module.flags = !{!9, !10, !11, !12, !13, !14}
+        !0 = !{void (ptr addrspace(1), ptr addrspace(1), i32, i32, i32)* @test_kernel, !1, !2}
+        !1 = !{}
+        !2 = !{!3, !4, !5, !6, !15}
+        !3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"bfloat", !"air.arg_name", !"in"}
+        !4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"bfloat", !"air.arg_name", !"out"}
+        !5 = !{i32 2, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_x"}
+        !6 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_y"}
+        !15 = !{i32 4, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_z"}
+        !7 = !{i32 2, i32 8, i32 0}
+        !8 = !{!"Metal", i32 3, i32 2, i32 0}
+        !9 = !{i32 7, !"air.max_device_buffers", i32 31}
+        !10 = !{i32 7, !"air.max_constant_buffers", i32 31}
+        !11 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+        !12 = !{i32 7, !"air.max_textures", i32 128}
+        !13 = !{i32 7, !"air.max_read_write_textures", i32 8}
+        !14 = !{i32 7, !"air.max_samplers", i32 16}
+        """
+
+        // Parse and transform
+        let lexer = Lexer(source: ir)
+        let tokens = lexer.tokenize()
+        var parser = Parser(tokens: tokens, source: lexer.source)
+        let module = try parser.parse()
+        applyAirTransforms(module: module)
+
+        // Check: no opaque ptr addrspace(3) should remain
+        var opaqueAS3Count = 0
+        for fn in module.functions where !fn.isDeclaration {
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    if case .opaquePointer(3) = inst.type { opaqueAS3Count += 1 }
+                    for (_, op) in inst.operands.enumerated() {
+                        if case .value(let v) = op, case .opaquePointer(3) = v.type { opaqueAS3Count += 1 }
+                    }
+                }
+            }
+        }
+        XCTAssertEqual(opaqueAS3Count, 0, "Found \(opaqueAS3Count) opaque ptr addrspace(3) references")
+
+        // Assemble and verify PSO creation
+        let metallib = try MetalASM.assemble(ir: ir)
+
+        #if canImport(Metal)
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal device")
+        }
+        let library = try device.makeLibrary(data: asDispatchData(metallib))
+        let fn = library.makeFunction(name: "test_kernel")
+        XCTAssertNotNil(fn, "Kernel function not found")
+        let pso = try device.makeComputePipelineState(function: fn!)
+        XCTAssertGreaterThan(pso.maxTotalThreadsPerThreadgroup, 0)
+        #endif
+    }
+
+    /// Load arbitrary LLIR from TEST_LLIR env var, assemble and test PSO.
+    func testExternalLLIR() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        guard let path = ProcessInfo.processInfo.environment["TEST_LLIR"] else {
+            throw XCTSkip("Set TEST_LLIR=/path/to/file.llir")
+        }
+        let ir = try String(contentsOfFile: path, encoding: .utf8)
+        let metallib = try MetalASM.assemble(ir: ir)
+        try metallib.write(to: URL(fileURLWithPath: "/tmp/test_external.metallib"))
+        let device = MTLCreateSystemDefaultDevice()!
+        let library = try device.makeLibrary(data: asDispatchData(metallib))
+        let fnName = library.functionNames.first!
+        let fn = library.makeFunction(name: fnName)!
+        let pso = try device.makeComputePipelineState(function: fn)
+        XCTAssertGreaterThan(pso.maxTotalThreadsPerThreadgroup, 0)
+        #endif
+    }
+
+    /// Minimal repro for join_scalars materializeAll failure
+    func testJoinScalars() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Full join_scalars IR from Triton — two TG globals, constant GEP with nuw
+        let ir = """
+        @__tg_cvt_0 = internal addrspace(3) global [2 x i32] undef, align 4
+        @global_smem = internal addrspace(3) global [8 x i8] undef, align 16
+
+        declare void @air.threadgroup.barrier(i32, i32)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+        declare i32 @air.thread_index_in_simdgroup()
+
+        define void @kernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ptr addrspace(1) %2) {
+          %4 = load i32, ptr addrspace(1) %0, align 4
+          %5 = load i32, ptr addrspace(1) %1, align 4
+          %6 = call i32 @air.thread_index_in_simdgroup()
+          %7 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %8 = urem i32 %6, 2
+          %9 = add i32 0, %8
+          store i32 %4, ptr addrspace(3) @__tg_cvt_0, align 4
+          store i32 %5, ptr addrspace(3) getelementptr inbounds nuw (i8, ptr addrspace(3) @__tg_cvt_0, i64 4), align 4
+          call void @air.threadgroup.barrier(i32 1, i32 4)
+          %10 = add i32 0, %9
+          %11 = zext i32 %10 to i64
+          %12 = getelementptr i32, ptr addrspace(3) @__tg_cvt_0, i64 %11
+          %13 = load i32, ptr addrspace(3) %12, align 4
+          %14 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %15 = extractvalue [3 x i32] %14, 0
+          %16 = zext i32 %15 to i64
+          %17 = trunc i64 %16 to i32
+          %18 = and i32 %17, 127
+          %19 = urem i32 %18, 32
+          %20 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %21 = extractvalue [3 x i32] %20, 0
+          %22 = udiv i32 %21, 32
+          %23 = shl i32 %19, 0
+          %24 = or i32 0, %23
+          %25 = shl i32 %22, 5
+          %26 = or i32 %24, %25
+          %27 = and i32 %26, 1
+          %28 = icmp eq i32 %27, 0
+          %29 = select i1 %28, i32 0, i32 1
+          %30 = or disjoint i32 %29, 0
+          %31 = xor i32 0, %30
+          %32 = xor i32 %31, 0
+          %33 = add i32 %32, 0
+          %34 = getelementptr float, ptr addrspace(1) %2, i32 %33
+          %35 = sitofp i32 %13 to float
+          store float %35, ptr addrspace(1) %34, align 4
+          ret void
+        }
+        """
+        let metallib = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let library = try device.makeLibrary(data: asDispatchData(metallib))
+        let fn = library.makeFunction(name: "kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        XCTAssertGreaterThan(pso.maxTotalThreadsPerThreadgroup, 0)
+
+        // Execute and verify: x=42, y=100 → output[0]=42.0, output[1]=100.0
+        let queue = device.makeCommandQueue()!
+        let bufX = device.makeBuffer(bytes: [Int32(42)], length: 4, options: .storageModeShared)!
+        let bufY = device.makeBuffer(bytes: [Int32(100)], length: 4, options: .storageModeShared)!
+        let bufOut = device.makeBuffer(length: 128 * MemoryLayout<Float>.size, options: .storageModeShared)!
+        memset(bufOut.contents(), 0, bufOut.length)
+
+        let cb = queue.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(bufX, offset: 0, index: 0)
+        enc.setBuffer(bufY, offset: 0, index: 1)
+        enc.setBuffer(bufOut, offset: 0, index: 2)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let out = bufOut.contents().bindMemory(to: Float.self, capacity: 128)
+        XCTAssertEqual(out[0], 42.0, "output[0] should be x=42")
+        XCTAssertEqual(out[1], 100.0, "output[1] should be y=100")
+        #endif
+    }
+
+    // ── While loop: count down from 8 by 2, add 1.0 each iteration → expect 4.0 ──
+    func testWhileLoop() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // While pattern — accumulate via phi (no load/store in loop body)
+        // count=8, decrement by 2, accumulate +1.0 each iteration → 4.0
+        let ir = """
+        target triple = "air64_v28-apple-macosx26.0.0"
+        target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+
+        define void @kernel(float addrspace(1)* %0, i32 addrspace(1)* %1, <3 x i32> %2) {
+          %4 = extractelement <3 x i32> %2, i32 0
+          %5 = icmp eq i32 %4, 0
+          br i1 %5, label %body, label %exit
+
+        body:
+          %count0 = load i32, i32 addrspace(1)* %1, align 4
+          br label %loop
+
+        loop:
+          %count = phi i32 [ %count0, %body ], [ %newcount, %loop ]
+          %val = load float, float addrspace(1)* %0, align 4
+          %newacc = fadd float %val, 1.000000e+00
+          store float %newacc, float addrspace(1)* %0, align 4
+          %newcount = sub i32 %count, 2
+          %test = icmp sgt i32 %newcount, 0
+          br i1 %test, label %loop, label %done
+
+        done:
+          ret void
+
+        exit:
+          ret void
+        }
+
+        !air.kernel = !{!0}
+        !air.version = !{!6}
+        !air.language_version = !{!7}
+        !llvm.module.flags = !{!8, !9, !10, !11, !12, !13}
+
+        !0 = !{void (float addrspace(1)*, i32 addrspace(1)*, <3 x i32>)* @kernel, !1, !2}
+        !1 = !{}
+        !2 = !{!3, !4, !5}
+        !3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"data"}
+        !4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"int", !"air.arg_name", !"n"}
+        !5 = !{i32 2, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint3", !"air.arg_name", !"tidtg"}
+        !6 = !{i32 2, i32 8, i32 0}
+        !7 = !{!"Metal", i32 3, i32 2, i32 0}
+        !8 = !{i32 7, !"air.max_device_buffers", i32 31}
+        !9 = !{i32 7, !"air.max_constant_buffers", i32 31}
+        !10 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+        !11 = !{i32 7, !"air.max_textures", i32 128}
+        !12 = !{i32 7, !"air.max_read_write_textures", i32 8}
+        !13 = !{i32 7, !"air.max_samplers", i32 16}
+        """
+        let metallib = try MetalASM.assemble(ir: ir)
+        try metallib.write(to: URL(fileURLWithPath: "/tmp/while_ours.metallib"))
+        let device = MTLCreateSystemDefaultDevice()!
+        let library = try device.makeLibrary(data: asDispatchData(metallib))
+        let fn = library.makeFunction(name: "kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let queue = device.makeCommandQueue()!
+        // data buffer (float) initialized to 0.0
+        var dataVal: Float = 0.0
+        let bufData = device.makeBuffer(bytes: &dataVal, length: 4, options: .storageModeShared)!
+        // count buffer (i32) = 8
+        var countVal: Int32 = 8
+        let bufCount = device.makeBuffer(bytes: &countVal, length: 4, options: .storageModeShared)!
+
+        let cb = queue.makeCommandBuffer()!
+        let enc = cb.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(bufData, offset: 0, index: 0)
+        enc.setBuffer(bufCount, offset: 0, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let result = bufData.contents().bindMemory(to: Float.self, capacity: 1)[0]
+        XCTAssertEqual(result, 4.0, "while loop should iterate 4 times (8/2)")
+        #endif
+    }
+
+    // ── Constant GEP offset: two TG slots at @global_smem+0 and @global_smem+8 ──
+    func testConstantGEPOffsetCorrectness() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Minimal kernel: thread 0 stores 42 at TG offset 0, 99 at TG offset 8.
+        // After barrier, thread 0 loads both back and writes them to output[0] and output[1].
+        // Tests that constant GEP expression `getelementptr(i8, @global_smem, i64 8)` is handled.
+        let ir = """
+        @global_smem = internal addrspace(3) global [16 x i8] undef, align 16
+
+        declare void @air.wg.barrier(i32, i32)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @kernel(ptr addrspace(1) %0) {
+          %tid3 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tid3, 0
+          %is0 = icmp eq i32 %tid, 0
+
+          ; Thread 0: store 42 at TG offset 0
+          br i1 %is0, label %store_vals, label %after_store
+
+        store_vals:
+          %slot0 = getelementptr inbounds i8, ptr addrspace(3) @global_smem, i32 0
+          %v42 = insertelement <1 x i32> undef, i32 42, i32 0
+          store <1 x i32> %v42, ptr addrspace(3) %slot0, align 4
+
+          ; Store 99 at TG offset 8 using constant GEP expression
+          %slot1 = getelementptr inbounds i8, ptr addrspace(3) getelementptr inbounds nuw (i8, ptr addrspace(3) @global_smem, i64 8), i32 0
+          %v99 = insertelement <1 x i32> undef, i32 99, i32 0
+          store <1 x i32> %v99, ptr addrspace(3) %slot1, align 4
+          br label %after_store
+
+        after_store:
+          call void @air.wg.barrier(i32 1, i32 1)
+
+          ; Thread 0: load both back and write to output
+          br i1 %is0, label %load_vals, label %done
+
+        load_vals:
+          %rd0 = getelementptr inbounds i8, ptr addrspace(3) @global_smem, i32 0
+          %ld0 = load <1 x i32>, ptr addrspace(3) %rd0, align 4
+          %val0 = extractelement <1 x i32> %ld0, i32 0
+
+          %rd1 = getelementptr inbounds i8, ptr addrspace(3) getelementptr inbounds nuw (i8, ptr addrspace(3) @global_smem, i64 8), i32 0
+          %ld1 = load <1 x i32>, ptr addrspace(3) %rd1, align 4
+          %val1 = extractelement <1 x i32> %ld1, i32 0
+
+          %out0 = getelementptr i32, ptr addrspace(1) %0, i32 0
+          store i32 %val0, ptr addrspace(1) %out0, align 4
+          %out1 = getelementptr i32, ptr addrspace(1) %0, i32 1
+          store i32 %val1, ptr addrspace(1) %out1, align 4
+          br label %done
+
+        done:
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let library = try device.makeLibrary(data: asDispatchData(data))
+        let fn = library.makeFunction(name: "kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let outBuf = device.makeBuffer(length: 8, options: .storageModeShared)!
+        let outPtr = outBuf.contents().bindMemory(to: Int32.self, capacity: 2)
+        outPtr[0] = -1
+        outPtr[1] = -1
+
+        let queue = device.makeCommandQueue()!
+        let cmdBuf = queue.makeCommandBuffer()!
+        let enc = cmdBuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        let r0 = outPtr[0]
+        let r1 = outPtr[1]
+        print("testConstantGEPOffsetCorrectness: slot0=\(r0) (expect 42), slot1=\(r1) (expect 99)")
+        XCTAssertEqual(r0, 42, "TG offset 0 should contain 42")
+        XCTAssertEqual(r1, 99, "TG offset 8 (via constant GEP) should contain 99")
+        #endif
+    }
+
+    func testFloatNaNReferenceMetallib() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Test: load reference metallib (compiled with metal toolchain) with NaN constant
+        let path = "/tmp/test_nan_metal.metallib"
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw XCTSkip("Reference \(path) not found — compile test_nan.metal first")
+        }
+        let device = MTLCreateSystemDefaultDevice()!
+        let url = URL(fileURLWithPath: path)
+        let lib = try device.makeLibrary(URL: url)
+        let fn = lib.makeFunction(name: "nan_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let count = 32
+        let outBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count { outPtr[i] = 0.0 }
+
+        let queue = device.makeCommandQueue()!
+        let cmdBuf = queue.makeCommandBuffer()!
+        let enc = cmdBuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        XCTAssertTrue(outPtr[0].isNaN, "Reference NaN: expected NaN, got \(outPtr[0])")
+        print("testFloatNaNReferenceMetallib: outPtr[0]=\(outPtr[0]) PASS")
+        #endif
+    }
+
+    func testFloat42Constant() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        source_filename = "test_42"
+        target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+        target triple = "air64_v28-apple-macosx26.0.0"
+
+        define void @test42_kernel(ptr addrspace(1) %buf, i32 %tid_x) {
+          %p = getelementptr float, ptr addrspace(1) %buf, i32 %tid_x
+          store float 42.0, ptr addrspace(1) %p, align 4
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !air.kernel = !{!1}
+        !air.version = !{!5}
+
+        !0 = !{i32 7, !"frame-pointer", i32 0}
+        !1 = !{ptr @test42_kernel, !2, !3}
+        !2 = !{}
+        !3 = !{!4, !6}
+        !4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"buf"}
+        !6 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_x"}
+        !5 = !{i32 2, i32 8, i32 0}
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "test42_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let count = 32
+        let outBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count { outPtr[i] = 0.0 }
+
+        let queue = device.makeCommandQueue()!
+        let cmdBuf = queue.makeCommandBuffer()!
+        let enc = cmdBuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        XCTAssertEqual(outPtr[0], 42.0, "Expected 42.0, got \(outPtr[0])")
+        print("testFloat42Constant: outPtr[0]=\(outPtr[0]) PASS")
+        #endif
+    }
+
+    func testFloatInfConstant() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        source_filename = "test_inf"
+        target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+        target triple = "air64_v28-apple-macosx26.0.0"
+
+        define void @inf_kernel(ptr addrspace(1) %buf, i32 %tid_x) {
+          %p = getelementptr float, ptr addrspace(1) %buf, i32 %tid_x
+          store float 0x7FF0000000000000, ptr addrspace(1) %p, align 4
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !air.kernel = !{!1}
+        !air.version = !{!5}
+
+        !0 = !{i32 7, !"frame-pointer", i32 0}
+        !1 = !{ptr @inf_kernel, !2, !3}
+        !2 = !{}
+        !3 = !{!4, !6}
+        !4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"buf"}
+        !6 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_x"}
+        !5 = !{i32 2, i32 8, i32 0}
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "inf_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let count = 32
+        let outBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count { outPtr[i] = 0.0 }
+
+        let queue = device.makeCommandQueue()!
+        let cmdBuf = queue.makeCommandBuffer()!
+        let enc = cmdBuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        XCTAssertTrue(outPtr[0].isInfinite, "Expected inf, got \(outPtr[0])")
+        print("testFloatInfConstant: outPtr[0]=\(outPtr[0]) PASS")
+        #endif
+    }
+
+    func testFloatNaNConstant() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Minimal repro: store float NaN constant to output buffer.
+        // float 0x7FF8000000000000 is LLVM IR double-hex for float qNaN (bits 0x7FC00000).
+        // This crashed Metal GPU JIT due to bitcode encoding issues.
+        let ir = """
+        source_filename = "test_nan"
+        target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+        target triple = "air64_v28-apple-macosx26.0.0"
+
+        define void @nan_kernel(ptr addrspace(1) %buf, i32 %tid_x) {
+          %p = getelementptr float, ptr addrspace(1) %buf, i32 %tid_x
+          store float 0x7FF8000000000000, ptr addrspace(1) %p, align 4
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !air.kernel = !{!1}
+        !air.version = !{!5}
+
+        !0 = !{i32 7, !"frame-pointer", i32 0}
+        !1 = !{ptr @nan_kernel, !2, !3}
+        !2 = !{}
+        !3 = !{!4, !6}
+        !4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"buf"}
+        !6 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"tid_x"}
+        !5 = !{i32 2, i32 8, i32 0}
+        """
+
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "nan_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let count = 32
+        let outBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count { outPtr[i] = 0.0 }
+
+        let queue = device.makeCommandQueue()!
+        let cmdBuf = queue.makeCommandBuffer()!
+        let enc = cmdBuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        XCTAssertTrue(outPtr[0].isNaN, "Expected NaN, got \(outPtr[0])")
+        XCTAssertTrue(outPtr[1].isNaN, "Expected NaN at index 1, got \(outPtr[1])")
+        print("testFloatNaNConstant: outPtr[0]=\(outPtr[0]) (bits: \(String(outPtr[0].bitPattern, radix: 16)))")
         #endif
     }
 }

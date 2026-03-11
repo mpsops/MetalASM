@@ -246,6 +246,12 @@ public struct Parser {
             }
         } else if textEquals(current, "define") {
             let fn = try parseFunctionDefinition()
+            // Create attribute group for inline function attributes
+            if !fn.functionAttributes.isEmpty && fn.attributeGroupIndex == nil {
+                let newIdx = (module.attributeGroups.map(\.index).max() ?? -1) + 1
+                module.attributeGroups.append(IRAttributeGroup(index: newIdx, attributes: fn.functionAttributes))
+                fn.attributeGroupIndex = newIdx
+            }
             module.functions.append(fn)
             globalValues[fn.name] = IRValue(type: fn.type, name: fn.name)
         } else if textEquals(current, "declare") {
@@ -487,6 +493,7 @@ public struct Parser {
 
         // Parse optional function attributes
         var attrGroupIndex: Int? = nil
+        var inlineAttrs: [IRAttribute] = []
         skipNewlines()
         while true {
             if current.kind == .attrGroupRef {
@@ -494,12 +501,16 @@ public struct Parser {
                 attrGroupIndex = tokenInt(Token(kind: ref.kind, start: ref.start + 1, end: ref.end))
                 skipNewlines()
             } else if current.kind == .keyword && tokenInSet(current, Self.attributeKeywords) {
+                if let attr = attributeFromToken(current) {
+                    inlineAttrs.append(attr)
+                }
                 _ = advance()
                 skipNewlines()
             } else {
                 break
             }
         }
+
 
         let fn = IRFunction(
             name: name,
@@ -513,6 +524,7 @@ public struct Parser {
         fn.parameterNames = paramNames
         fn.parameterStringAttributes = paramStringAttrs
         fn.parameterAttributes = paramAttrs
+        fn.functionAttributes = inlineAttrs
         fn.attributeGroupIndex = attrGroupIndex
         fn.type = .function(ret: returnType, params: paramTypes, isVarArg: isVarArg)
 
@@ -694,6 +706,7 @@ public struct Parser {
             if textEquals(t, "notail") { return try parseCall(resultName: resultName) }
             break
         case 0x61: // a
+            if textEquals(t, "atomicrmw") { return try parseAtomicRMW(resultName: resultName) }
             if textEquals(t, "alloca") { return try parseAlloca(resultName: resultName) }
             if textEquals(t, "add") || textEquals(t, "and") || textEquals(t, "ashr") {
                 return try parseBinOp(resultName: resultName)
@@ -987,6 +1000,60 @@ public struct Parser {
         return inst
     }
 
+    // atomicrmw add ptr addrspace(3) %ptr, i32 1 monotonic, align 4
+    private mutating func parseAtomicRMW(resultName: String) throws -> IRInstruction {
+        _ = try expectKeyword("atomicrmw")
+        skipNewlines()
+
+        // Parse optional volatile
+        _ = consumeIfKeyword("volatile")
+
+        // Parse operation: add, xchg, max, min, umax, umin, and, or, xor, sub
+        guard current.kind == .keyword else {
+            throw ParseError.unexpected("expected atomic operation", line: 0, column: 0)
+        }
+        let opTok = advance()
+        let atomicOp = tokenText(opTok)
+
+        skipNewlines()
+
+        // Parse pointer type and operand
+        let ptrType = try parseType()
+        let ptr = try parseOperand(type: ptrType)
+        _ = try expect(.comma)
+
+        // Parse value type and operand
+        let valType = try parseType()
+        let val = try parseOperand(type: valType)
+
+        // Skip ordering (monotonic, acquire, release, etc.)
+        if current.kind == .keyword {
+            _ = advance()
+        }
+
+        // Parse optional alignment
+        if consumeIf(.comma) {
+            skipNewlines()
+            if consumeIfKeyword("align") {
+                if current.kind == .integer { _ = advance() }
+            }
+        }
+
+        let inst = IRInstruction(
+            opcode: .atomicRMW,
+            type: valType,
+            name: resultName,
+            operands: [ptr, val]
+        )
+        inst.attributes.atomicOp = atomicOp
+
+        if !resultName.isEmpty {
+            localValues[resultName] = IRValue(type: valType, name: resultName)
+        }
+
+        return inst
+    }
+
     private mutating func parseGEP(resultName: String) throws -> IRInstruction {
         _ = try expectKeyword("getelementptr")
         skipNewlines()
@@ -995,6 +1062,7 @@ public struct Parser {
         if consumeIfKeyword("inbounds") {
             inBounds = true
         }
+        _ = consumeIfKeyword("nuw")
 
         // Source element type
         let sourceType = try parseType()
@@ -1664,21 +1732,42 @@ public struct Parser {
         _ = try expectKeyword("getelementptr")
         skipNewlines()
         _ = consumeIfKeyword("inbounds")
+        _ = consumeIfKeyword("nuw")
         _ = try expect(.leftParen)
-        // Parse the GEP expression
-        _ = try parseType()
+        let srcType = try parseType()
         _ = try expect(.comma)
         let ptrType = try parseType()
-        let ptr = try parseOperand(type: ptrType)
-        var indices: [IRInstruction.Operand] = []
+        let ptrOp = try parseOperand(type: ptrType)
+        // Compute constant byte offset
+        var byteOffset: Int64 = 0
         while consumeIf(.comma) {
             let idxType = try parseType()
-            let idx = try parseOperand(type: idxType)
-            indices.append(idx)
+            let idxOp = try parseOperand(type: idxType)
+            if case .constant(let c) = idxOp, case .integer(_, let v) = c {
+                // For i8 source type, each index is 1 byte
+                let elemSize: Int64
+                switch srcType {
+                case .i8: elemSize = 1
+                case .int(let bits): elemSize = Int64(bits / 8)
+                case .float16, .bfloat16: elemSize = 2
+                case .float32: elemSize = 4
+                case .float64: elemSize = 8
+                default: elemSize = 1
+                }
+                byteOffset += v * elemSize
+            }
         }
         _ = try expect(.rightParen)
-        // Return as a constant GEP (simplified)
-        return ptr
+        if byteOffset == 0 {
+            return ptrOp
+        }
+        // Create a NEW value with the byte-offset (don't mutate shared global reference)
+        if case .value(let v) = ptrOp {
+            let newVal = IRValue(type: v.type, name: v.name)
+            newVal.constantGEPByteOffset = byteOffset
+            return .value(newVal)
+        }
+        return ptrOp
     }
 
     private mutating func parseConstantCast(type: IRType) throws -> IRInstruction.Operand {
@@ -2143,6 +2232,10 @@ public struct Parser {
             if textEquals(t, "readonly") { return .readOnly }
         case 0x69: // i
             if textEquals(t, "immarg") { return .immArg }
+        case 0x6F: // o
+            if textEquals(t, "optnone") { return .optNone }
+        case 0x73: // s
+            if textEquals(t, "signext") { return .signExt }
         default: break
         }
         return nil

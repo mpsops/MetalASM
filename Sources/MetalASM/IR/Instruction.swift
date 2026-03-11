@@ -154,6 +154,9 @@ public final class IRInstruction {
         /// For GEP: source element type
         public var gepSourceType: IRType? = nil
 
+        /// For atomicrmw: operation kind (add, xchg, max, min, and, or, xor)
+        public var atomicOp: String? = nil
+
         public init() {}
     }
 
