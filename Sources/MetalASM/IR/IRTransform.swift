@@ -1969,13 +1969,11 @@ private func transformMMATypedPtrs(module: IRModule) {
     // tail call fast @mmaLoad(float addrspace(3)* nocapture readonly ...)
     // tail call      @mmaStore(vec, float addrspace(3)* nocapture writeonly ...)
     for fn in module.functions where !fn.isDeclaration {
-        var hasMMA = false
         for bb in fn.basicBlocks {
             for inst in bb.instructions where inst.opcode == .call {
                 guard let calleeOp = inst.operands.last,
                       case .value(let callee) = calleeOp else { continue }
                 if callee.name == mmaLoadName {
-                    hasMMA = true
                     inst.operands[inst.operands.count - 1] = .value(IRValue(type: mmaLoadType, name: callee.name))
                     // Set call-site paramattr to match ref (nocapture+readonly on ptr param)
                     if let loadFn = module.functions.first(where: { $0.name == mmaLoadName }),
@@ -1985,7 +1983,6 @@ private func transformMMATypedPtrs(module: IRModule) {
                         inst.attributes.funcAttributes = []
                     }
                 } else if callee.name == mmaStoreName {
-                    hasMMA = true
                     inst.operands[inst.operands.count - 1] = .value(IRValue(type: mmaStoreType, name: callee.name))
                     if let storeFn = module.functions.first(where: { $0.name == mmaStoreName }),
                        let groupIdx = storeFn.attributeGroupIndex {
@@ -1994,7 +1991,6 @@ private func transformMMATypedPtrs(module: IRModule) {
                         inst.attributes.funcAttributes = []
                     }
                 } else if callee.name.hasPrefix(mmaMulName) {
-                    hasMMA = true
                     inst.attributes.funcAttributes = []
                 }
             }
@@ -2361,8 +2357,6 @@ private func transformTGGlobalGEPs(module: IRModule) {
         let i8TGPtr = IRType.pointer(pointee: .i8, addressSpace: 3)
 
         // Note: constant GEP flattening already done above for all TG globals.
-        let byteGlobalNames = Set(byteGlobals.map { $0.name })
-
         for fn in module.functions where !fn.isDeclaration {
             guard let entryBB = fn.basicBlocks.first else { continue }
 
