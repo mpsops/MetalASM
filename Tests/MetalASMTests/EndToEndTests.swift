@@ -4716,4 +4716,83 @@ extension EndToEndTests {
         XCTAssertEqual(failures, 0, "\(failures)/\(M*N) elements wrong — TG global coalescing bug?")
         #endif
     }
+
+    /// Dispatch an external .ll kernel with 2 buffers (input i32[], output i32[])
+    /// and verify output against expected values from TEST_LLIR_EXPECTED.
+    ///
+    /// Usage:
+    ///   TEST_LLIR=/tmp/kernel.ll \
+    ///   TEST_LLIR_RUN="in_count:out_count:threads" \
+    ///   swift test --filter testExternalLLIRRun
+    ///
+    /// in_count/out_count = number of i32 elements, threads = threadgroup width.
+    /// Input is filled with deterministic pattern (i % 1000).
+    /// Output is printed so you can compare with reference.
+    func testExternalLLIRRun() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        guard let path = ProcessInfo.processInfo.environment["TEST_LLIR"] else {
+            throw XCTSkip("Set TEST_LLIR=/path/to/file.ll")
+        }
+        guard let runSpec = ProcessInfo.processInfo.environment["TEST_LLIR_RUN"] else {
+            throw XCTSkip("Set TEST_LLIR_RUN=in_count:out_count:threads")
+        }
+        let parts = runSpec.split(separator: ":").compactMap { Int($0) }
+        guard parts.count == 3 else {
+            XCTFail("TEST_LLIR_RUN must be in_count:out_count:threads, got \(runSpec)")
+            return
+        }
+        let inCount = parts[0], outCount = parts[1], threads = parts[2]
+
+        let ir = try String(contentsOfFile: path, encoding: .utf8)
+        let metallib = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let library = try device.makeLibrary(data: asDispatchData(metallib))
+        let fnName = library.functionNames.first!
+        let fn = library.makeFunction(name: fnName)!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let inBuf = device.makeBuffer(length: inCount * 4, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: outCount * 4, options: .storageModeShared)!
+        let inPtr = inBuf.contents().bindMemory(to: Int32.self, capacity: inCount)
+        let outPtr = outBuf.contents().bindMemory(to: Int32.self, capacity: outCount)
+
+        // Deterministic input
+        for i in 0..<inCount { inPtr[i] = Int32(i % 1000) }
+        for i in 0..<outCount { outPtr[i] = -1 }
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // Print output for comparison
+        print("testExternalLLIRRun: output[\(outCount)] =", (0..<outCount).map { outPtr[$0] })
+
+        // If TEST_LLIR_EXPECTED is set, verify
+        if let expectedStr = ProcessInfo.processInfo.environment["TEST_LLIR_EXPECTED"] {
+            let expected = expectedStr.split(separator: ",").compactMap { Int32($0) }
+            guard expected.count == outCount else {
+                XCTFail("Expected \(outCount) values, got \(expected.count)")
+                return
+            }
+            var failures = 0
+            for i in 0..<outCount {
+                if outPtr[i] != expected[i] {
+                    print("  MISMATCH at [\(i)]: got \(outPtr[i]), expected \(expected[i])")
+                    failures += 1
+                }
+            }
+            XCTAssertEqual(failures, 0, "\(failures)/\(outCount) elements wrong")
+        }
+        #endif
+    }
 }

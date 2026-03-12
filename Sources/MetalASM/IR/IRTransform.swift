@@ -2146,7 +2146,13 @@ private func transformTGGlobalGEPs(module: IRModule) {
         // Two sources of offsets:
         //   1. constantGEPByteOffset on operand values (from parser constant GEP expressions)
         //   2. GEP instructions with byte global base and constant index
+        //
+        // IMPORTANT: If a byte global has ANY dynamic (non-constant) GEP offset,
+        // we must NOT split it — the dynamic GEP would still point to the original
+        // (shrunk) global while loads at constant offsets would read from separate
+        // split globals. This causes correctness bugs (e.g. chained reductions).
         var byteGlobalOffsets: [String: Set<Int64>] = [:]
+        var byteGlobalHasDynamicGEP: Set<String> = []
         let byteGlobalNames = Set(byteGlobals.map { $0.name })
         for fn in module.functions where !fn.isDeclaration {
             for bb in fn.basicBlocks {
@@ -2158,32 +2164,50 @@ private func transformTGGlobalGEPs(module: IRModule) {
                             byteGlobalOffsets[v.name, default: []].insert(v.constantGEPByteOffset)
                         }
                     }
-                    // Source 2: GEP instructions like `getelementptr i8, @global_smem, i64 512`
+                    // Source 2: GEP instructions with byte global base
                     if inst.opcode == .getelementptr,
                        inst.operands.count >= 2,
                        case .value(let baseVal) = inst.operands[0],
                        byteGlobalNames.contains(baseVal.name),
-                       baseVal.constantGEPByteOffset == 0,
-                       case .constant(let c) = inst.operands[1],
-                       case .integer(_, let offset) = c,
-                       offset != 0 {
-                        // Compute actual byte offset considering GEP source type
-                        let elemSize: Int64
-                        if let srcTy = inst.attributes.gepSourceType {
-                            switch srcTy {
-                            case .i8: elemSize = 1
-                            case .i16, .float16, .bfloat16: elemSize = 2
-                            case .i32, .float32: elemSize = 4
-                            case .i64, .float64: elemSize = 8
-                            default: elemSize = 1
+                       baseVal.constantGEPByteOffset == 0 {
+                        if case .constant(let c) = inst.operands[1],
+                           case .integer(_, let offset) = c,
+                           offset != 0 {
+                            // Constant offset GEP
+                            let elemSize: Int64
+                            if let srcTy = inst.attributes.gepSourceType {
+                                switch srcTy {
+                                case .i8: elemSize = 1
+                                case .i16, .float16, .bfloat16: elemSize = 2
+                                case .i32, .float32: elemSize = 4
+                                case .i64, .float64: elemSize = 8
+                                default: elemSize = 1
+                                }
+                            } else {
+                                elemSize = 1
                             }
-                        } else {
-                            elemSize = 1
+                            byteGlobalOffsets[baseVal.name, default: []].insert(offset * elemSize)
+                        } else if case .value(_) = inst.operands[1] {
+                            // Dynamic offset GEP — only unsafe if byte-addressed (i8 element),
+                            // since the dynamic offset could access any split region.
+                            // Float/int-typed GEPs access predictable strides within one region.
+                            let isByteGEP: Bool
+                            if let srcTy = inst.attributes.gepSourceType {
+                                isByteGEP = (srcTy == .i8)
+                            } else {
+                                isByteGEP = true // assume byte-addressed if unknown
+                            }
+                            if isByteGEP {
+                                byteGlobalHasDynamicGEP.insert(baseVal.name)
+                            }
                         }
-                        byteGlobalOffsets[baseVal.name, default: []].insert(offset * elemSize)
                     }
                 }
             }
+        }
+        // Remove globals with dynamic GEPs from the split candidates
+        for name in byteGlobalHasDynamicGEP {
+            byteGlobalOffsets.removeValue(forKey: name)
         }
 
         // Phase B: Create new TG globals for each non-zero byte offset region
