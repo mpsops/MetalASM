@@ -853,9 +853,14 @@ private func transformBarrierRename(module: IRModule) {
 // finishes reading. This causes WAR hazards when two reduce operations share
 // the same TG allocation (allocation.offset = 0).
 //
-// Fix: ensure every TG store is preceded by a barrier within the same basic
-// block. If the instruction immediately before a TG store is not a barrier
-// (air.wg.barrier), insert one.
+// Fix: ensure correct barrier placement around TG (threadgroup) memory accesses.
+//
+// Two hazards must be covered:
+//   1. RAW (Read After Write): barrier between TG store and subsequent TG load
+//      so all warps' stores are visible before any warp reads.
+//   2. WAR (Write After Read): barrier between TG load and subsequent TG store
+//      so all warps finish reading before any warp overwrites (e.g. chained
+//      reductions that reuse the same shared memory).
 //
 // IMPORTANT: Never insert a barrier immediately before a conditional branch —
 // the GPU JIT crashes on `barrier → br i1` in the same block ("Failed to
@@ -876,6 +881,17 @@ private func transformTGStoreBarrierInsert(module: IRModule) {
             }
         }
         guard !tgStoreBlockNames.isEmpty else { continue }
+
+        // Also collect blocks that contain TG loads
+        var tgLoadBlockNames = Set<String>()
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .load {
+                guard inst.operands.count >= 1 else { continue }
+                if case .value(let v) = inst.operands[0], isTGPointer(v.type) {
+                    tgLoadBlockNames.insert(bb.name)
+                }
+            }
+        }
 
         // Strategy 1: For TG stores in straight-line code (no conditional branch),
         // insert barrier before the store in the same block.
@@ -907,7 +923,7 @@ private func transformTGStoreBarrierInsert(module: IRModule) {
         // Strategy 2: For conditional branches that target TG-store blocks,
         // insert barrier at the START of the join block (false-branch target).
         // This places the barrier after the conditional store completes,
-        // before any subsequent TG loads.
+        // before any subsequent TG loads (RAW hazard).
         for bb in fn.basicBlocks {
             for inst in bb.instructions {
                 guard inst.opcode == .br, inst.operands.count >= 3 else { continue }
@@ -921,6 +937,45 @@ private func transformTGStoreBarrierInsert(module: IRModule) {
                     if joinBB.instructions.isEmpty || !isBarrierCall(joinBB.instructions[0]) {
                         joinBB.instructions.insert(makeBarrierCall(module: module), at: 0)
                     }
+                }
+            }
+        }
+
+        // Strategy 3: WAR hazard — if a block contains a conditional branch to a
+        // TG-store block AND there was a prior TG load (in a predecessor block),
+        // we need a barrier BEFORE the conditional branch to ensure all warps
+        // finish reading before any warp writes. Since we can't place a barrier
+        // right before `br i1`, we insert it before the first instruction that
+        // feeds into the TG store sequence (i.e. at the start of the block that
+        // contains the conditional branch, if no barrier exists yet).
+        //
+        // Walk blocks in order: track whether we've seen a TG load since the
+        // last barrier. If so, any block branching to a TG-store block needs
+        // a WAR barrier.
+        var seenTGLoadSinceBarrier = false
+        for bb in fn.basicBlocks {
+            // Check if this block has a barrier — resets tracking
+            for inst in bb.instructions {
+                if isBarrierCall(inst) {
+                    seenTGLoadSinceBarrier = false
+                }
+                // Track TG loads
+                if inst.opcode == .load, inst.operands.count >= 1,
+                   case .value(let v) = inst.operands[0], isTGPointer(v.type) {
+                    seenTGLoadSinceBarrier = true
+                }
+            }
+
+            // If we've seen a TG load and this block branches to a TG-store block,
+            // insert a WAR barrier at the start of this block
+            guard seenTGLoadSinceBarrier else { continue }
+            guard let last = bb.instructions.last, last.opcode == .br,
+                  last.operands.count >= 3 else { continue }
+            if case .basicBlock(let trueBB) = last.operands[1],
+               tgStoreBlockNames.contains(trueBB.name) {
+                if bb.instructions.isEmpty || !isBarrierCall(bb.instructions[0]) {
+                    bb.instructions.insert(makeBarrierCall(module: module), at: 0)
+                    seenTGLoadSinceBarrier = false
                 }
             }
         }
