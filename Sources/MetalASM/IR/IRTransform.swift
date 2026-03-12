@@ -856,10 +856,16 @@ private func transformBarrierRename(module: IRModule) {
 // Fix: ensure every TG store is preceded by a barrier within the same basic
 // block. If the instruction immediately before a TG store is not a barrier
 // (air.wg.barrier), insert one.
+//
+// IMPORTANT: Never insert a barrier immediately before a conditional branch —
+// the GPU JIT crashes on `barrier → br i1` in the same block ("Failed to
+// materializeAll"). Instead, for conditional branches that target TG-store
+// blocks, insert the barrier at the start of the join block (the false-branch
+// target where execution converges after the conditional TG store).
 
 private func transformTGStoreBarrierInsert(module: IRModule) {
-    // Build set of basic blocks that contain TG stores (addrspace 3)
     for fn in module.functions where !fn.isDeclaration {
+        // Collect basic blocks that contain TG stores (addrspace 3)
         var tgStoreBlockNames = Set<String>()
         for bb in fn.basicBlocks {
             for inst in bb.instructions where inst.opcode == .store {
@@ -871,37 +877,51 @@ private func transformTGStoreBarrierInsert(module: IRModule) {
         }
         guard !tgStoreBlockNames.isEmpty else { continue }
 
-        // Find conditional branches that target TG-store blocks.
-        // Pattern: `br i1 cond, label %thenBlock, label %endBlock`
-        // where thenBlock contains a TG store (storeDShared pattern).
-        // Insert a barrier before this branch if not already preceded by one.
-        for bb in fn.basicBlocks {
+        // Strategy 1: For TG stores in straight-line code (no conditional branch),
+        // insert barrier before the store in the same block.
+        for bb in fn.basicBlocks where tgStoreBlockNames.contains(bb.name) {
             var i = 0
             while i < bb.instructions.count {
                 let inst = bb.instructions[i]
-                guard inst.opcode == .br, inst.operands.count >= 3 else { i += 1; continue }
-                // operands: [cond, trueBlock, falseBlock]
-                let branchesToTG: Bool
-                if case .basicBlock(let targetBB) = inst.operands[1],
-                   tgStoreBlockNames.contains(targetBB.name) {
-                    branchesToTG = true
-                } else {
-                    branchesToTG = false
+                guard inst.opcode == .store, inst.operands.count >= 2,
+                      case .value(let v) = inst.operands[1], isTGPointer(v.type) else {
+                    i += 1; continue
                 }
-                guard branchesToTG else { i += 1; continue }
-
                 // Check if preceded by a barrier
-                let needsBarrier: Bool
-                if i > 0 {
-                    needsBarrier = !isBarrierCall(bb.instructions[i - 1])
-                } else {
-                    needsBarrier = true
-                }
-                if needsBarrier {
-                    bb.instructions.insert(makeBarrierCall(module: module), at: i)
-                    i += 1  // skip past inserted barrier
+                if i == 0 || !isBarrierCall(bb.instructions[i - 1]) {
+                    // Only insert if this block is NOT reached via a conditional branch
+                    // from another block (those are handled by Strategy 2 below).
+                    // A block reached via conditional branch typically has a single
+                    // unconditional branch as its terminator (back to join block).
+                    let isConditionalTarget = bb.instructions.last.map { $0.opcode == .br && $0.operands.count == 1 } ?? false
+                    let blockHasOnlyStoreAndBranch = bb.instructions.count <= 3
+                    if !(isConditionalTarget && blockHasOnlyStoreAndBranch) {
+                        bb.instructions.insert(makeBarrierCall(module: module), at: i)
+                        i += 1
+                    }
                 }
                 i += 1
+            }
+        }
+
+        // Strategy 2: For conditional branches that target TG-store blocks,
+        // insert barrier at the START of the join block (false-branch target).
+        // This places the barrier after the conditional store completes,
+        // before any subsequent TG loads.
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions {
+                guard inst.opcode == .br, inst.operands.count >= 3 else { continue }
+                // operands: [cond, trueBlock, falseBlock]
+                guard case .basicBlock(let trueBB) = inst.operands[1],
+                      tgStoreBlockNames.contains(trueBB.name),
+                      case .basicBlock(let falseBB) = inst.operands[2] else { continue }
+
+                // Find the join block (false branch target) and insert barrier at start
+                if let joinBB = fn.basicBlocks.first(where: { $0.name == falseBB.name }) {
+                    if joinBB.instructions.isEmpty || !isBarrierCall(joinBB.instructions[0]) {
+                        joinBB.instructions.insert(makeBarrierCall(module: module), at: 0)
+                    }
+                }
             }
         }
     }
@@ -932,6 +952,12 @@ private func makeBarrierCall(module: IRModule) -> IRInstruction {
         .constant(.integer(i32Ty, 1)),
         .value(barrierFn)
     ]
+    // Ensure the declaration exists in the module
+    if !module.functions.contains(where: { $0.name == "air.wg.barrier" }) {
+        let decl = IRFunction(name: "air.wg.barrier", returnType: .void,
+                              parameterTypes: [i32Ty, i32Ty], isDeclaration: true)
+        module.functions.insert(decl, at: 0)
+    }
     return inst
 }
 
