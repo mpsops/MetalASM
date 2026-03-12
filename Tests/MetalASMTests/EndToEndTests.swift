@@ -1854,6 +1854,54 @@ extension EndToEndTests {
         #endif
     }
 
+    // MARK: - Pass 5b scalar packing test
+
+    func testScalarPackingScale() throws {
+        // Kernel: out[i] = in[i] * scale
+        // 2 device ptrs + 1 float scalar → Pass 5b should pack the float into a buffer
+        let ir = """
+        define void @scale_kernel(ptr addrspace(1) %in, ptr addrspace(1) %out, float %scale) {
+          %tid3 = call <3 x i32> @air.thread_position_in_grid.v3i32()
+          %idx = extractelement <3 x i32> %tid3, i32 0
+          %p_in = getelementptr inbounds float, ptr addrspace(1) %in, i32 %idx
+          %val = load float, ptr addrspace(1) %p_in, align 4
+          %mul = fmul float %val, %scale
+          %p_out = getelementptr inbounds float, ptr addrspace(1) %out, i32 %idx
+          store float %mul, ptr addrspace(1) %p_out, align 4
+          ret void
+        }
+        declare <3 x i32> @air.thread_position_in_grid.v3i32()
+        """
+
+        // Step 1: parse
+        print("STEP 1: parsing...")
+        let lexer = Lexer(source: ir)
+        let tokens = lexer.tokenize()
+        var parser = Parser(tokens: tokens, source: lexer.source)
+        let module = try parser.parse()
+        print("  parsed OK, \(module.functions.count) functions")
+
+        // Step 2: transform
+        print("STEP 2: applyAirTransforms...")
+        applyAirTransforms(module: module)
+        print("  transforms OK")
+
+        let fn = module.functions.first(where: { !$0.isDeclaration })!
+        print("STEP 3: params after transform:")
+        for (i, (ty, nm)) in zip(fn.parameterTypes, fn.parameterNames).enumerated() {
+            print("  [\(i)] \(ty) %\(nm)")
+        }
+        print("STEP 4: entry block instructions (\(fn.basicBlocks[0].instructions.count) total):")
+        for (i, inst) in fn.basicBlocks[0].instructions.enumerated() {
+            print("  [\(i)] \(inst.opcode) \(inst.name ?? "-") : \(inst.type) ops=\(inst.operands.count)")
+        }
+
+        // Step 5: compile to metallib (NO GPU dispatch)
+        print("STEP 5: assembling to metallib...")
+        let data = try MetalASM.assemble(ir: ir)
+        print("  metallib: \(data.count) bytes — DONE")
+    }
+
     // MARK: - TG byte global ablation tests
 
     func testTGByteAblation() throws {
@@ -1865,12 +1913,31 @@ extension EndToEndTests {
         func tryKernel(_ label: String, _ ir: String) {
             do {
                 let data = try MetalASM.assemble(ir: ir)
+                print("\(label): timing=\(MetalASM._lastTiming)")
                 let lib = try device.makeLibrary(data: asDispatchData(data))
                 let fnName = lib.functionNames.first!
                 let fn = lib.makeFunction(name: fnName)!
                 let pso = try device.makeComputePipelineState(function: fn)
                 print("\(label): OK (maxThreads=\(pso.maxTotalThreadsPerThreadgroup))")
             } catch {
+                // Dump the IR for debugging
+                print("\(label): FAILED — dumping transformed IR")
+                if let parsed = try? {
+                    let lexer = Lexer(source: ir)
+                    let tokens = lexer.tokenize()
+                    var parser = Parser(tokens: tokens, source: lexer.source)
+                    return try parser.parse()
+                }() {
+                    applyAirTransforms(module: parsed)
+                    for fn in parsed.functions where !fn.isDeclaration {
+                        print("  fn \(fn.name)(\(fn.parameterTypes.map { "\($0)" }.joined(separator: ", ")))")
+                        for bb in fn.basicBlocks {
+                            for inst in bb.instructions {
+                                print("    \(inst.name.isEmpty ? "" : "%\(inst.name) = ")\(inst.opcode) \(inst.type) \(inst.operands)")
+                            }
+                        }
+                    }
+                }
                 XCTFail("\(label): \(error.localizedDescription.prefix(80))")
             }
         }
@@ -2570,6 +2637,137 @@ extension EndToEndTests {
 
 
 
+    /// Struct phi in loop: 32-element {ptr addrspace(1) x 32} phi gets split
+    /// into 32 scalar ptr phis. Verifies transformStructPhis handles
+    /// insertvalue chains whose aggregate base is a split struct phi.
+    func testStructPhiLoop() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Build 32-element insertvalue chain + struct phi in loop
+        let n = 32
+        let structTy = "{ " + Array(repeating: "ptr addrspace(1)", count: n).joined(separator: ", ") + " }"
+        var inserts = ""
+        for i in 0..<n {
+            let prev = i == 0 ? "undef" : "%s\(i-1)"
+            inserts += "  %s\(i) = insertvalue \(structTy) \(prev), ptr addrspace(1) %a_init, \(i)\n"
+        }
+        let ir = """
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @struct_phi_kernel(ptr addrspace(1) %0, ptr addrspace(1) %1) {
+        entry:
+          %tid_arr = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tid_arr, 0
+          %tid64 = zext i32 %tid to i64
+          %a_init = getelementptr float, ptr addrspace(1) %0, i64 %tid64
+        \(inserts)  br label %loop
+        loop:
+          %iv = phi i32 [ 0, %entry ], [ %iv_next, %loop ]
+          %acc = phi float [ 0.000000e+00, %entry ], [ %acc_next, %loop ]
+          %ptrs = phi \(structTy) [ %s\(n-1), %entry ], [ %ptrs_next, %loop ]
+          %p0 = extractvalue \(structTy) %ptrs, 0
+          %val = load float, ptr addrspace(1) %p0
+          %acc_next = fadd float %acc, %val
+          %p0_next = getelementptr float, ptr addrspace(1) %p0, i64 \(n)
+          %ptrs_next = insertvalue \(structTy) %ptrs, ptr addrspace(1) %p0_next, 0
+          %iv_next = add i32 %iv, 1
+          %cond = icmp slt i32 %iv_next, 4
+          br i1 %cond, label %loop, label %exit
+        exit:
+          %out = getelementptr float, ptr addrspace(1) %1, i64 %tid64
+          store float %acc_next, ptr addrspace(1) %out
+          ret void
+        }
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "struct_phi_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        // Fill input: [0, 1, 2, ..., 127]  (32 threads × 4 iterations = read 128 floats)
+        let count = 128
+        let inBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let inPtr = inBuf.contents().bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count { inPtr[i] = Float(i) }
+
+        let outBuf = device.makeBuffer(length: 32 * 4, options: .storageModeShared)!
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // Thread t reads input[t], input[t+32], input[t+64], input[t+96]
+        // acc = input[t] + input[t+32] + input[t+64] + input[t+96]
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: 32)
+        for t in 0..<32 {
+            let expected = Float(t) + Float(t + 32) + Float(t + 64) + Float(t + 96)
+            XCTAssertEqual(outPtr[t], expected, accuracy: 0.01,
+                           "thread \(t): got \(outPtr[t]) expected \(expected)")
+        }
+        #endif
+    }
+
+    /// Minimal repro: advancing ptr phi + MMA load in same loop = GPU JIT crash.
+    /// Either alone works. The combination triggers "Failed to materializeAll."
+    func testAdvancingPtrPhiWithMMA() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        source_filename = "LLVMDialectModule"
+
+        @__tg_dot_ab_0 = internal addrspace(3) global [4096 x float] undef, align 4
+
+        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare void @air.wg.barrier(i32, i32)
+
+        define void @test_kernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ptr addrspace(1) %2) {
+        entry:
+          br label %loop
+
+        loop:
+          %iv = phi i32 [ 0, %entry ], [ %iv_next, %loop ]
+          %p0 = phi ptr addrspace(1) [ %0, %entry ], [ %p0_next, %loop ]
+
+          %p0_next = getelementptr half, ptr addrspace(1) %p0, i32 64
+
+          %tg_ptr = getelementptr float, ptr addrspace(3) @__tg_dot_ab_0, i32 0
+          %a = call <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(
+            ptr addrspace(3) %tg_ptr,
+            <2 x i64> <i64 8, i64 0>, <2 x i64> <i64 1, i64 0>, <2 x i64> <i64 0, i64 0>)
+
+          call void @air.wg.barrier(i32 2, i32 1)
+
+          %iv_next = add i32 %iv, 1
+          %cond = icmp slt i32 %iv_next, 8
+          br i1 %cond, label %loop, label %exit
+
+        exit:
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "test_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        XCTAssertGreaterThan(pso.maxTotalThreadsPerThreadgroup, 0)
+        #endif
+    }
+
     func testAtomicXchgI32() throws {
         #if !canImport(Metal)
         throw XCTSkip("Metal not available")
@@ -3157,6 +3355,30 @@ extension EndToEndTests {
             throw XCTSkip("Set TEST_LLIR=/path/to/file.llir")
         }
         let ir = try String(contentsOfFile: path, encoding: .utf8)
+        // Dump transformed IR for debugging
+        let lexer = Lexer(source: ir)
+        let tokens = lexer.tokenize()
+        var parser = Parser(tokens: tokens, source: lexer.source)
+        let module = try parser.parse()
+        applyAirTransforms(module: module)
+        var dump = ""
+        for fn in module.functions {
+            dump += "FN: \(fn.name) isDecl=\(fn.isDeclaration) bbs=\(fn.basicBlocks.count)\n"
+            for (bbIdx, bb) in fn.basicBlocks.enumerated() {
+                dump += " BB[\(bbIdx)] '\(bb.name)' (\(bb.instructions.count) insts)\n"
+                for inst in bb.instructions {
+                    let ops = inst.operands.map { op -> String in
+                        switch op {
+                        case .basicBlock(let b): return "label %\(b.name)"
+                        case .value(let v): return "%\(v.name)"
+                        default: return "\(op)"
+                        }
+                    }.joined(separator: ", ")
+                    dump += "  \(inst.name.isEmpty ? "_" : "%\(inst.name)") = \(inst.opcode) [\(ops)]\n"
+                }
+            }
+        }
+        try dump.write(toFile: "/tmp/inline_dump.txt", atomically: true, encoding: .utf8)
         let metallib = try MetalASM.assemble(ir: ir)
         try metallib.write(to: URL(fileURLWithPath: "/tmp/test_external.metallib"))
         let device = MTLCreateSystemDefaultDevice()!
@@ -3165,6 +3387,105 @@ extension EndToEndTests {
         let fn = library.makeFunction(name: fnName)!
         let pso = try device.makeComputePipelineState(function: fn)
         XCTAssertGreaterThan(pso.maxTotalThreadsPerThreadgroup, 0)
+        print("testExternalLLIR: PSO OK, fn=\(fnName), maxThreads=\(pso.maxTotalThreadsPerThreadgroup)")
+
+        // If TEST_LLIR_DISPATCH=MxNxK, dispatch as a dot kernel: C = A @ B
+        // Buffers: 0=A(MxK float), 1=B(KxN float), 2=C(MxN float)
+        if let dims = ProcessInfo.processInfo.environment["TEST_LLIR_DISPATCH"] {
+            let parts = dims.split(separator: "x").compactMap { Int($0) }
+            guard parts.count == 3 else {
+                XCTFail("TEST_LLIR_DISPATCH must be MxNxK, got \(dims)")
+                return
+            }
+            let M = parts[0], N = parts[1], K = parts[2]
+            let aBuf = device.makeBuffer(length: M * K * 4, options: .storageModeShared)!
+            let bBuf = device.makeBuffer(length: K * N * 4, options: .storageModeShared)!
+            let cBuf = device.makeBuffer(length: M * N * 4, options: .storageModeShared)!
+            let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: M * K)
+            let bPtr = bBuf.contents().bindMemory(to: Float.self, capacity: K * N)
+            let cPtr = cBuf.contents().bindMemory(to: Float.self, capacity: M * N)
+            // Fill A and B with deterministic pattern
+            for i in 0..<(M*K) { aPtr[i] = Float(i % 7 - 3) }
+            for i in 0..<(K*N) { bPtr[i] = Float(i % 5 - 2) }
+            for i in 0..<(M*N) { cPtr[i] = -999.0 }
+
+            let queue = device.makeCommandQueue()!
+            let cmd = queue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(aBuf, offset: 0, index: 0)
+            enc.setBuffer(bBuf, offset: 0, index: 1)
+            enc.setBuffer(cBuf, offset: 0, index: 2)
+            // Thread count: override via TEST_LLIR_THREADS env, default 128
+            let threadsPerTG: Int
+            if let t = ProcessInfo.processInfo.environment["TEST_LLIR_THREADS"], let n = Int(t) {
+                threadsPerTG = n
+            } else {
+                threadsPerTG = 128
+            }
+            print("testExternalLLIR: dispatching \(threadsPerTG) threads")
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: threadsPerTG, height: 1, depth: 1))
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            // Compute reference: C[i,j] = sum_k A[i,k]*B[k,j]
+            var refC = [Float](repeating: 0, count: M * N)
+            for i in 0..<M {
+                for j in 0..<N {
+                    var sum: Float = 0
+                    for k in 0..<K {
+                        sum += aPtr[i * K + k] * bPtr[k * N + j]
+                    }
+                    refC[i * N + j] = sum
+                }
+            }
+            var maxErr: Float = 0
+            var firstBad = ""
+            for i in 0..<M {
+                for j in 0..<N {
+                    let val = cPtr[i * N + j]
+                    let err = abs(val - refC[i * N + j])
+                    if err > maxErr {
+                        maxErr = err
+                        if firstBad.isEmpty && err > 0.01 {
+                            firstBad = "C[\(i),\(j)]=\(val) expected \(refC[i * N + j])"
+                        }
+                    }
+                }
+            }
+            // Show per-8x8-tile errors and dump bad tile values
+            for tm in 0..<(M/8) {
+                for tn in 0..<(N/8) {
+                    var tileMax: Float = 0
+                    for i in (tm*8)..<(tm*8+8) {
+                        for j in (tn*8)..<(tn*8+8) {
+                            tileMax = max(tileMax, abs(cPtr[i*N+j] - refC[i*N+j]))
+                        }
+                    }
+                    if tileMax > 0.01 {
+                        print("  tile[\(tm),\(tn)] rows \(tm*8)-\(tm*8+7) cols \(tn*8)-\(tn*8+7): max_err=\(tileMax)")
+                        if tm == 7 && tn == 2 {
+                            // Check if got matches ref from a different tile
+                            for otm in 0..<(M/8) {
+                                let match = (0..<8).allSatisfy { j in
+                                    cPtr[56*N + tn*8 + j] == refC[otm*8*N + tn*8 + j]
+                                }
+                                if match { print("    got row56 = ref row\(otm*8) tile[\(otm),\(tn)]!") }
+                            }
+                            print("    got row56: ", (0..<8).map { cPtr[56*N + tn*8 + $0] })
+                            print("    ref row56: ", (0..<8).map { refC[56*N + tn*8 + $0] })
+                            // Also check tile[6,2] (tm=6 = rows 48-55, same tn)
+                            print("    ref row48: ", (0..<8).map { refC[48*N + tn*8 + $0] })
+                            print("    ref row40: ", (0..<8).map { refC[40*N + tn*8 + $0] })
+                        }
+                    }
+                }
+            }
+            print("testExternalLLIR: dispatch \(M)x\(N)x\(K) max_err=\(maxErr) \(firstBad)")
+            XCTAssertLessThan(maxErr, 0.1, "dot \(M)x\(N)x\(K) max_err=\(maxErr) \(firstBad)")
+        }
         #endif
     }
 
@@ -3577,6 +3898,173 @@ extension EndToEndTests {
         #endif
     }
 
+    /// Minimal repro: GEP with byte offset into middle of a single TG global
+    /// crashes Metal GPU JIT ("Failed to materializeAll"). The fix is to split
+    /// the monolithic @global_smem into separate TG globals for each region.
+    func testTGByteOffsetGEPCrash() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        source_filename = "LLVMDialectModule"
+
+        @global_smem = internal addrspace(3) global [1024 x i8] undef, align 16
+
+        declare void @air.wg.barrier(i32, i32)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @kernel(ptr addrspace(1) %0, ptr addrspace(1) %1) {
+          %3 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %4 = extractvalue [3 x i32] %3, 0
+          %5 = and i32 %4, 31
+
+          ; Store to base of global_smem
+          %6 = getelementptr float, ptr addrspace(3) @global_smem, i32 %5
+          store float 1.0, ptr addrspace(3) %6, align 4
+
+          ; Store to global_smem + 512 bytes — byte-offset GEP into middle of TG global
+          %base2 = getelementptr i8, ptr addrspace(3) @global_smem, i64 512
+          %7 = getelementptr float, ptr addrspace(3) %base2, i32 %5
+          store float 2.0, ptr addrspace(3) %7, align 4
+
+          call void @air.wg.barrier(i32 1, i32 1)
+
+          %8 = load float, ptr addrspace(3) %6, align 4
+          %9 = load float, ptr addrspace(3) %7, align 4
+          %10 = fadd float %8, %9
+
+          %11 = getelementptr float, ptr addrspace(1) %1, i32 %5
+          store float %10, ptr addrspace(1) %11, align 4
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        let data = try MetalASM.assemble(ir: ir)
+        XCTAssertGreaterThan(data.count, 100)
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        // Dispatch and verify correctness: each thread should store 1.0 + 2.0 = 3.0
+        let count = 32
+        let inBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count { outPtr[i] = 0.0 }
+
+        let queue = device.makeCommandQueue()!
+        let cmdBuf = queue.makeCommandBuffer()!
+        let enc = cmdBuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        for i in 0..<count {
+            XCTAssertEqual(outPtr[i], 3.0, "thread \(i): expected 3.0, got \(outPtr[i])")
+        }
+        #endif
+    }
+
+    /// Same as testTGByteOffsetGEPCrash but with nested constant GEP expression
+    /// (the form Triton actually emits for multi-value scan).
+    func testTGNestedConstantGEPCrash() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        source_filename = "LLVMDialectModule"
+
+        @global_smem = internal addrspace(3) global [1024 x i8] undef, align 16
+
+        declare void @air.wg.barrier(i32, i32)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @kernel(ptr addrspace(1) %0, ptr addrspace(1) %1) {
+          %3 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %4 = extractvalue [3 x i32] %3, 0
+          %5 = and i32 %4, 31
+
+          %6 = getelementptr float, ptr addrspace(3) @global_smem, i32 %5
+          store float 1.0, ptr addrspace(3) %6, align 4
+
+          ; Nested constant GEP — the exact pattern Triton emits
+          %7 = getelementptr float, ptr addrspace(3) getelementptr inbounds nuw (i8, ptr addrspace(3) @global_smem, i64 512), i32 %5
+          store float 2.0, ptr addrspace(3) %7, align 4
+
+          call void @air.wg.barrier(i32 1, i32 1)
+
+          %8 = load float, ptr addrspace(3) %6, align 4
+          %9 = load float, ptr addrspace(3) %7, align 4
+          %10 = fadd float %8, %9
+
+          %11 = getelementptr float, ptr addrspace(1) %1, i32 %5
+          store float %10, ptr addrspace(1) %11, align 4
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        let data = try MetalASM.assemble(ir: ir)
+        XCTAssertGreaterThan(data.count, 100)
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let count = 32
+        let inBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: count * 4, options: .storageModeShared)!
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count { outPtr[i] = 0.0 }
+
+        let queue = device.makeCommandQueue()!
+        let cmdBuf = queue.makeCommandBuffer()!
+        let enc = cmdBuf.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: count, height: 1, depth: 1))
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        for i in 0..<count {
+            XCTAssertEqual(outPtr[i], 3.0, "thread \(i): expected 3.0, got \(outPtr[i])")
+        }
+        #endif
+    }
+
+    /// Full 2D linear recurrence scan IR from Triton — the actual failing kernel.
+    func testScan2DLinearRecurrence() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = try String(contentsOfFile: "/tmp/scan2d_linear_recurrence.ll", encoding: .utf8)
+        let data = try MetalASM.assemble(ir: ir)
+        XCTAssertGreaterThan(data.count, 100)
+
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "scan2d_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        XCTAssertGreaterThan(pso.maxTotalThreadsPerThreadgroup, 0)
+        #endif
+    }
+
     func testFloatNaNConstant() throws {
         #if !canImport(Metal)
         throw XCTSkip("Metal not available")
@@ -3633,6 +4121,101 @@ extension EndToEndTests {
         XCTAssertTrue(outPtr[0].isNaN, "Expected NaN, got \(outPtr[0])")
         XCTAssertTrue(outPtr[1].isNaN, "Expected NaN at index 1, got \(outPtr[1])")
         print("testFloatNaNConstant: outPtr[0]=\(outPtr[0]) (bits: \(String(outPtr[0].bitPattern, radix: 16)))")
+        #endif
+    }
+
+    /// Variable-index half GEP + MMA + correctness: the load-and-extract pattern.
+    /// Each thread loads A[lane] (half) via variable-index GEP, converts to float,
+    /// stores to TG, does MMA(ones, diag(A)), checks result = A broadcast across rows.
+    /// Tests that lshr index scaling + extractelement picks correct half for both
+    /// even and odd indices.
+    func testHalfGEPLoadExtractMMA() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Simpler: each thread loads input[tid] (half) via variable GEP,
+        // stores to TG, then MMA load from TG. We verify the load is correct.
+        // Key: tid is variable, so GEP gets lshr scaling. Even tids (0,2,4..)
+        // and odd tids (1,3,5..) exercise both extractelement lanes.
+        let ir = """
+        source_filename = "LLVMDialectModule"
+
+        @__tg_buf = internal addrspace(3) global [64 x float] undef, align 4
+
+        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare void @air.threadgroup.barrier(i32, i32)
+        declare i32 @air.thread_index_in_simdgroup()
+
+        define void @half_extract_kernel(ptr addrspace(1) %in, ptr addrspace(1) %out) {
+          %lane = call i32 @air.thread_index_in_simdgroup()
+
+          ; Variable-index half GEP — this triggers lshr + load-and-extract
+          %p = getelementptr half, ptr addrspace(1) %in, i32 %lane
+          %v = load half, ptr addrspace(1) %p
+          %vf = fpext half %v to float
+
+          ; Store to TG
+          %lane64 = zext i32 %lane to i64
+          %tg_p = getelementptr float, ptr addrspace(3) @__tg_buf, i64 %lane64
+          store float %vf, ptr addrspace(3) %tg_p
+
+          call void @air.threadgroup.barrier(i32 1, i32 4)
+
+          ; MMA load (forces MMA path, validates typed pointer compatibility)
+          %mma = call <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(
+            ptr addrspace(3) @__tg_buf,
+            <2 x i64> splat (i64 8), <2 x i64> <i64 1, i64 8>, <2 x i64> zeroinitializer)
+
+          ; Write loaded half value to output for verification
+          %out_p = getelementptr float, ptr addrspace(1) %out, i32 %lane
+          store float %vf, ptr addrspace(1) %out_p
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "half_extract_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        // Input: 32 half values = 0.0, 1.0, 2.0, ..., 31.0
+        // Tests both even indices (lane 0,2,4..) and odd indices (lane 1,3,5..)
+        let inBuf = device.makeBuffer(length: 32 * 2, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: 32 * 4, options: .storageModeShared)!
+        let inPtr = inBuf.contents().bindMemory(to: UInt16.self, capacity: 32)
+        for i in 0..<32 {
+            // Convert Float to float16 bits
+            inPtr[i] = Float16(Float(i)).bitPattern
+        }
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: 32)
+        for i in 0..<32 { outPtr[i] = -999.0 }
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        var maxErr: Float = 0
+        for i in 0..<32 {
+            let expected = Float(i)
+            let err = abs(outPtr[i] - expected)
+            maxErr = max(maxErr, err)
+            if err > 0.1 {
+                print("testHalfGEPLoadExtractMMA: out[\(i)] = \(outPtr[i]) expected \(expected)")
+            }
+        }
+        print("testHalfGEPLoadExtractMMA: max_err = \(maxErr)")
+        XCTAssertLessThan(maxErr, 0.1, "Half GEP load-and-extract max_err=\(maxErr)")
         #endif
     }
 }

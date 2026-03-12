@@ -41,6 +41,16 @@ final class ValueEnumerator {
     /// Get or assign an index for a type.
     @discardableResult
     func enumerateType(_ type: IRType) -> Int {
+        // When MMA is present, collapse all non-float device pointers to float*
+        // so the type table only has float* for addrspace(1). GPU JIT crashes on
+        // non-float typed device ptrs when MMA intrinsics are present.
+        if TypeTableWriter.collapseDevicePtrsToFloat,
+           case .pointer(let pointee, 1) = type, pointee != .float32 {
+            let canonical = IRType.pointer(pointee: .float32, addressSpace: 1)
+            let idx = enumerateType(canonical)
+            typeMap[type] = idx  // alias this type to the float* entry
+            return idx
+        }
         if let existing = typeMap[type] {
             return existing
         }

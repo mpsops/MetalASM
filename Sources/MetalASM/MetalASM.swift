@@ -36,17 +36,39 @@ public enum MetalASM {
         let opqTypes = ve_dbg.types.filter { if case .opaquePointer(_) = $0 { return true }; return false }
         if !opqTypes.isEmpty { print("[assemble] WARNING: opaque ptr types remain: \(opqTypes)") }
 
-        // Debug: dump metadata
+        // Debug: dump transformed IR
         if ProcessInfo.processInfo.environment["METALASM_DUMP_IR"] != nil {
             var dump = ""
-            for fn in module.functions {
-                dump += "fn: \(fn.name)(\(fn.parameterTypes.map { "\($0)" }.joined(separator: ", ")))\n"
+            for g in module.globals {
+                dump += "@\(g.name) = addrspace(\(g.addressSpace)) global \(g.valueType)\n"
             }
-            for (i, md) in module.metadataNodes.enumerated() {
-                dump += "!\(i) = !{\(md.operands.map { "\($0)" }.joined(separator: ", "))}\n"
+            for fn in module.functions {
+                if fn.isDeclaration {
+                    dump += "declare \(fn.returnType) @\(fn.name)(\(fn.parameterTypes.map { "\($0)" }.joined(separator: ", ")))\n"
+                } else {
+                    dump += "define \(fn.returnType) @\(fn.name)(\(fn.parameterTypes.map { "\($0)" }.joined(separator: ", "))) {\n"
+                    for bb in fn.basicBlocks {
+                        dump += "\(bb.name):\n"
+                        for inst in bb.instructions {
+                            let ops = inst.operands.map { op -> String in
+                                switch op {
+                                case .value(let v): return "%\(v.name):\(v.type)"
+                                case .constant(let c): return "const(\(c))"
+                                case .basicBlock(let b): return "bb(\(b.name))"
+                                case .type(let t): return "type(\(t))"
+                                case .intLiteral(let i): return "\(i)"
+                                case .metadata(let m): return "!\(m)"
+                                }
+                            }
+                            let srcTy = inst.attributes.gepSourceType.map { " srcTy=\($0)" } ?? ""
+                            dump += "  %\(inst.name) = \(inst.opcode) \(inst.type) [\(ops.joined(separator: ", "))]\(srcTy)\n"
+                        }
+                    }
+                    dump += "}\n"
+                }
             }
             try? dump.write(toFile: "/tmp/metalasm_debug.txt", atomically: true, encoding: .utf8)
-            print("[assemble] dumped debug info to /tmp/metalasm_debug.txt")
+            print("[assemble] dumped transformed IR to /tmp/metalasm_debug.txt")
         }
 
         // Phase 2: Serialize IR to LLVM bitcode

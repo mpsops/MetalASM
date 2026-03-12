@@ -46,7 +46,10 @@ public final class BitcodeWriter {
 
         // TypeTableWriter.emitOpaqueAsTyped is set by IRTransform (single source
         // of truth for the hasMMA || hasTGByteGlobal condition). Reset after use.
-        defer { TypeTableWriter.emitOpaqueAsTyped = false }
+        defer {
+            TypeTableWriter.emitOpaqueAsTyped = false
+            TypeTableWriter.collapseDevicePtrsToFloat = false
+        }
 
         let te = CFAbsoluteTimeGetCurrent()
         let enumerator = ValueEnumerator(module: module)

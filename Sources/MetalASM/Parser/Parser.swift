@@ -1283,9 +1283,17 @@ public struct Parser {
             let tok = try expect(.integer)
             indices.append(.intLiteral(Int64(tokenInt(tok) ?? 0)))
         }
-        let inst = IRInstruction(opcode: .extractValue, type: .i32, name: resultName, operands: indices)
+        // Infer element type from aggregate type + first index
+        var elemType: IRType = .i32
+        if case .structure(_, let elems, _) = aggType,
+           case .intLiteral(let idx) = indices.last, idx >= 0 && Int(idx) < elems.count {
+            elemType = elems[Int(idx)]
+        } else if case .array(let et, _) = aggType {
+            elemType = et
+        }
+        let inst = IRInstruction(opcode: .extractValue, type: elemType, name: resultName, operands: indices)
         if !resultName.isEmpty {
-            localValues[resultName] = IRValue(type: .i32, name: resultName)
+            localValues[resultName] = IRValue(type: elemType, name: resultName)
         }
         return inst
     }
@@ -1650,7 +1658,7 @@ public struct Parser {
             if textEquals(current, "null") {
                 _ = advance()
                 return .constant(.null(type))
-            } else if textEquals(current, "undef") {
+            } else if textEquals(current, "undef") || textEquals(current, "poison") {
                 _ = advance()
                 return .constant(.undef(type))
             } else if textEquals(current, "zeroinitializer") {
@@ -1681,6 +1689,32 @@ public struct Parser {
                 return .constant(.vectorValue(type, elements))
             }
             throw ParseError.unexpected("operand '\(text(current))'", line: 0, column: 0)
+
+        case .leftBrace:
+            // Struct constant literal: { i32 2, float 3.0, ... }
+            _ = advance() // consume '{'
+            skipNewlines()
+            var structElems: [IRConstant] = []
+            while current.kind != .rightBrace {
+                let elemType = try parseType()
+                let elemOp = try parseOperand(type: elemType)
+                switch elemOp {
+                case .constant(let c):
+                    structElems.append(c)
+                default:
+                    structElems.append(.undef(elemType))
+                }
+                if current.kind == .comma {
+                    _ = advance()
+                    skipNewlines()
+                }
+            }
+            _ = try expect(.rightBrace)
+            // For single-element struct, unwrap to just the element constant
+            if structElems.count == 1 {
+                return .constant(structElems[0])
+            }
+            return .constant(.zeroInitializer(type))
 
         case .leftAngle:
             // Vector constant literal: <i32 0, i32 1, ...>
@@ -1818,7 +1852,7 @@ public struct Parser {
             }
             return .float64(0)
         case .keyword:
-            if textEquals(current, "undef") { _ = advance(); return .undef(type) }
+            if textEquals(current, "undef") || textEquals(current, "poison") { _ = advance(); return .undef(type) }
             if textEquals(current, "zeroinitializer") { _ = advance(); return .zeroInitializer(type) }
             if textEquals(current, "null") { _ = advance(); return .null(type) }
             // Skip unknown
@@ -1962,7 +1996,7 @@ public struct Parser {
             } else if current.kind == .keyword && textEquals(current, "null") {
                 _ = advance()
                 return .constant(type, .null(type))
-            } else if current.kind == .keyword && textEquals(current, "undef") {
+            } else if current.kind == .keyword && (textEquals(current, "undef") || textEquals(current, "poison")) {
                 _ = advance()
                 return .constant(type, .undef(type))
             }

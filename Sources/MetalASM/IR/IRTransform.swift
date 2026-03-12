@@ -21,16 +21,275 @@ public func applyAirTransforms(module: IRModule) {
     module.dataLayout = airDataLayout
     module.targetTriple = airTriple
 
+    transformInlineNonKernelFunctions(module: module)
     transformStructPhis(module: module)
+    transformPtrPhisToI64(module: module)
     transformBarrierRename(module: module)
+    transformFNegToFSub(module: module)
     transformLLVMIntrinsicRename(module: module)
+    transformI64ShuffleSplit(module: module)
     transformAtomicRMW(module: module)
+    transformTGGlobalDeadElim(module: module)
+    transformTGGlobalCoalesce(module: module)
     transformTGGlobalGEPs(module: module)
     transformMMATypedPtrs(module: module)
     transformBFloat16Casts(module: module)
     transformScalarStoreGuard(module: module)
     transformAirSystemValues(module: module)
     transformDeviceLoadsVolatile(module: module)
+    transformWidenDeviceLoads(module: module)
+}
+
+// MARK: - Transform: Inline non-kernel functions
+//
+// Metal kernels cannot call other functions (no function pointers in AIR).
+// Inline all calls to non-declaration, non-kernel functions into callers.
+// Single-pass: handles simple cases (no recursion, single basic block callees).
+
+private func transformInlineNonKernelFunctions(module: IRModule) {
+    var inlineCounter = 0
+
+    // Repeat until no more inlining is possible (handles nested call graphs)
+    for _ in 0..<20 {  // safety limit
+        // Rebuild callee map each iteration (functions get removed after inlining)
+        var calledNames = Set<String>()
+        for fn in module.functions where !fn.isDeclaration {
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions where inst.opcode == .call {
+                    guard let calleeOp = inst.operands.last,
+                          case .value(let calleeVal) = calleeOp else { continue }
+                    calledNames.insert(calleeVal.name)
+                }
+            }
+        }
+
+        let inlineableFns = Dictionary(uniqueKeysWithValues:
+            module.functions.filter { !$0.isDeclaration && calledNames.contains($0.name) }
+                .map { ($0.name, $0) }
+        )
+
+        guard !inlineableFns.isEmpty else { return }
+
+        var didInline = false
+        let moduleFnNames = Set(module.functions.map { $0.name })
+        let globalNames = Set(module.globals.map { $0.name })
+
+        for fn in module.functions where !fn.isDeclaration {
+            var bbIdx = 0
+            while bbIdx < fn.basicBlocks.count {
+                let bb = fn.basicBlocks[bbIdx]
+                var i = 0
+                while i < bb.instructions.count {
+                    let inst = bb.instructions[i]
+                    guard inst.opcode == .call,
+                          let calleeOp = inst.operands.last,
+                          case .value(let calleeVal) = calleeOp,
+                          let callee = inlineableFns[calleeVal.name] else {
+                        i += 1
+                        continue
+                    }
+
+                    didInline = true
+                    let prefix = "_inl\(inlineCounter)_"
+                    inlineCounter += 1
+
+                    // Build param → argument mapping
+                    let args = Array(inst.operands.dropLast())
+                    var renameMap: [String: IRInstruction.Operand] = [:]
+                    for (idx, param) in callee.parameters.enumerated() {
+                        if idx < args.count {
+                            renameMap[param.name] = args[idx]
+                        }
+                    }
+
+                    let renameOp = { (op: IRInstruction.Operand) -> IRInstruction.Operand in
+                        switch op {
+                        case .value(let v):
+                            if let replacement = renameMap[v.name] { return replacement }
+                            if moduleFnNames.contains(v.name) { return op }
+                            if globalNames.contains(v.name) { return op }
+                            return .value(IRValue(type: v.type, name: prefix + v.name))
+                        default:
+                            return op
+                        }
+                    }
+
+                    if callee.basicBlocks.count == 1 {
+                        // --- Single-BB inlining (simple path) ---
+                        var newInsts: [IRInstruction] = []
+                        var retOperand: IRInstruction.Operand? = nil
+
+                        for srcInst in callee.basicBlocks[0].instructions {
+                            if srcInst.opcode == .ret {
+                                if let firstOp = srcInst.operands.first {
+                                    retOperand = renameOp(firstOp)
+                                }
+                                continue
+                            }
+
+                            let cloned = IRInstruction(
+                                opcode: srcInst.opcode,
+                                type: srcInst.type,
+                                name: srcInst.name.isEmpty ? "" : prefix + srcInst.name,
+                                operands: srcInst.operands.map(renameOp),
+                                attributes: srcInst.attributes
+                            )
+                            if !srcInst.name.isEmpty {
+                                renameMap[srcInst.name] = .value(IRValue(type: srcInst.type, name: prefix + srcInst.name))
+                            }
+                            newInsts.append(cloned)
+                        }
+
+                        // Map call result to return value — rename across ALL BBs
+                        if !inst.name.isEmpty, let retVal = retOperand {
+                            if case .value(let v) = retVal, !v.name.isEmpty {
+                                let oldName = inst.name
+                                let newName = v.name
+                                // Rename in rest of current BB
+                                for j in (i + 1)..<bb.instructions.count {
+                                    let later = bb.instructions[j]
+                                    for (k, op) in later.operands.enumerated() {
+                                        if case .value(let v2) = op, v2.name == oldName {
+                                            later.operands[k] = .value(IRValue(type: v2.type, name: newName))
+                                        }
+                                    }
+                                }
+                                // Rename in all subsequent BBs of the function
+                                let currentBBIdx = fn.basicBlocks.firstIndex(where: { $0 === bb })!
+                                for laterBBIdx in (currentBBIdx + 1)..<fn.basicBlocks.count {
+                                    for later in fn.basicBlocks[laterBBIdx].instructions {
+                                        for (k, op) in later.operands.enumerated() {
+                                            if case .value(let v2) = op, v2.name == oldName {
+                                                later.operands[k] = .value(IRValue(type: v2.type, name: newName))
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        bb.instructions.replaceSubrange(i...i, with: newInsts)
+                        // Don't advance i — re-process for nested calls
+
+                    } else {
+                        // --- Multi-BB inlining ---
+                        // Split caller BB at call site:
+                        //   bb: [before_call..., call, after_call...] →
+                        //   bb: [before_call..., br callee_entry]
+                        //   callee_bb0, callee_bb1, ... (ret → br continuation)
+                        //   continuation: [after_call...]
+
+                        // Create continuation BB with instructions after the call
+                        let contBBName = "\(prefix)cont"
+                        let afterCallInsts = Array(bb.instructions[(i + 1)...])
+                        let contBB = IRBasicBlock(name: contBBName, instructions: afterCallInsts)
+
+                        // Clone callee BBs with renamed labels and SSAs
+                        var bbRenameMap: [String: IRBasicBlock] = [:]
+                        var clonedBBs: [IRBasicBlock] = []
+
+                        for srcBB in callee.basicBlocks {
+                            let newName = prefix + srcBB.name
+                            let clonedBB = IRBasicBlock(name: newName)
+                            bbRenameMap[srcBB.name] = clonedBB
+                            clonedBBs.append(clonedBB)
+                        }
+
+                        // Rename operand with BB awareness
+                        let renameOpMultiBB = { (op: IRInstruction.Operand) -> IRInstruction.Operand in
+                            switch op {
+                            case .basicBlock(let refBB):
+                                if let renamed = bbRenameMap[refBB.name] {
+                                    return .basicBlock(renamed)
+                                }
+                                return op
+                            default:
+                                return renameOp(op)
+                            }
+                        }
+
+                        // Clone instructions into each BB
+                        for (srcBBIdx, srcBB) in callee.basicBlocks.enumerated() {
+                            let clonedBB = clonedBBs[srcBBIdx]
+
+                            for srcInst in srcBB.instructions {
+                                if srcInst.opcode == .ret {
+                                    // Replace ret with br to continuation
+                                    // If call had a result, we need to propagate the return value
+                                    if !inst.name.isEmpty, let firstOp = srcInst.operands.first {
+                                        let retVal = renameOpMultiBB(firstOp)
+                                        if case .value(let v) = retVal, !v.name.isEmpty {
+                                            let oldName = inst.name
+                                            // Rename uses in continuation BB
+                                            for later in contBB.instructions {
+                                                for (k, op) in later.operands.enumerated() {
+                                                    if case .value(let v2) = op, v2.name == oldName {
+                                                        later.operands[k] = .value(IRValue(type: v2.type, name: v.name))
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    clonedBB.instructions.append(
+                                        IRInstruction(opcode: .br, operands: [.basicBlock(contBB)])
+                                    )
+                                    continue
+                                }
+
+                                let cloned = IRInstruction(
+                                    opcode: srcInst.opcode,
+                                    type: srcInst.type,
+                                    name: srcInst.name.isEmpty ? "" : prefix + srcInst.name,
+                                    operands: srcInst.operands.map(renameOpMultiBB),
+                                    attributes: srcInst.attributes
+                                )
+                                if !srcInst.name.isEmpty {
+                                    renameMap[srcInst.name] = .value(IRValue(type: srcInst.type, name: prefix + srcInst.name))
+                                }
+                                clonedBB.instructions.append(cloned)
+                            }
+                        }
+
+                        // Truncate caller BB: remove call + after-call, add br to callee entry
+                        bb.instructions.removeSubrange(i...)
+                        bb.instructions.append(
+                            IRInstruction(opcode: .br, operands: [.basicBlock(clonedBBs[0])])
+                        )
+
+                        // Insert cloned BBs + continuation after current BB
+                        var insertBBs = clonedBBs
+                        insertBBs.append(contBB)
+                        fn.basicBlocks.insert(contentsOf: insertBBs, at: bbIdx + 1)
+
+                        // Don't advance i — we've restructured BBs, break inner loop
+                        break
+                    }
+                }
+                bbIdx += 1
+            }
+        }
+
+        // Remove functions that were fully inlined (no longer called)
+        let stillCalledNames: Set<String> = {
+            var names = Set<String>()
+            for fn in module.functions where !fn.isDeclaration {
+                for bb in fn.basicBlocks {
+                    for inst in bb.instructions where inst.opcode == .call {
+                        if let calleeOp = inst.operands.last,
+                           case .value(let v) = calleeOp {
+                            names.insert(v.name)
+                        }
+                    }
+                }
+            }
+            return names
+        }()
+        module.functions.removeAll {
+            !$0.isDeclaration && inlineableFns.keys.contains($0.name) && !stillCalledNames.contains($0.name)
+        }
+
+        if !didInline { return }
+    }  // end repeat loop
 }
 
 // MARK: - Transform: Decompose int-to-bfloat casts
@@ -263,6 +522,7 @@ private func transformStructPhis(module: IRModule) {
         }
 
         guard !allScalarPhis.isEmpty else { continue }
+        // allScalarPhis collected
 
         // Pass 1: Collect all insertvalue chains across all blocks
         // Map: insertvalue result name → {elemIdx: scalar operand}
@@ -271,11 +531,19 @@ private func transformStructPhis(module: IRModule) {
             for inst in bb.instructions where inst.opcode == .insertValue && inst.operands.count >= 3 {
                 if case .intLiteral(let idx) = inst.operands[2] {
                     insertValueScalars[inst.name, default: [:]][Int(idx)] = inst.operands[1]
-                    // Inherit from aggregate base
-                    if case .value(let agg) = inst.operands[0],
-                       let existing = insertValueScalars[agg.name] {
-                        for (k, v) in existing where insertValueScalars[inst.name]?[k] == nil {
-                            insertValueScalars[inst.name, default: [:]][k] = v
+                    // Inherit from aggregate base (another insertvalue chain)
+                    if case .value(let agg) = inst.operands[0] {
+                        if let existing = insertValueScalars[agg.name] {
+                            for (k, v) in existing where insertValueScalars[inst.name]?[k] == nil {
+                                insertValueScalars[inst.name, default: [:]][k] = v
+                            }
+                        }
+                        // Inherit from split struct phi (agg was a struct phi → scalar phis)
+                        if let phiNames = allScalarPhis[agg.name],
+                           let phiTypes = allScalarTypes[agg.name] {
+                            for (k, name) in phiNames.enumerated() where insertValueScalars[inst.name]?[k] == nil {
+                                insertValueScalars[inst.name, default: [:]][k] = .value(IRValue(type: phiTypes[k], name: name))
+                            }
                         }
                     }
                 }
@@ -334,6 +602,7 @@ private func transformStructPhis(module: IRModule) {
                     // Check if this is part of a struct phi chain
                     if case .value(let agg) = inst.operands[0] {
                         if agg.name == "undef" || insertValueScalars[agg.name] != nil ||
+                           allScalarPhis[agg.name] != nil ||
                            (inst.operands.count >= 1 && {
                                if case .constant(.undef(_)) = inst.operands[0] { return true }
                                return false
@@ -361,6 +630,182 @@ private func transformStructPhis(module: IRModule) {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+// MARK: - Transform: ptr phi → i64 phi (GPU JIT workaround)
+//
+// Metal GPU JIT has a limit of ~63 ptr-typed phi nodes in a single loop block.
+// Pipelined matmul can produce 96+ ptr phis (32 per operand × 3 operands).
+// Fix: convert ptr addrspace(1) phis to i64 phis using ptrtoint/inttoptr.
+// i64 phis have no such limit (tested up to 96).
+
+private func transformPtrPhisToI64(module: IRModule) {
+    let i64Type = IRType.int(bits: 64)
+
+    for fn in module.functions where !fn.isDeclaration {
+        // Build block lookup for predecessor insertion
+        let blocksByName = Dictionary(uniqueKeysWithValues: fn.basicBlocks.map { ($0.name, $0) })
+
+        for bb in fn.basicBlocks {
+            // Count ptr phis in this block
+            let ptrPhis = bb.instructions.filter { inst in
+                guard inst.opcode == .phi else { return false }
+                switch inst.type {
+                case .opaquePointer(let addrSpace) where addrSpace == 1: return true
+                case .pointer(_, let addrSpace) where addrSpace == 1: return true
+                default: return false
+                }
+            }
+
+            guard ptrPhis.count > 32 else { continue }
+
+            // Track: original phi name → inttoptr name (for use-site renaming)
+            var ptrRestore: [(phiName: String, intToPtrName: String, ptrType: IRType)] = []
+            // Track: predecessor block → [(ptrtoint name, source value operand)]
+            var predInsertions: [String: [(name: String, srcOp: IRInstruction.Operand, ptrType: IRType)]] = [:]
+
+            for phi in ptrPhis {
+                let origPtrType = phi.type
+                let origName = phi.name
+                let restoreName = "\(origName)_ptr"
+
+                // Change phi type to i64
+                phi.type = i64Type
+
+                // Process incoming values: [val0, bb0, val1, bb1, ...]
+                var i = 0
+                while i < phi.operands.count - 1 {
+                    let valOp = phi.operands[i]
+                    let bbOp = phi.operands[i + 1]
+
+                    // Create ptrtoint instruction name
+                    let p2iName: String
+                    switch valOp {
+                    case .value(let v):
+                        p2iName = "\(v.name)_p2i"
+                    case .constant(_):
+                        p2iName = "\(origName)_const_p2i_\(i/2)"
+                    default:
+                        i += 2; continue
+                    }
+
+                    // Get predecessor block name
+                    if case .basicBlock(let predBB) = bbOp {
+                        predInsertions[predBB.name, default: []].append(
+                            (name: p2iName, srcOp: valOp, ptrType: origPtrType)
+                        )
+                    }
+
+                    // Update phi incoming to reference ptrtoint result
+                    phi.operands[i] = .value(IRValue(type: i64Type, name: p2iName))
+
+                    i += 2
+                }
+
+                ptrRestore.append((phiName: origName, intToPtrName: restoreName, ptrType: origPtrType))
+            }
+
+            // Infer typed pointer from GEP usage: if a GEP uses the phi's inttoptr result
+            // with a non-float source type, the inttoptr must produce that typed ptr
+            // (otherwise emitOpaqueAsTyped makes it float* → type mismatch with GEP source)
+            var phiPointeeTypes: [String: IRType] = [:]
+            for bb2 in fn.basicBlocks {
+                for inst in bb2.instructions where inst.opcode == .getelementptr {
+                    if let srcTy = inst.attributes.gepSourceType,
+                       let baseOp = inst.operands.first,
+                       case .value(let v) = baseOp {
+                        for entry in ptrRestore where entry.phiName == v.name {
+                            phiPointeeTypes[entry.phiName] = srcTy
+                        }
+                    }
+                }
+            }
+
+            // Insert inttoptr instructions after ALL phis in the block
+            let firstNonPhiIdx = bb.instructions.firstIndex(where: { $0.opcode != .phi }) ?? bb.instructions.count
+            var intToPtrInsts: [IRInstruction] = []
+            for (phiName, i2pName, ptrType) in ptrRestore {
+                // Use typed pointer if we know the pointee from GEP usage
+                let actualPtrType: IRType
+                if let pointee = phiPointeeTypes[phiName],
+                   case .opaquePointer(let as1) = ptrType {
+                    actualPtrType = .pointer(pointee: pointee, addressSpace: as1)
+                } else {
+                    actualPtrType = ptrType
+                }
+                let i2p = IRInstruction(
+                    opcode: .intToPtr,
+                    type: actualPtrType,
+                    name: i2pName,
+                    operands: [.value(IRValue(type: i64Type, name: phiName))]
+                )
+                intToPtrInsts.append(i2p)
+            }
+            bb.instructions.insert(contentsOf: intToPtrInsts, at: firstNonPhiIdx)
+
+            // Rename all uses of original phi name → inttoptr name (in ALL blocks)
+            // But NOT in the phi itself (it stays as i64)
+            let renameMap: [String: (String, IRType)] = Dictionary(uniqueKeysWithValues: ptrRestore.map {
+                let actualType: IRType
+                if let pointee = phiPointeeTypes[$0.phiName],
+                   case .opaquePointer(let as1) = $0.ptrType {
+                    actualType = .pointer(pointee: pointee, addressSpace: as1)
+                } else {
+                    actualType = $0.ptrType
+                }
+                return ($0.phiName, ($0.intToPtrName, actualType))
+            })
+
+            for renBB in fn.basicBlocks {
+                for inst in renBB.instructions {
+                    // Skip the phi instructions we just converted (they reference i64 values)
+                    if inst.opcode == .phi && renameMap[inst.name] != nil { continue }
+                    // Skip the inttoptr instructions we just created (they reference the phi by i64 name)
+                    if inst.opcode == .intToPtr && ptrRestore.contains(where: { $0.intToPtrName == inst.name }) { continue }
+
+                    for j in inst.operands.indices {
+                        if case .value(let v) = inst.operands[j],
+                           let (newName, newType) = renameMap[v.name] {
+                            inst.operands[j] = .value(IRValue(type: newType, name: newName))
+                        }
+                    }
+                }
+            }
+
+            // Insert ptrtoint instructions in predecessor blocks (before terminator)
+            // Deduplicate: same source value in same block → same ptrtoint
+            for (predName, insertions) in predInsertions {
+                guard let predBB = blocksByName[predName] else { continue }
+                // Find terminator (last instruction)
+                let termIdx = predBB.instructions.count - 1
+                guard termIdx >= 0 else { continue }
+
+                // Deduplicate by name
+                var seen = Set<String>()
+                var p2iInsts: [IRInstruction] = []
+                for (name, srcOp, ptrType) in insertions {
+                    guard !seen.contains(name) else { continue }
+                    seen.insert(name)
+
+                    // If the source references a renamed phi (back-edge), use the inttoptr name
+                    var actualSrcOp = srcOp
+                    if case .value(let v) = srcOp, let (newName, newType) = renameMap[v.name] {
+                        actualSrcOp = .value(IRValue(type: newType, name: newName))
+                    }
+
+                    let p2i = IRInstruction(
+                        opcode: .ptrToInt,
+                        type: i64Type,
+                        name: name,
+                        operands: [actualSrcOp]
+                    )
+                    _ = ptrType  // suppress unused warning
+                    p2iInsts.append(p2i)
+                }
+                predBB.instructions.insert(contentsOf: p2iInsts, at: termIdx)
             }
         }
     }
@@ -433,7 +878,39 @@ private let llvmToAirIntrinsics: [(String, String)] = [
     // fma
     ("llvm.fma.f32",    "air.fma.f32"),
     ("llvm.fma.f16",    "air.fma.f16"),
+    // rint (round to nearest integer)
+    ("llvm.rint.f32",   "air.fast_rint.f32"),
+    ("llvm.rint.f16",   "air.fast_rint.f16"),
+    // mulhi (unsigned multiply-high)
+    ("__mulhi",         "air.mul_hi.u.i32"),
+    ("__mul64hi",       "air.mul_hi.u.i64"),
 ]
+
+// MARK: - Transform: fneg → fsub -0.0
+//
+// Metal GPU JIT (LLVM 14) doesn't support FUNC_CODE_INST_UNOP (fneg).
+// Lower fneg %x → fsub float -0.0, %x.
+
+private func transformFNegToFSub(module: IRModule) {
+    for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            for i in bb.instructions.indices {
+                let inst = bb.instructions[i]
+                guard inst.opcode == .fneg, inst.operands.count >= 1 else { continue }
+                let negZero: IRConstant
+                switch inst.type {
+                case .float16:  negZero = .float16(0x8000)  // -0.0 in f16 bits
+                case .float32:  negZero = .float32(-0.0)
+                case .float64:  negZero = .float64(-0.0)
+                default:        negZero = .float32(-0.0)
+                }
+                bb.instructions[i] = IRInstruction(
+                    opcode: .fsub, type: inst.type, name: inst.name,
+                    operands: [.constant(negZero), inst.operands[0]])
+            }
+        }
+    }
+}
 
 private func transformLLVMIntrinsicRename(module: IRModule) {
     let nameMap = Dictionary(llvmToAirIntrinsics, uniquingKeysWith: { _, b in b })
@@ -459,6 +936,127 @@ private func transformLLVMIntrinsicRename(module: IRModule) {
     // Remove attribute groups that are no longer referenced by any function
     let usedGroupIndices = Set(module.functions.compactMap { $0.attributeGroupIndex })
     module.attributeGroups.removeAll { !usedGroupIndices.contains($0.index) }
+}
+
+// MARK: - Transform: Split i64 SIMD shuffles into pairs of i32 shuffles
+//
+// Metal GPU JIT crashes (XPC_ERROR_CONNECTION_INTERRUPTED) on air.simd_shuffle_*.i64.
+// Fix: split each i64 shuffle into two i32 shuffles on the low/high halves,
+// then reassemble. Works for shuffle_up, shuffle_down, shuffle_xor, shuffle.
+
+private func transformI64ShuffleSplit(module: IRModule) {
+    let i32 = IRType.int(bits: 32)
+    let i64 = IRType.int(bits: 64)
+    let i16 = IRType.int(bits: 16)
+
+    // Ensure i32 shuffle declarations exist
+    var declaredShuffles = Set<String>()
+    for fn in module.functions where fn.isDeclaration {
+        declaredShuffles.insert(fn.name)
+    }
+
+    for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            var i = 0
+            while i < bb.instructions.count {
+                let inst = bb.instructions[i]
+                guard inst.opcode == .call,
+                      let calleeOp = inst.operands.last,
+                      case .value(let calleeVal) = calleeOp,
+                      calleeVal.name.hasPrefix("air.simd_shuffle"),
+                      calleeVal.name.hasSuffix(".i64") else {
+                    i += 1
+                    continue
+                }
+
+                let resultName = inst.name
+                let i32Name = calleeVal.name.replacingOccurrences(of: ".i64", with: ".i32")
+
+                // Declare i32 variant if needed
+                if !declaredShuffles.contains(i32Name) {
+                    let decl = IRFunction(
+                        name: i32Name,
+                        returnType: i32,
+                        parameterTypes: [i32, i16],
+                        isDeclaration: true
+                    )
+                    module.functions.append(decl)
+                    declaredShuffles.insert(i32Name)
+                }
+
+                // operands: [value_i64, offset_i16, callee]
+                let srcOp = inst.operands[0]
+                let offsetOp = inst.operands[1]
+
+                let loName = "\(resultName).lo"
+                let hiName = "\(resultName).hi"
+                let shufLoName = "\(resultName).shuf_lo"
+                let shufHiName = "\(resultName).shuf_hi"
+                let hiExtName = "\(resultName).hi_ext"
+                let hiShlName = "\(resultName).hi_shl"
+
+                // %lo = trunc i64 %src to i32
+                let truncLo = IRInstruction(opcode: .trunc, type: i32, name: loName, operands: [srcOp])
+
+                // %hi_pre = lshr i64 %src, 32
+                let lshrInst = IRInstruction(opcode: .lshr, type: i64, name: "\(resultName).hi_pre", operands: [
+                    srcOp, .constant(.integer(i64, 32))
+                ])
+                let hiPreVal = IRValue(type: i64, name: "\(resultName).hi_pre")
+
+                // %hi = trunc i64 %hi_pre to i32
+                let truncHi = IRInstruction(opcode: .trunc, type: i32, name: hiName, operands: [.value(hiPreVal)])
+
+                // %shuf_lo = call i32 @air.simd_shuffle_*.i32(i32 %lo, i16 %offset)
+                let loVal = IRValue(type: i32, name: loName)
+                let hiVal = IRValue(type: i32, name: hiName)
+                let fnType = IRType.pointer(
+                    pointee: .function(ret: i32, params: [i32, i16], isVarArg: false),
+                    addressSpace: 0
+                )
+                let fnVal = IRValue(type: fnType, name: i32Name)
+                let shufLo = IRInstruction(opcode: .call, type: i32, name: shufLoName, operands: [
+                    .value(loVal), offsetOp, .value(fnVal)
+                ])
+
+                // %shuf_hi = call i32 @air.simd_shuffle_*.i32(i32 %hi, i16 %offset)
+                let fnVal2 = IRValue(type: fnType, name: i32Name)
+                let shufHi = IRInstruction(opcode: .call, type: i32, name: shufHiName, operands: [
+                    .value(hiVal), offsetOp, .value(fnVal2)
+                ])
+
+                // %hi_ext = zext i32 %shuf_hi to i64
+                let shufLoVal = IRValue(type: i32, name: shufLoName)
+                let shufHiVal = IRValue(type: i32, name: shufHiName)
+                let hiExt = IRInstruction(opcode: .zext, type: i64, name: hiExtName, operands: [.value(shufHiVal)])
+
+                // %hi_shl = shl i64 %hi_ext, 32
+                let hiExtVal = IRValue(type: i64, name: hiExtName)
+                let hiShl = IRInstruction(opcode: .shl, type: i64, name: hiShlName, operands: [
+                    .value(hiExtVal), .constant(.integer(i64, 32))
+                ])
+
+                // %result = zext i32 %shuf_lo to i64  (lo_ext)
+                // then or with hi_shl
+                let loExtName = "\(resultName).lo_ext"
+                let loExt = IRInstruction(opcode: .zext, type: i64, name: loExtName, operands: [.value(shufLoVal)])
+                let loExtVal = IRValue(type: i64, name: loExtName)
+                let hiShlVal = IRValue(type: i64, name: hiShlName)
+                let orInst = IRInstruction(opcode: .or, type: i64, name: resultName, operands: [
+                    .value(loExtVal), .value(hiShlVal)
+                ])
+
+                // Replace the original call with the sequence
+                bb.instructions.replaceSubrange(i...i, with: [
+                    truncLo, lshrInst, truncHi, shufLo, shufHi, hiExt, hiShl, loExt, orInst
+                ])
+                i += 9  // skip all new instructions
+            }
+        }
+    }
+
+    // Remove i64 shuffle declarations (no longer called)
+    module.functions.removeAll { $0.isDeclaration && $0.name.hasPrefix("air.simd_shuffle") && $0.name.hasSuffix(".i64") }
 }
 
 // MARK: - Transform 2: MMA load/store elimination + multiply-accumulate fixup
@@ -541,6 +1139,7 @@ private func transformMMATypedPtrs(module: IRModule) {
     }
     let needsTypedPtrs = hasMMADecl || hasTGByteGlobal || hasAtomicDecl || hasTGGlobal || hasI1Load
     TypeTableWriter.emitOpaqueAsTyped = needsTypedPtrs
+    TypeTableWriter.collapseDevicePtrsToFloat = hasMMADecl
     guard needsTypedPtrs else { return }
 
     // Fix cmpxchg: pointer types in cmpxchg calls must be i32*, not float*.
@@ -670,10 +1269,13 @@ private func transformMMATypedPtrs(module: IRModule) {
         }
 
         // Convert opaque pointer params to typed pointers
+        // When MMA is present, GPU JIT requires all device ptrs to be float* —
+        // half*, i8* etc. crash when MMA intrinsics are in the same module.
         var changed = false
         for i in fn.parameterTypes.indices {
             if case .opaquePointer(let addrSpace) = fn.parameterTypes[i] {
-                let pointee = paramPointeeTypes[i] ?? .float32
+                var pointee = paramPointeeTypes[i] ?? .float32
+                if hasMMADecl && addrSpace == 1 { pointee = .float32 }
                 fn.parameterTypes[i] = .pointer(pointee: pointee, addressSpace: addrSpace)
                 fn.parameters[i].type = fn.parameterTypes[i]
                 changed = true
@@ -721,31 +1323,89 @@ private func transformMMATypedPtrs(module: IRModule) {
         // the GEP result should also be typed (using gepSourceType).
         for bb in fn.basicBlocks {
             for inst in bb.instructions where inst.opcode == .getelementptr {
-                if case .opaquePointer(let addrSpace) = inst.type,
-                   let srcTy = inst.attributes.gepSourceType {
+                // Get addrspace from either opaque or typed pointer
+                let addrSpace: Int
+                let isOpaque: Bool
+                switch inst.type {
+                case .opaquePointer(let a): addrSpace = a; isOpaque = true
+                case .pointer(_, let a): addrSpace = a; isOpaque = false
+                default: continue
+                }
+                guard let srcTy = inst.attributes.gepSourceType else { continue }
+
                     // Metal has no i1 memory type — remap to i8
-                    let pointee = (srcTy == .int(bits: 1)) ? IRType.int(bits: 8) : srcTy
+                    var pointee = (srcTy == .int(bits: 1)) ? IRType.int(bits: 8) : srcTy
                     if srcTy == .int(bits: 1) {
                         inst.attributes.gepSourceType = .int(bits: 8)
                     }
-                    let typedPtr = IRType.pointer(pointee: pointee, addressSpace: addrSpace)
-                    inst.type = typedPtr
-                    // Propagate to uses
-                    let gepName = inst.name
-                    if !gepName.isEmpty {
-                        for bb2 in fn.basicBlocks {
-                            for inst2 in bb2.instructions {
-                                for j in inst2.operands.indices {
-                                    if case .value(let v) = inst2.operands[j],
-                                       v.name == gepName,
-                                       case .opaquePointer(_) = v.type {
-                                        inst2.operands[j] = .value(IRValue(type: typedPtr, name: v.name))
+
+                    // For device ptrs with MMA: force float32 GEP source type.
+                    // GPU JIT requires GEP source type to match pointer pointee type.
+                    if addrSpace == 1 && pointee != .float32 && hasMMADecl {
+                        let elemSize = scalarSizeAlign(srcTy).0
+                        pointee = .float32
+                        inst.attributes.gepSourceType = .float32
+                        if elemSize != 4, inst.operands.count >= 2 {
+                            if let newIdx = scaleGepIndexToFloat(inst.operands[1], elemSize: elemSize) {
+                                inst.operands[1] = newIdx
+                            } else {
+                                // Variable index: insert scaling instruction
+                                // half (2 bytes) → float (4 bytes): new_idx = old_idx * 2 / 4
+                                // But 2/4 = 0.5 which loses precision for odd indices.
+                                // Instead: byte_offset = old_idx * elemSize, new_idx = byte_offset / 4
+                                // For half (2 bytes): new_idx = old_idx / 2 (truncating)
+                                // This is only correct if the original indices are even, which they
+                                // should be for half→float stride conversion in practice.
+                                // Actually for half→float we need: new_byte_offset = old_idx * 2
+                                // new_float_idx = new_byte_offset / 4 = old_idx / 2
+                                // We insert: %scaled = lshr i32 %old_idx, 1 (divide by 2)
+                                if elemSize == 2 {
+                                    if case .value(let idxVal) = inst.operands[1] {
+                                        let origIdxName = idxVal.name
+                                        let scaledName = "\(inst.name)_hidx"
+                                        let scaledInst = IRInstruction(
+                                            opcode: .lshr, type: idxVal.type, name: scaledName,
+                                            operands: [
+                                                .value(idxVal),
+                                                .constant(.integer(idxVal.type, 1))
+                                            ])
+                                        // Insert before this GEP
+                                        let bb = fn.basicBlocks.first(where: { $0.instructions.contains(where: { $0 === inst }) })!
+                                        if let idx = bb.instructions.firstIndex(where: { $0 === inst }) {
+                                            bb.instructions.insert(scaledInst, at: idx)
+                                        }
+                                        inst.operands[1] = .value(IRValue(type: idxVal.type, name: scaledName))
+                                        // Tag GEP so load widening can emit extractelement
+                                        inst.attributes.gepHalfScaledOrigIdx = origIdxName
                                     }
                                 }
                             }
                         }
                     }
-                }
+
+                    let typedPtr = IRType.pointer(pointee: pointee, addressSpace: addrSpace)
+                    if inst.type != typedPtr {
+                        let oldType = inst.type
+                        inst.type = typedPtr
+                        // Propagate to uses
+                        let gepName = inst.name
+                        if !gepName.isEmpty {
+                            for bb2 in fn.basicBlocks {
+                                for inst2 in bb2.instructions {
+                                    for j in inst2.operands.indices {
+                                        if case .value(let v) = inst2.operands[j],
+                                           v.name == gepName,
+                                           (v.type == oldType || {
+                                               if case .opaquePointer(_) = v.type { return true }
+                                               return false
+                                           }()) {
+                                            inst2.operands[j] = .value(IRValue(type: typedPtr, name: v.name))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
             }
         }
     }
@@ -820,6 +1480,84 @@ private func transformMMATypedPtrs(module: IRModule) {
     }
 }
 
+// MARK: - Transform: Coalesce threadgroup globals
+//
+// Merge __tg_cvt_* buffers (from ConvertLayoutOp) into a dot buffer they don't
+// overlap with. The cvt op finishes before/after the dot — they're never live
+// simultaneously. This reduces TG memory for large tile sizes.
+// MARK: - Transform: Remove unreferenced TG globals
+// Globals declared but never used in any instruction waste TG memory.
+private func transformTGGlobalDeadElim(module: IRModule) {
+    // Collect all global names referenced in instructions
+    var referencedNames: Set<String> = []
+    for fn in module.functions {
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions {
+                for op in inst.operands {
+                    if case .value(let v) = op {
+                        referencedNames.insert(v.name)
+                    }
+                }
+            }
+        }
+    }
+    // Remove unreferenced addrspace(3) globals
+    module.globals.removeAll(where: { g in
+        g.addressSpace == 3 && !referencedNames.contains(g.name)
+    })
+}
+
+// Safe merges: __tg_cvt_* → __tg_dot_ab_* (cvt runs before dot scatter)
+//              __tg_cvt_* → __tg_dot_c_*  (cvt of result runs after dot gather)
+// Both the ab and c buffers are live during MMA, so they CANNOT be merged.
+//
+private func transformTGGlobalCoalesce(module: IRModule) {
+    // Find cvt and dot globals
+    var cvtGlobals: [(global: IRGlobal, elemType: IRType, count: Int)] = []
+    var dotGlobals: [(global: IRGlobal, elemType: IRType, count: Int)] = []
+
+    for g in module.globals where g.addressSpace == 3 {
+        if case .array(let elemTy, let n) = g.valueType, elemTy != .i8, n > 64 {
+            if g.name.hasPrefix("__tg_cvt_") {
+                cvtGlobals.append((global: g, elemType: elemTy, count: n))
+            } else if g.name.hasPrefix("__tg_dot_") {
+                dotGlobals.append((global: g, elemType: elemTy, count: n))
+            }
+        }
+    }
+
+    guard !cvtGlobals.isEmpty, !dotGlobals.isEmpty else { return }
+
+    // For each cvt global, merge into a dot_ab global (NOT dot_c — cvt reads from dot_c!)
+    for cvt in cvtGlobals {
+        guard let target = dotGlobals.first(where: {
+            $0.elemType == cvt.elemType && $0.global.name.contains("_ab_")
+        }) ?? dotGlobals.first(where: { $0.elemType == cvt.elemType }) else { continue }
+        let oldName = cvt.global.name
+        let newName = target.global.name
+        // Rename all references
+        for fn in module.functions {
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    for (k, op) in inst.operands.enumerated() {
+                        if case .value(let v) = op, v.name == oldName {
+                            inst.operands[k] = .value(IRValue(type: v.type, name: newName))
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resize target if cvt is larger
+        if cvt.count > target.count {
+            target.global.valueType = .array(element: cvt.elemType, count: cvt.count)
+        }
+
+        // Remove cvt global
+        module.globals.removeAll(where: { $0.name == oldName })
+    }
+}
+
 // MARK: - Transform 3: Threadgroup global GEP rewrite
 
 private func transformTGGlobalGEPs(module: IRModule) {
@@ -845,6 +1583,12 @@ private func transformTGGlobalGEPs(module: IRModule) {
     // `getelementptr i8, @__tg_cvt_0, 4` must be expanded into explicit GEP
     // instructions to preserve the byte offset.
     // For MMA globals (non-i8 element type), convert byte offset to element offset.
+    //
+    // IMPORTANT: For [N x i8] byte globals, byte-offset GEPs into the middle of
+    // the global crash Metal GPU JIT ("Failed to materializeAll"). Instead of
+    // emitting GEP instructions with non-zero offsets, we create separate TG
+    // globals for each distinct byte offset region and redirect references.
+    var offsetGlobalMap: [String: [Int64: String]] = [:]
     do {
         var tgGlobalInfo: [String: (elemType: IRType, elemBytes: Int64)] = [:]
         for g in module.globals where g.addressSpace == 3 {
@@ -860,6 +1604,86 @@ private func transformTGGlobalGEPs(module: IRModule) {
                 tgGlobalInfo[g.name] = (elemType: elemTy, elemBytes: bytes)
             }
         }
+
+        // Phase A: Collect distinct byte offsets for each [N x i8] byte global.
+        // Two sources of offsets:
+        //   1. constantGEPByteOffset on operand values (from parser constant GEP expressions)
+        //   2. GEP instructions with byte global base and constant index
+        var byteGlobalOffsets: [String: Set<Int64>] = [:]
+        let byteGlobalNames = Set(byteGlobals.map { $0.name })
+        for fn in module.functions where !fn.isDeclaration {
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    // Source 1: constant GEP expression offsets
+                    for i in inst.operands.indices {
+                        if case .value(let v) = inst.operands[i], v.constantGEPByteOffset != 0,
+                           let info = tgGlobalInfo[v.name], info.elemBytes == 1 {
+                            byteGlobalOffsets[v.name, default: []].insert(v.constantGEPByteOffset)
+                        }
+                    }
+                    // Source 2: GEP instructions like `getelementptr i8, @global_smem, i64 512`
+                    if inst.opcode == .getelementptr,
+                       inst.operands.count >= 2,
+                       case .value(let baseVal) = inst.operands[0],
+                       byteGlobalNames.contains(baseVal.name),
+                       baseVal.constantGEPByteOffset == 0,
+                       case .constant(let c) = inst.operands[1],
+                       case .integer(_, let offset) = c,
+                       offset != 0 {
+                        // Compute actual byte offset considering GEP source type
+                        let elemSize: Int64
+                        if let srcTy = inst.attributes.gepSourceType {
+                            switch srcTy {
+                            case .i8: elemSize = 1
+                            case .i16, .float16, .bfloat16: elemSize = 2
+                            case .i32, .float32: elemSize = 4
+                            case .i64, .float64: elemSize = 8
+                            default: elemSize = 1
+                            }
+                        } else {
+                            elemSize = 1
+                        }
+                        byteGlobalOffsets[baseVal.name, default: []].insert(offset * elemSize)
+                    }
+                }
+            }
+        }
+
+        // Phase B: Create new TG globals for each non-zero byte offset region
+        // offsetGlobalMap: original name → [offset → new global name] (declared above do block)
+        for (globalName, offsets) in byteGlobalOffsets {
+            guard let g = module.globals.first(where: { $0.name == globalName }),
+                  case .array(_, let totalBytes) = g.valueType else { continue }
+            let sortedOffsets = offsets.sorted()
+            var mapping: [Int64: String] = [:]
+            for offset in sortedOffsets {
+                let regionSize = totalBytes - Int(offset)
+                guard regionSize > 0 else { continue }
+                let newName = "\(globalName)__off\(offset)"
+                mapping[offset] = newName
+                let newGlobal = IRGlobal(
+                    name: newName,
+                    valueType: .array(element: .i8, count: regionSize),
+                    addressSpace: 3,
+                    initializer: .undef(.array(element: .i8, count: regionSize))
+                )
+                newGlobal.linkage = g.linkage
+                newGlobal.alignment = g.alignment
+                module.globals.append(newGlobal)
+                // Also register in byteGlobals list so Part 1 picks it up
+                byteGlobals.append(newGlobal)
+            }
+            offsetGlobalMap[globalName] = mapping
+            // Shrink the original global to just the first region
+            if let firstOffset = sortedOffsets.first {
+                let newValueType = IRType.array(element: .i8, count: Int(firstOffset))
+                g.valueType = newValueType
+                g.type = .pointer(pointee: newValueType, addressSpace: 3)
+            }
+        }
+
+        // Phase C: Flatten constant GEPs — for byte globals with offset regions,
+        // redirect to the new split global instead of emitting a byte-offset GEP
         var ctr = 5000
         for fn in module.functions where !fn.isDeclaration {
             for bb in fn.basicBlocks {
@@ -868,40 +1692,102 @@ private func transformTGGlobalGEPs(module: IRModule) {
                     for i in inst.operands.indices {
                         if case .value(let v) = inst.operands[i], v.constantGEPByteOffset != 0,
                            let info = tgGlobalInfo[v.name] {
-                            let ssaName = "__cgep_\(ctr)"
-                            ctr += 1
-                            // Convert byte offset to element offset for non-i8 globals
-                            let gepSourceType: IRType
-                            let gepOffset: Int64
-                            if info.elemBytes > 1 && v.constantGEPByteOffset % info.elemBytes == 0 {
-                                gepSourceType = info.elemType
-                                gepOffset = v.constantGEPByteOffset / info.elemBytes
+                            // Check if this is a byte global with a split region
+                            if let mapping = offsetGlobalMap[v.name],
+                               let newGlobalName = mapping[v.constantGEPByteOffset] {
+                                // Replace with direct reference to the new split global (offset 0)
+                                inst.operands[i] = .value(IRValue(
+                                    type: .opaquePointer(addressSpace: 3),
+                                    name: newGlobalName))
                             } else {
-                                gepSourceType = .i8
-                                gepOffset = v.constantGEPByteOffset
+                                // Non-byte global or no split: emit GEP instruction as before
+                                let ssaName = "__cgep_\(ctr)"
+                                ctr += 1
+                                let gepSourceType: IRType
+                                let gepOffset: Int64
+                                if info.elemBytes > 1 && v.constantGEPByteOffset % info.elemBytes == 0 {
+                                    gepSourceType = info.elemType
+                                    gepOffset = v.constantGEPByteOffset / info.elemBytes
+                                } else {
+                                    gepSourceType = .i8
+                                    gepOffset = v.constantGEPByteOffset
+                                }
+                                let gepInst = IRInstruction(
+                                    opcode: .getelementptr,
+                                    type: .opaquePointer(addressSpace: 3),
+                                    name: ssaName,
+                                    operands: [
+                                        .value(IRValue(type: v.type, name: v.name)),
+                                        .constant(.integer(.i64, gepOffset)),
+                                    ],
+                                    attributes: {
+                                        var a = IRInstruction.InstructionAttributes()
+                                        a.inBounds = true
+                                        a.gepSourceType = gepSourceType
+                                        return a
+                                    }()
+                                )
+                                newInsts.append(gepInst)
+                                inst.operands[i] = .value(IRValue(type: .opaquePointer(addressSpace: 3), name: ssaName))
                             }
-                            let gepInst = IRInstruction(
-                                opcode: .getelementptr,
-                                type: .opaquePointer(addressSpace: 3),
-                                name: ssaName,
-                                operands: [
-                                    .value(IRValue(type: v.type, name: v.name)),
-                                    .constant(.integer(.i64, gepOffset)),
-                                ],
-                                attributes: {
-                                    var a = IRInstruction.InstructionAttributes()
-                                    a.inBounds = true
-                                    a.gepSourceType = gepSourceType
-                                    return a
-                                }()
-                            )
-                            newInsts.append(gepInst)
-                            inst.operands[i] = .value(IRValue(type: .opaquePointer(addressSpace: 3), name: ssaName))
                         }
                     }
                     newInsts.append(inst)
                 }
                 bb.instructions = newInsts
+            }
+        }
+    }
+
+    // Phase D: Rewrite GEP instructions with byte-global base + constant offset
+    // e.g. `%x = getelementptr i8, @global_smem, i64 512` → replace uses of %x
+    // with direct reference to @global_smem__off512
+    if !offsetGlobalMap.isEmpty {
+        for fn in module.functions where !fn.isDeclaration {
+            for bb in fn.basicBlocks {
+                var replacements: [String: String] = [:]  // old SSA name → new global name
+                bb.instructions = bb.instructions.compactMap { inst in
+                    if inst.opcode == .getelementptr,
+                       inst.operands.count >= 2,
+                       case .value(let baseVal) = inst.operands[0],
+                       let mapping = offsetGlobalMap[baseVal.name],
+                       case .constant(let c) = inst.operands[1],
+                       case .integer(_, let rawOffset) = c,
+                       rawOffset != 0 {
+                        // Compute actual byte offset
+                        let elemSize: Int64
+                        if let srcTy = inst.attributes.gepSourceType {
+                            switch srcTy {
+                            case .i8: elemSize = 1
+                            case .i16, .float16, .bfloat16: elemSize = 2
+                            case .i32, .float32: elemSize = 4
+                            case .i64, .float64: elemSize = 8
+                            default: elemSize = 1
+                            }
+                        } else {
+                            elemSize = 1
+                        }
+                        let byteOffset = rawOffset * elemSize
+                        if let newGlobalName = mapping[byteOffset] {
+                            replacements[inst.name] = newGlobalName
+                            return nil  // Remove this GEP instruction
+                        }
+                    }
+                    return inst
+                }
+                // Replace all uses of removed GEPs with split global references
+                if !replacements.isEmpty {
+                    for inst in bb.instructions {
+                        for i in inst.operands.indices {
+                            if case .value(let v) = inst.operands[i],
+                               let newGlobalName = replacements[v.name] {
+                                inst.operands[i] = .value(IRValue(
+                                    type: .opaquePointer(addressSpace: 3),
+                                    name: newGlobalName))
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1141,6 +2027,10 @@ private func transformTGGlobalGEPs(module: IRModule) {
     // --- Part 1b: Device pointer bitcasts ---
     // When emitOpaqueAsTyped is on, remaining opaquePointer(1) params become float*.
     // Stores/loads of non-float types through these need bitcast to the correct type.
+    // SKIP when MMA is present: type table collapses all device ptrs to float*,
+    // so bitcasts would become identity (float* → float*) which is invalid.
+    let hasMMAForBitcast = module.functions.contains { $0.name.hasPrefix("air.simdgroup_matrix_8x8_") }
+    if !hasMMAForBitcast {
     for fn in module.functions where !fn.isDeclaration {
         var nextSSA = fn.basicBlocks.flatMap(\.instructions).compactMap {
             if let n = Int($0.name) { return n } else { return nil }
@@ -1204,6 +2094,7 @@ private func transformTGGlobalGEPs(module: IRModule) {
             bb.instructions = newInsts
         }
     }
+    } // end if !hasMMAForBitcast
 
     // --- Part 2: Preamble GEP for MMA globals (keep as globals, add typed pointer) ---
     guard !mmaGlobals.isEmpty else { return }
@@ -1560,7 +2451,7 @@ private func transformAirSystemValues(module: IRModule) {
         // No system value calls — kernel already has explicit params, skip param rewrites
         let needsParamTransform = hasTid || hasTidTG || hasPid || hasSimdlane || hasNumPrograms
 
-        let origParamCount = fn.parameterTypes.count
+        var origParamCount = fn.parameterTypes.count
 
         if needsParamTransform {
             // Build replacement map: old SSA name → new param name
@@ -1741,41 +2632,263 @@ private func transformAirSystemValues(module: IRModule) {
         let isDeviceFunction = calledFnNames.contains(fn.name)
         guard !isDeviceFunction else { continue }
 
-        // Pass 5b: rewrite scalar (non-pointer) params to constant buffer pointers.
-        // Metal requires all kernel params to be buffers or system values. Scalar
-        // params (float, i32) from Triton are passed via setBytes which maps to
-        // addrspace(2) constant buffers. Rewrite: float %x → ptr addrspace(2) %x,
-        // and insert a load at the start of the entry block.
+        // Pass 5b: pack all scalar params into ONE device buffer.
+        // Metal has a 31-buffer argument limit. The old approach gave each scalar
+        // its own buffer slot, which exhausted the limit for kernels with many params.
+        //
+        // Scalar params come in two forms from the MLIR backend:
+        //   a) ptr addrspace(2) — MLIR already converted i32/i64 to constant buffer ptrs
+        //   b) raw scalars (float, i32, etc.) — MLIR didn't convert these
+        // Both consume one Metal buffer slot each. We pack ALL of them into ONE
+        // device buffer (ptr addrspace(1)). For form (a), we rewrite the existing
+        // loads to use the packed buffer. For form (b), we insert new loads.
+        // Dead params (from MLIR descriptor lowering) are included in the buffer
+        // layout but get no GEP/load — they just occupy space so that offsets
+        // match the Python driver's expand_signature-based packing.
         do {
-            var scalarPreamble: [IRInstruction] = []
+            // Collect scalar param indices, their types, and whether they're already ptrs
+            struct ScalarParam {
+                let origIdx: Int
+                let scalarType: IRType  // the underlying scalar type (e.g. .i32, .float32)
+                let isConstPtr: Bool    // true if param is ptr addrspace(2)
+                let isDead: Bool        // true if param has no loads (dead from MLIR DCE)
+                let paramName: String
+            }
+            var scalarParams: [ScalarParam] = []
+
+            // First pass: identify descriptor groups to infer types for dead params.
+            // Between consecutive device pointers (addrspace(1)), scalar params form
+            // a descriptor group. For no-metadata descriptors, _expand_descriptor
+            // produces: [i64×(2N), i1, i1, i32×N, i64×N] where N = ndim.
+            // N = (group_size - 2) / 4.
+            struct DescriptorGroup {
+                let startIdx: Int  // first scalar param index (after the device ptr)
+                let count: Int     // number of scalar params in this group
+            }
+            var descriptorGroups: [DescriptorGroup] = []
+            var i = 0
+            while i < origParamCount {
+                let pt = fn.parameterTypes[i]
+                let isDevicePtr: Bool
+                switch pt {
+                case .pointer(_, addressSpace: 1), .opaquePointer(addressSpace: 1):
+                    isDevicePtr = true
+                default:
+                    isDevicePtr = false
+                }
+                if isDevicePtr {
+                    // Count consecutive addrspace(2) params after this device ptr
+                    var count = 0
+                    var j = i + 1
+                    while j < origParamCount {
+                        var matched = false
+                        switch fn.parameterTypes[j] {
+                        case .pointer(_, addressSpace: 2), .opaquePointer(addressSpace: 2):
+                            matched = true
+                            count += 1; j += 1
+                        default:
+                            break
+                        }
+                        if !matched { break }
+                    }
+                    if count > 0 {
+                        descriptorGroups.append(DescriptorGroup(startIdx: i + 1, count: count))
+                    }
+                }
+                i += 1
+            }
+
+            /// Given a descriptor group of `count` scalar params, return the type
+            /// pattern matching _expand_descriptor(no metadata): [i64×(2N), i1, i1, i32×N, i64×N].
+            func descriptorTypePattern(count: Int) -> [IRType] {
+                // count = 4*N + 2 → N = (count - 2) / 4
+                guard count >= 2, (count - 2) % 4 == 0 else {
+                    // Not a recognized descriptor pattern — fall back to i64
+                    return Array(repeating: .int(bits: 64), count: count)
+                }
+                let ndim = (count - 2) / 4
+                var types: [IRType] = []
+                for _ in 0..<(2 * ndim) { types.append(.int(bits: 64)) }  // shape + strides
+                types.append(.int(bits: 1))   // padding
+                types.append(.int(bits: 1))   // tf32
+                for _ in 0..<ndim { types.append(.int(bits: 32)) }  // block_shape
+                for _ in 0..<ndim { types.append(.int(bits: 64)) }  // block_strides
+                return types
+            }
+
+            // Build lookup: param index → type from descriptor pattern (for dead params).
+            // Only apply the descriptor pattern if live params' types actually match
+            // the pattern — otherwise it's just regular scalars (e.g. M, N, K, strides)
+            // that happen to follow a device pointer.
+            var descriptorTypeForParam: [Int: IRType] = [:]
+            for group in descriptorGroups {
+                let pattern = descriptorTypePattern(count: group.count)
+                // Validate: check that live params' load types match the pattern
+                var patternValid = true
+                for offset in 0..<group.count {
+                    let paramIdx = group.startIdx + offset
+                    let paramName = fn.parameterNames[paramIdx]
+                    let liveType = inferLoadType(fn: fn, paramIdx: paramIdx, paramName: paramName)
+                    if liveType != .void {
+                        // Live param — its type must match the pattern
+                        if !typeSizesMatch(liveType, pattern[offset]) {
+                            patternValid = false
+                            break
+                        }
+                    }
+                }
+                if patternValid {
+                    for (offset, ty) in pattern.enumerated() {
+                        descriptorTypeForParam[group.startIdx + offset] = ty
+                    }
+                }
+            }
+
             for i in 0..<origParamCount {
                 let paramType = fn.parameterTypes[i]
-                let scalarType: IRType
+                let paramName = fn.parameterNames[i]
+
                 switch paramType {
-                case .float32: scalarType = .float32
-                case .i32:     scalarType = .i32
-                default: continue
+                // Form (b): raw scalar params
+                case .float32, .float64, .float16, .bfloat16,
+                     .int(bits: 1), .int(bits: 8), .int(bits: 16),
+                     .int(bits: 32), .int(bits: 64):
+                    scalarParams.append(ScalarParam(
+                        origIdx: i, scalarType: paramType,
+                        isConstPtr: false, isDead: false, paramName: paramName
+                    ))
+
+                // Form (a): ptr addrspace(2) — constant buffer pointer from MLIR
+                case .pointer(_, addressSpace: 2), .opaquePointer(addressSpace: 2):
+                    let loadType = inferLoadType(fn: fn, paramIdx: i, paramName: paramName)
+                    if loadType == .void {
+                        // Dead param — use descriptor pattern type for correct layout
+                        let deadType = descriptorTypeForParam[i] ?? .int(bits: 32)
+                        scalarParams.append(ScalarParam(
+                            origIdx: i, scalarType: deadType,
+                            isConstPtr: true, isDead: true, paramName: paramName
+                        ))
+                    } else {
+                        scalarParams.append(ScalarParam(
+                            origIdx: i, scalarType: loadType,
+                            isConstPtr: true, isDead: false, paramName: paramName
+                        ))
+                    }
+
+                default:
+                    continue  // device/TG pointers stay as-is
                 }
-                let oldName = fn.parameterNames[i]
-                let loadName = oldName.isEmpty ? "scalar_\(i)" : oldName
-                let ptrName = "\(loadName)_ptr"
-                let ptrType = IRType.pointer(pointee: scalarType, addressSpace: 2)
-                fn.parameterTypes[i] = ptrType
-                fn.parameterNames[i] = ptrName
-                let loadInst = IRInstruction(
-                    opcode: .load, type: scalarType, name: loadName,
-                    operands: [.value(IRValue(type: ptrType, name: ptrName))]
-                )
-                loadInst.attributes.alignment = 4
-                scalarPreamble.append(loadInst)
             }
-            if !scalarPreamble.isEmpty, let entryBB = fn.basicBlocks.first {
-                entryBB.instructions.insert(contentsOf: scalarPreamble, at: 0)
-                // Update fn.type and fn.parameters to match modified parameterTypes
-                fn.type = .function(ret: fn.returnType, params: fn.parameterTypes, isVarArg: false)
-                for i in 0..<fn.parameters.count {
-                    fn.parameters[i] = IRValue(type: fn.parameterTypes[i], name: fn.parameterNames[i])
+
+            if !scalarParams.isEmpty, let entryBB = fn.basicBlocks.first {
+                let scalarTypes = scalarParams.map { $0.scalarType }
+
+                // Compute byte offset for each scalar field (natural alignment)
+                var fieldOffsets: [Int] = []
+                var currentOffset = 0
+                for ty in scalarTypes {
+                    let (size, align) = scalarSizeAlign(ty)
+                    let padding = (align - (currentOffset % align)) % align
+                    currentOffset += padding
+                    fieldOffsets.append(currentOffset)
+                    currentOffset += size
                 }
+                // When MMA is present, use float as the scalar buf element type
+                // to avoid i8* typed pointers that crash GPU JIT with MMA.
+                let hasMMAForScalar = module.functions.contains { $0.name.hasPrefix("air.simdgroup_matrix_8x8_") }
+                let scalarElemType: IRType = hasMMAForScalar ? .float32 : .i8
+                let scalarElemSize: Int = hasMMAForScalar ? 4 : 1
+                let bufPtrType = IRType.pointer(pointee: scalarElemType, addressSpace: 1)
+                let bufPtrName = "_scalar_buf"
+
+                // Build preamble: GEP + load for each LIVE scalar (skip dead)
+                var preamble: [IRInstruction] = []
+                for (j, sp) in scalarParams.enumerated() {
+                    if sp.isDead { continue }  // dead params just occupy space in the buffer
+
+                    let offset = fieldOffsets[j]
+                    let baseName = sp.paramName.isEmpty ? "scalar_\(sp.origIdx)" : sp.paramName
+                    let loadName: String
+                    if sp.isConstPtr {
+                        loadName = baseName.hasSuffix("_ptr") ? String(baseName.dropLast(4)) : baseName
+                    } else {
+                        loadName = baseName
+                    }
+
+                    // GEP: index in scalarElemSize-byte units
+                    let gepIndex = Int64(offset / scalarElemSize)
+                    let gepName = "\(loadName)_gep"
+                    let gepInst = IRInstruction(
+                        opcode: .getelementptr,
+                        type: bufPtrType,
+                        name: gepName,
+                        operands: [
+                            .value(IRValue(type: bufPtrType, name: bufPtrName)),
+                            .constant(.integer(.i64, gepIndex)),
+                        ]
+                    )
+                    gepInst.attributes.inBounds = true
+                    gepInst.attributes.gepSourceType = scalarElemType
+                    preamble.append(gepInst)
+
+                    // Bitcast to typed pointer for the load (skip when MMA — types collapse to float*)
+                    let loadPtrName: String
+                    let loadPtrType: IRType
+                    if hasMMAForScalar {
+                        // No bitcast needed — GEP already produces float*, load widening handles the rest
+                        loadPtrName = gepName
+                        loadPtrType = bufPtrType
+                    } else {
+                        loadPtrType = IRType.pointer(pointee: sp.scalarType, addressSpace: 1)
+                        let castName = "\(loadName)_bcp"
+                        let castInst = IRInstruction(
+                            opcode: .bitcast,
+                            type: loadPtrType,
+                            name: castName,
+                            operands: [.value(IRValue(type: bufPtrType, name: gepName))]
+                        )
+                        preamble.append(castInst)
+                        loadPtrName = castName
+                    }
+
+                    if sp.isConstPtr {
+                        // Form (a): rewrite existing loads from this param to use new pointer.
+                        let oldParamName = sp.paramName
+                        for bb in fn.basicBlocks {
+                            for inst in bb.instructions where inst.opcode == .load {
+                                if let op = inst.operands.first, case .value(let v) = op,
+                                   v.name == oldParamName {
+                                    inst.operands[0] = .value(IRValue(type: loadPtrType, name: loadPtrName))
+                                }
+                            }
+                        }
+                    } else {
+                        // Form (b): insert new load instruction
+                        let loadInst = IRInstruction(
+                            opcode: .load, type: sp.scalarType, name: loadName,
+                            operands: [.value(IRValue(type: loadPtrType, name: loadPtrName))]
+                        )
+                        let (_, align) = scalarSizeAlign(sp.scalarType)
+                        loadInst.attributes.alignment = align
+                        preamble.append(loadInst)
+                    }
+                }
+
+                // Remove ALL scalar params (live + dead), add single packed buffer param
+                let allScalarIndices = scalarParams.map { $0.origIdx }
+                for i in allScalarIndices.sorted().reversed() {
+                    fn.parameterTypes.remove(at: i)
+                    fn.parameterNames.remove(at: i)
+                    fn.parameters.remove(at: i)
+                }
+                let remainingOrigCount = origParamCount - allScalarIndices.count
+                fn.parameterTypes.insert(bufPtrType, at: remainingOrigCount)
+                fn.parameterNames.insert(bufPtrName, at: remainingOrigCount)
+                fn.parameters.insert(IRValue(type: bufPtrType, name: bufPtrName), at: remainingOrigCount)
+                origParamCount = remainingOrigCount + 1
+
+                entryBB.instructions.insert(contentsOf: preamble, at: 0)
+                fn.type = .function(ret: fn.returnType, params: fn.parameterTypes, isVarArg: false)
             }
         }
 
@@ -1923,6 +3036,290 @@ private func transformAirSystemValues(module: IRModule) {
 }
 
 // MARK: - Helpers
+
+/// Infer the scalar type loaded from a ptr addrspace(2) parameter.
+/// Scans the function for `load T, ptr addrspace(2) %paramName` and returns T.
+/// Returns .void if no load is found (dead parameter).
+private func inferLoadType(fn: IRFunction, paramIdx: Int, paramName: String) -> IRType {
+    for bb in fn.basicBlocks {
+        for inst in bb.instructions where inst.opcode == .load {
+            if let op = inst.operands.first, case .value(let v) = op,
+               v.name == paramName {
+                return inst.type
+            }
+        }
+    }
+    return .void  // dead param — no loads found
+}
+
+/// Check if two scalar types have the same byte size (for descriptor pattern validation).
+private func typeSizesMatch(_ a: IRType, _ b: IRType) -> Bool {
+    return scalarSizeAlign(a).0 == scalarSizeAlign(b).0
+}
+
+/// Returns (size, alignment) in bytes for scalar types in packed buffer layout.
+private func scalarSizeAlign(_ t: IRType) -> (Int, Int) {
+    switch t {
+    case .i1, .int(bits: 1):   return (1, 1)
+    case .i8, .int(bits: 8):   return (1, 1)
+    case .i16, .int(bits: 16): return (2, 2)
+    case .i32, .int(bits: 32): return (4, 4)
+    case .i64, .int(bits: 64): return (8, 8)
+    case .float16:             return (2, 2)
+    case .bfloat16:            return (2, 2)
+    case .float32:             return (4, 4)
+    case .float64:             return (8, 8)
+    default:                   return (4, 4) // fallback
+    }
+}
+
+// MARK: - Transform: Force float* for all device pointers when MMA is present
+//
+// The Metal GPU JIT crashes when non-float typed pointers (half*, i32*, i8*)
+// coexist with MMA intrinsics in the same module. This pass runs last and
+// forces all device pointer types to float*.
+
+// MARK: - Transform: Widen device loads for MMA compatibility
+
+/// When MMA intrinsics are present, ALL device loads must be `load float`.
+/// GPU JIT crashes on `load half`/`load i32`/etc from device ptr with MMA.
+/// This pass runs LAST so it catches loads created by earlier passes (e.g. scalar buffer packing).
+private func transformWidenDeviceLoads(module: IRModule) {
+    let hasMMADecl = module.functions.contains { $0.name.hasPrefix("air.simdgroup_matrix_8x8_") }
+    guard hasMMADecl else { return }
+
+    for fn in module.functions where !fn.isDeclaration {
+        // Build map of GEP names that were half-scaled (lshr) → original index name + type.
+        // We find the lshr instruction (%<gep>_hidx) and get its first operand as the
+        // current name of the original index (may have been renamed by later passes).
+        var halfScaledGEPs: [String: (origIdxName: String, idxType: IRType)] = [:]
+        // First, build map of lshr name → first operand (the original index)
+        var lshrOrigIdx: [String: (name: String, type: IRType)] = [:]
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .lshr {
+                if inst.name.hasSuffix("_hidx"),
+                   inst.operands.count >= 1,
+                   case .value(let origVal) = inst.operands[0] {
+                    lshrOrigIdx[inst.name] = (name: origVal.name, type: origVal.type)
+                }
+            }
+        }
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .getelementptr {
+                if inst.attributes.gepHalfScaledOrigIdx != nil {
+                    // Find the lshr that feeds this GEP's index
+                    let lshrName = "\(inst.name)_hidx"
+                    if let origInfo = lshrOrigIdx[lshrName] {
+                        halfScaledGEPs[inst.name] = (origIdxName: origInfo.name, idxType: origInfo.type)
+                    }
+                }
+            }
+        }
+        // Propagate through phi, inttoptr, ptrtoint, bitcast — any instruction that
+        // passes a half-scaled pointer through to a new name
+        var changed = true
+        while changed {
+            changed = false
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    if halfScaledGEPs[inst.name] != nil { continue }
+                    switch inst.opcode {
+                    case .phi, .intToPtr, .bitcast:
+                        for op in inst.operands {
+                            if case .value(let v) = op, let info = halfScaledGEPs[v.name] {
+                                halfScaledGEPs[inst.name] = info
+                                changed = true
+                                break
+                            }
+                        }
+                    case .ptrToInt:
+                        if let op = inst.operands.first,
+                           case .value(let v) = op,
+                           let info = halfScaledGEPs[v.name] {
+                            halfScaledGEPs[inst.name] = info
+                            changed = true
+                        }
+                    default: break
+                    }
+                }
+            }
+        }
+
+
+
+        var widenedLoads: [String: (castName: String, origType: IRType)] = [:]
+        for bb in fn.basicBlocks {
+            var newInsts: [IRInstruction] = []
+            for inst in bb.instructions {
+                if inst.opcode == .load,
+                   inst.type != .float32,
+                   inst.operands.count >= 1,
+                   case .value(let ptrVal) = inst.operands[0],
+                   ({
+                       switch ptrVal.type {
+                       case .pointer(_, 1), .opaquePointer(1): return true
+                       default: return false
+                       }
+                   }()) {
+                    let origType = inst.type
+                    let castName = "\(inst.name)_wcast"
+                    // Check if this load's pointer came from a half-scaled GEP
+                    if (origType == .float16 || origType == .bfloat16),
+                       let halfInfo = halfScaledGEPs[ptrVal.name] {
+                        // Load-and-extract pattern:
+                        // %f = load float, float* %gep        (load 4 bytes = 2 halves)
+                        // %v2 = bitcast float %f to <2 x half>
+                        // %bit = and i32 %origIdx, 1           (odd/even selector)
+                        // %val = extractelement <2 x half> %v2, i32 %bit
+                        inst.type = .float32
+                        newInsts.append(inst)
+
+                        let v2Type = IRType.vector(element: origType, count: 2)
+                        let bcName = "\(inst.name)_v2h"
+                        let bcInst = IRInstruction(
+                            opcode: .bitcast, type: v2Type, name: bcName,
+                            operands: [.value(IRValue(type: .float32, name: inst.name))])
+                        newInsts.append(bcInst)
+
+                        let andName = "\(inst.name)_lane"
+                        let andInst = IRInstruction(
+                            opcode: .and, type: halfInfo.idxType, name: andName,
+                            operands: [
+                                .value(IRValue(type: halfInfo.idxType, name: halfInfo.origIdxName)),
+                                .constant(.integer(halfInfo.idxType, 1))
+                            ])
+                        newInsts.append(andInst)
+
+                        let extractInst = IRInstruction(
+                            opcode: .extractElement, type: origType, name: castName,
+                            operands: [
+                                .value(IRValue(type: v2Type, name: bcName)),
+                                .value(IRValue(type: halfInfo.idxType, name: andName))
+                            ])
+                        newInsts.append(extractInst)
+                        widenedLoads[inst.name] = (castName, origType)
+                        continue
+                    }
+
+                    inst.type = .float32
+                    newInsts.append(inst)
+                    let castOpcode: IRInstruction.Opcode
+                    switch origType {
+                    case .float16, .bfloat16: castOpcode = .fpTrunc
+                    case .int(let bits) where bits == 32: castOpcode = .bitcast
+                    case .int(let bits) where bits < 32:
+                        let bcName = "\(inst.name)_bc"
+                        let bcInst = IRInstruction(
+                            opcode: .bitcast, type: .int(bits: 32), name: bcName,
+                            operands: [.value(IRValue(type: .float32, name: inst.name))])
+                        newInsts.append(bcInst)
+                        let truncInst = IRInstruction(
+                            opcode: .trunc, type: origType, name: castName,
+                            operands: [.value(IRValue(type: .int(bits: 32), name: bcName))])
+                        newInsts.append(truncInst)
+                        widenedLoads[inst.name] = (castName, origType)
+                        continue
+                    default:
+                        inst.type = origType
+                        newInsts.append(inst)
+                        continue
+                    }
+                    let castInst = IRInstruction(
+                        opcode: castOpcode, type: origType, name: castName,
+                        operands: [.value(IRValue(type: .float32, name: inst.name))])
+                    newInsts.append(castInst)
+                    widenedLoads[inst.name] = (castName, origType)
+                    continue
+                }
+                newInsts.append(inst)
+            }
+            bb.instructions = newInsts
+        }
+        if !widenedLoads.isEmpty {
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    if widenedLoads[inst.name] != nil && inst.opcode == .load { continue }
+                    if inst.name.hasSuffix("_wcast") || inst.name.hasSuffix("_bc")
+                        || inst.name.hasSuffix("_v2h") || inst.name.hasSuffix("_lane") { continue }
+                    for j in inst.operands.indices {
+                        if case .value(let v) = inst.operands[j],
+                           let entry = widenedLoads[v.name] {
+                            inst.operands[j] = .value(IRValue(type: entry.origType, name: entry.castName))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Eliminate device pointer bitcasts that become identity after type table collapse.
+    // e.g. bitcast i32* %x → i8* becomes bitcast float* → float* (identity) which is invalid.
+    let floatDevPtr = IRType.pointer(pointee: .float32, addressSpace: 1)
+    for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            var renames: [String: String] = [:] // old name → replacement name
+            bb.instructions.removeAll { inst in
+                if inst.opcode == .bitcast,
+                   case .pointer(_, 1) = inst.type,
+                   inst.operands.count == 1,
+                   case .value(let src) = inst.operands[0],
+                   case .pointer(_, 1) = src.type {
+                    // Both source and dest are device pointers — will collapse to same float*
+                    renames[inst.name] = src.name
+                    return true
+                }
+                if inst.opcode == .bitcast,
+                   case .opaquePointer(1) = inst.type,
+                   inst.operands.count == 1,
+                   case .value(let src) = inst.operands[0],
+                   case .pointer(_, 1) = src.type {
+                    renames[inst.name] = src.name
+                    return true
+                }
+                if inst.opcode == .bitcast,
+                   case .pointer(_, 1) = inst.type,
+                   inst.operands.count == 1,
+                   case .value(let src) = inst.operands[0],
+                   case .opaquePointer(1) = src.type {
+                    renames[inst.name] = src.name
+                    return true
+                }
+                return false
+            }
+            if !renames.isEmpty {
+                for inst in bb.instructions {
+                    for j in inst.operands.indices {
+                        if case .value(let v) = inst.operands[j],
+                           let replacement = renames[v.name] {
+                            inst.operands[j] = .value(IRValue(type: floatDevPtr, name: replacement))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Try to scale a GEP index from `elemSize`-byte elements to float (4-byte) elements.
+/// Returns the new operand if scaling is possible, nil otherwise.
+private func scaleGepIndexToFloat(_ op: IRInstruction.Operand, elemSize: Int) -> IRInstruction.Operand? {
+    if elemSize == 4 { return op }
+    switch op {
+    case .intLiteral(let val):
+        let byteOffset = val * Int64(elemSize)
+        guard byteOffset % 4 == 0 else { return nil }
+        return .intLiteral(byteOffset / 4)
+    case .constant(let c):
+        if case .integer(let cTy, let val) = c {
+            let byteOffset = val * Int64(elemSize)
+            guard byteOffset % 4 == 0 else { return nil }
+            return .constant(.integer(cTy, byteOffset / 4))
+        }
+        return nil
+    default:
+        return nil
+    }
+}
 
 private func isDeviceBufferType(_ t: IRType) -> Bool {
     switch t {

@@ -154,6 +154,10 @@ public final class IRInstruction {
         /// For GEP: source element type
         public var gepSourceType: IRType? = nil
 
+        /// For GEP: original index name before lshr scaling (half→float).
+        /// Used by transformWidenDeviceLoads to emit extractelement for correct half selection.
+        public var gepHalfScaledOrigIdx: String? = nil
+
         /// For atomicrmw: operation kind (add, xchg, max, min, and, or, xor)
         public var atomicOp: String? = nil
 

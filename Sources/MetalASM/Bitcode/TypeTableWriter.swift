@@ -30,6 +30,10 @@ final class TypeTableWriter {
     /// Set by BitcodeWriter when MMA intrinsics are detected.
     static var emitOpaqueAsTyped = false
 
+    /// When true, collapse ALL device (addrspace 1) typed pointers to float*.
+    /// Set when MMA intrinsics are present — GPU JIT crashes on non-float device ptrs with MMA.
+    static var collapseDevicePtrsToFloat = false
+
     /// TYPE_BLOCK ID.
     static let blockID: UInt64 = 17
 
@@ -91,8 +95,11 @@ final class TypeTableWriter {
 
         case .pointer(let pointee, let addrSpace):
             // Typed pointer (legacy AIR style) → POINTER: [pointee_type_id, address_space]
+            // When MMA present, force device ptrs to float* (GPU JIT constraint)
+            let effectivePointee = (collapseDevicePtrsToFloat && addrSpace == 1 && pointee != .float32)
+                ? IRType.float32 : pointee
             writer.emitUnabbrevRecord(code: pointerCode, operands: [
-                UInt64(enumerator.typeIndex(pointee)),
+                UInt64(enumerator.typeIndex(effectivePointee)),
                 UInt64(addrSpace)
             ])
 

@@ -11,6 +11,7 @@ final class FunctionWriter {
     static let declareBlocksCode: UInt64 = 1
     static let instBinopCode: UInt64 = 2
     static let instCastCode: UInt64 = 3
+    static let instUnopCode: UInt64 = 77  // FUNC_CODE_INST_UNOP (fneg)
     static let instGEPOldCode: UInt64 = 4
     static let instSelectCode: UInt64 = 5
     static let instExtractEltCode: UInt64 = 6
@@ -613,6 +614,14 @@ final class FunctionWriter {
                     relativeID(valID),
                     UInt64(enumerator.typeIndex(inst.type)),
                     UInt64(castOpcode(inst.opcode))])
+            }
+
+        case .fneg:
+            // FUNC_CODE_INST_UNOP (77): [val_relID, unop_opcode(=0 for fneg), fast-math-flags]
+            if inst.operands.count >= 1 {
+                let val = resolveOperand(inst.operands[0])
+                writer.emitUnabbrevRecord(code: Self.instUnopCode,
+                    operands: [relativeID(val), 0, 0])
             }
 
         case .add, .fadd, .sub, .fsub, .mul, .fmul, .udiv, .sdiv, .fdiv,
