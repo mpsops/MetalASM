@@ -893,9 +893,27 @@ private func transformTGStoreBarrierInsert(module: IRModule) {
             }
         }
 
+        // Collect blocks that are targets of conditional branches (not all threads reach them).
+        // Inserting barriers in these blocks causes barrier divergence (GPU hang/corruption).
+        var conditionalTargetBlocks = Set<String>()
+        for bb in fn.basicBlocks {
+            guard let last = bb.instructions.last, last.opcode == .br,
+                  last.operands.count >= 3 else { continue }
+            // Conditional branch: operands = [cond, trueBlock, falseBlock]
+            if case .basicBlock(let trueBB) = last.operands[1] {
+                conditionalTargetBlocks.insert(trueBB.name)
+            }
+            if case .basicBlock(let falseBB) = last.operands[2] {
+                conditionalTargetBlocks.insert(falseBB.name)
+            }
+        }
+
         // Strategy 1: For TG stores in straight-line code (no conditional branch),
         // insert barrier before the store in the same block.
+        // Skip blocks that are conditional branch targets — those are handled by
+        // Strategy 2 (barrier in the join block where all threads converge).
         for bb in fn.basicBlocks where tgStoreBlockNames.contains(bb.name) {
+            guard !conditionalTargetBlocks.contains(bb.name) else { continue }
             var i = 0
             while i < bb.instructions.count {
                 let inst = bb.instructions[i]
@@ -905,16 +923,8 @@ private func transformTGStoreBarrierInsert(module: IRModule) {
                 }
                 // Check if preceded by a barrier
                 if i == 0 || !isBarrierCall(bb.instructions[i - 1]) {
-                    // Only insert if this block is NOT reached via a conditional branch
-                    // from another block (those are handled by Strategy 2 below).
-                    // A block reached via conditional branch typically has a single
-                    // unconditional branch as its terminator (back to join block).
-                    let isConditionalTarget = bb.instructions.last.map { $0.opcode == .br && $0.operands.count == 1 } ?? false
-                    let blockHasOnlyStoreAndBranch = bb.instructions.count <= 3
-                    if !(isConditionalTarget && blockHasOnlyStoreAndBranch) {
-                        bb.instructions.insert(makeBarrierCall(module: module), at: i)
-                        i += 1
-                    }
+                    bb.instructions.insert(makeBarrierCall(module: module), at: i)
+                    i += 1
                 }
                 i += 1
             }
@@ -1545,7 +1555,7 @@ private func transformInferOpaquePointerTypes(module: IRModule) {
             var halfParamIndices: [String: Int] = [:]
             for i in fn.parameterTypes.indices {
                 if case .pointer(let pointee, 1) = fn.parameterTypes[i],
-                   pointee == .float16 {
+                   pointee == .float16 || pointee == .bfloat16 {
                     halfParamIndices[fn.parameters[i].name] = i
                 }
             }
@@ -1597,15 +1607,13 @@ private func transformInferOpaquePointerTypes(module: IRModule) {
                 }
             }
 
-            // Step 2: Convert params that feed loads OR have no direct load/store uses
-            // (ambiguous params like phi-only chains need conversion for MMA compatibility).
-            // Only SKIP conversion for params that EXCLUSIVELY feed stores (output buffers).
+            // Step 2: Convert ALL half* device params to float*.
+            // GPU JIT crashes on ANY half* device pointer (loads AND stores) when MMA is present.
             var changed = false
             var convertedParams: Set<String> = []
             for i in fn.parameterTypes.indices {
                 if case .pointer(let pointee, 1) = fn.parameterTypes[i],
-                   pointee == .float16,
-                   !paramFeedsStore.contains(i) || paramFeedsLoad.contains(i) {
+                   pointee == .float16 || pointee == .bfloat16 {
                     fn.parameterTypes[i] = .pointer(pointee: .float32, addressSpace: 1)
                     fn.parameters[i].type = fn.parameterTypes[i]
                     convertedParams.insert(fn.parameters[i].name)
@@ -1624,7 +1632,7 @@ private func transformInferOpaquePointerTypes(module: IRModule) {
                 changed2 = false
                 for bb in fn.basicBlocks {
                     for inst in bb.instructions {
-                        guard case .pointer(let pointee, 1) = inst.type, pointee == .float16,
+                        guard case .pointer(let pointee, 1) = inst.type, pointee == .float16 || pointee == .bfloat16,
                               !convertedValues.contains(inst.name) else { continue }
                         // Check if any operand is a converted pointer
                         let basesConverted = inst.operands.contains { op in
@@ -1641,14 +1649,14 @@ private func transformInferOpaquePointerTypes(module: IRModule) {
 
             for bb in fn.basicBlocks {
                 for inst in bb.instructions {
-                    if case .pointer(let pointee, 1) = inst.type, pointee == .float16,
+                    if case .pointer(let pointee, 1) = inst.type, (pointee == .float16 || pointee == .bfloat16),
                        convertedValues.contains(inst.name) {
                         inst.type = .pointer(pointee: .float32, addressSpace: 1)
                         changed = true
                     }
                     for j in inst.operands.indices {
                         if case .value(let v) = inst.operands[j],
-                           case .pointer(let pointee, 1) = v.type, pointee == .float16,
+                           case .pointer(let pointee, 1) = v.type, (pointee == .float16 || pointee == .bfloat16),
                            convertedValues.contains(v.name) {
                             inst.operands[j] = .value(IRValue(type: .pointer(pointee: .float32, addressSpace: 1), name: v.name))
                             changed = true
@@ -1664,7 +1672,7 @@ private func transformInferOpaquePointerTypes(module: IRModule) {
             for bb in fn.basicBlocks {
                 for inst in bb.instructions where inst.opcode == .getelementptr {
                     if case .pointer(_, 1) = inst.type,
-                       let srcTy = inst.attributes.gepSourceType, srcTy == .float16,
+                       let srcTy = inst.attributes.gepSourceType, (srcTy == .float16 || srcTy == .bfloat16),
                        convertedValues.contains(inst.name) {
                         inst.attributes.gepSourceType = .float32
                         inst.type = .pointer(pointee: .float32, addressSpace: 1)
@@ -3706,7 +3714,69 @@ private func transformWidenDeviceLoads(module: IRModule) {
             }
         }
 
+        // Convert intToPtr results from non-float device ptrs to float*.
+        // Scalar buffer expansion creates intToPtr with half*/i8* result types.
+        // intToPtr computes addresses via integer arithmetic (no stride issue).
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .intToPtr {
+                if case .pointer(let pointee, 1) = inst.type, pointee != .float32 {
+                    inst.type = .pointer(pointee: .float32, addressSpace: 1)
+                }
+            }
+        }
 
+        // Convert remaining non-float32 device GEPs to float GEPs.
+        // transformMMATypedPtrs handles half→float for params and their GEP chains,
+        // but scalar-buffer-expanded pointers (intToPtr → GEP) and phi-expanded
+        // pointers can create new half-srcTy GEPs after that pass runs.
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .getelementptr {
+                guard let srcTy = inst.attributes.gepSourceType else { continue }
+                let elemSize: Int
+                switch srcTy {
+                case .float16, .bfloat16: elemSize = 2
+                case .i8, .int(bits: 8): elemSize = 1
+                default: continue
+                }
+                // Only device pointers (addrspace 1)
+                guard ({ switch inst.type { case .pointer(_, 1), .opaquePointer(1): return true; default: return false } }()) else { continue }
+
+                // Update base operand type if it's still non-float
+                if case .value(let baseVal) = inst.operands[0],
+                   case .pointer(let bp, 1) = baseVal.type, bp != .float32 {
+                    inst.operands[0] = .value(IRValue(type: .pointer(pointee: .float32, addressSpace: 1), name: baseVal.name))
+                }
+
+                inst.attributes.gepSourceType = .float32
+                if case .pointer(_, let a) = inst.type {
+                    inst.type = .pointer(pointee: .float32, addressSpace: a)
+                }
+
+                guard inst.operands.count >= 2 else { continue }
+
+                // Constant index: scale by elemSize/4
+                if case .constant(.integer(let ty, let val)) = inst.operands[1] {
+                    let byteOffset = val * Int64(elemSize)
+                    inst.operands[1] = .constant(.integer(ty, byteOffset / 4))
+                }
+                // Variable index (half/bf16 only): insert lshr to halve
+                else if elemSize == 2, case .value(let idxVal) = inst.operands[1] {
+                    let scaledName = "\(inst.name)_hidx2"
+                    let scaledInst = IRInstruction(
+                        opcode: .lshr, type: idxVal.type, name: scaledName,
+                        operands: [
+                            .value(idxVal),
+                            .constant(.integer(idxVal.type, 1))
+                        ])
+                    if let bbRef = fn.basicBlocks.first(where: { $0.instructions.contains(where: { $0 === inst }) }),
+                       let idx = bbRef.instructions.firstIndex(where: { $0 === inst }) {
+                        bbRef.instructions.insert(scaledInst, at: idx)
+                    }
+                    inst.operands[1] = .value(IRValue(type: idxVal.type, name: scaledName))
+                    inst.attributes.gepHalfScaledOrigIdx = idxVal.name
+                }
+            }
+        }
 
         var widenedLoads: [String: (castName: String, origType: IRType)] = [:]
         for bb in fn.basicBlocks {
@@ -3820,89 +3890,102 @@ private func transformWidenDeviceLoads(module: IRModule) {
                 }
             }
         }
-    }
 
-    // Fix store type mismatches for device pointers after MMA half→float conversion.
-    // Half-scaled GEPs (index÷2, float32 stride) have the wrong address for half stores —
-    // two consecutive halves map to the same float32 address, so storing a single half
-    // at the float32-aligned address overwrites the wrong lane.
-    // Fix: create a new GEP with the ORIGINAL (un-halved) index and half* source type.
-    for fn in module.functions where !fn.isDeclaration {
-        // Build map: half-scaled GEP name → (base ptr operand, original index operand)
-        struct HalfGEPInfo {
-            let baseName: String
-            let baseType: IRType
-            let origIdxName: String
-            let origIdxType: IRType
-        }
-        var halfGEPMap: [String: HalfGEPInfo] = [:]
-        for bb in fn.basicBlocks {
-            for inst in bb.instructions where inst.opcode == .getelementptr {
-                if let origIdx = inst.attributes.gepHalfScaledOrigIdx,
-                   inst.operands.count >= 2,
-                   case .value(let baseVal) = inst.operands[0] {
-                    // Find the lshr instruction to get original index type
-                    let lshrName = "\(inst.name)_hidx"
-                    var idxType: IRType = .int(bits: 32)
-                    for bb2 in fn.basicBlocks {
-                        for inst2 in bb2.instructions where inst2.name == lshrName {
-                            if case .value(let v) = inst2.operands[0] {
-                                idxType = v.type
-                            }
-                        }
-                    }
-                    halfGEPMap[inst.name] = HalfGEPInfo(
-                        baseName: baseVal.name, baseType: baseVal.type,
-                        origIdxName: origIdx, origIdxType: idxType
-                    )
-                }
-            }
-        }
-
+        // Widen half/bfloat device stores to float stores (MMA requires store float only).
+        // For stores through half-scaled GEPs: load float (packed pair) → insertelement → store float.
+        // For stores through non-scaled GEPs: fpext to float and store.
         for bb in fn.basicBlocks {
             var newInsts: [IRInstruction] = []
             for inst in bb.instructions {
-                if inst.opcode == .store, inst.operands.count >= 2,
-                   case .value(let val) = inst.operands[0],
-                   case .value(let ptr) = inst.operands[1],
-                   case .pointer(let pointee, let addrSpace) = ptr.type,
-                   addrSpace == 1,
-                   pointee != val.type {
-                    // Check if the store pointer is a half-scaled GEP
-                    if let info = halfGEPMap[ptr.name] {
-                        // Bitcast base param (float32*) back to half*, then GEP with original index.
-                        // Metal typed pointers require GEP source type == pointer pointee type.
-                        let halfPtrTy = IRType.pointer(pointee: val.type, addressSpace: addrSpace)
-                        let bcBaseName = "\(ptr.name)_stbase"
-                        let bcBase = IRInstruction(
-                            opcode: .bitcast, type: halfPtrTy, name: bcBaseName,
-                            operands: [.value(IRValue(type: info.baseType, name: info.baseName))])
-                        newInsts.append(bcBase)
-                        let stGepName = "\(ptr.name)_stgep"
-                        let stGep = IRInstruction(
-                            opcode: .getelementptr, type: halfPtrTy, name: stGepName,
-                            operands: [
-                                .value(IRValue(type: halfPtrTy, name: bcBaseName)),
-                                .value(IRValue(type: info.origIdxType, name: info.origIdxName))
-                            ])
-                        stGep.attributes.gepSourceType = val.type
-                        newInsts.append(stGep)
-                        inst.operands[1] = .value(IRValue(type: halfPtrTy, name: stGepName))
-                    } else {
-                        // Non-half-scaled GEP: simple bitcast (address is correct)
-                        let bcName = "\(ptr.name)_stbc"
-                        let bcType = IRType.pointer(pointee: val.type, addressSpace: addrSpace)
-                        let bc = IRInstruction(opcode: .bitcast, type: bcType, name: bcName,
-                                               operands: [.value(ptr)])
-                        newInsts.append(bc)
-                        inst.operands[1] = .value(IRValue(type: bcType, name: bcName))
-                    }
+                guard inst.opcode == .store, inst.operands.count >= 2,
+                      case .value(let val) = inst.operands[0],
+                      (val.type == .float16 || val.type == .bfloat16),
+                      case .value(let ptr) = inst.operands[1],
+                      ({ switch ptr.type { case .pointer(_, 1), .opaquePointer(1): return true; default: return false } }())
+                else {
+                    newInsts.append(inst)
+                    continue
                 }
-                newInsts.append(inst)
+
+                let halfType = val.type // .float16 or .bfloat16
+                let v2Type = IRType.vector(element: halfType, count: 2)
+                let prefix = "\(inst.name.isEmpty ? ptr.name : inst.name)_ws\(newInsts.count)"
+
+                if let halfInfo = halfScaledGEPs[ptr.name] {
+                    // Half-scaled GEP: float address holds 2 packed halves.
+                    // Load float → bitcast <2 x half> → insertelement → bitcast float → store float.
+                    let ldName = "\(prefix)_ld"
+                    let ldInst = IRInstruction(
+                        opcode: .load, type: .float32, name: ldName,
+                        operands: [.value(IRValue(type: .pointer(pointee: .float32, addressSpace: 1), name: ptr.name))])
+                    newInsts.append(ldInst)
+
+                    let v2Name = "\(prefix)_v2"
+                    let v2Inst = IRInstruction(
+                        opcode: .bitcast, type: v2Type, name: v2Name,
+                        operands: [.value(IRValue(type: .float32, name: ldName))])
+                    newInsts.append(v2Inst)
+
+                    let laneName = "\(prefix)_lane"
+                    let laneInst = IRInstruction(
+                        opcode: .and, type: halfInfo.idxType, name: laneName,
+                        operands: [
+                            .value(IRValue(type: halfInfo.idxType, name: halfInfo.origIdxName)),
+                            .constant(.integer(halfInfo.idxType, 1))
+                        ])
+                    newInsts.append(laneInst)
+
+                    let insName = "\(prefix)_ins"
+                    let insInst = IRInstruction(
+                        opcode: .insertElement, type: v2Type, name: insName,
+                        operands: [
+                            .value(IRValue(type: v2Type, name: v2Name)),
+                            .value(IRValue(type: halfType, name: val.name)),
+                            .value(IRValue(type: halfInfo.idxType, name: laneName))
+                        ])
+                    newInsts.append(insInst)
+
+                    let packName = "\(prefix)_pack"
+                    let packInst = IRInstruction(
+                        opcode: .bitcast, type: .float32, name: packName,
+                        operands: [.value(IRValue(type: v2Type, name: insName))])
+                    newInsts.append(packInst)
+
+                    let storeInst = IRInstruction(
+                        opcode: .store, type: .void, name: "",
+                        operands: [
+                            .value(IRValue(type: .float32, name: packName)),
+                            .value(IRValue(type: .pointer(pointee: .float32, addressSpace: 1), name: ptr.name))
+                        ])
+                    storeInst.attributes.alignment = 4
+                    newInsts.append(storeInst)
+                } else {
+                    // Non-scaled GEP: simple fpext to float and store.
+                    let extName = "\(prefix)_ext"
+                    let extInst = IRInstruction(
+                        opcode: .fpExt, type: .float32, name: extName,
+                        operands: [.value(IRValue(type: halfType, name: val.name))])
+                    newInsts.append(extInst)
+
+                    let storeInst = IRInstruction(
+                        opcode: .store, type: .void, name: "",
+                        operands: [
+                            .value(IRValue(type: .float32, name: extName)),
+                            .value(IRValue(type: .pointer(pointee: .float32, addressSpace: 1), name: ptr.name))
+                        ])
+                    storeInst.attributes.alignment = 4
+                    newInsts.append(storeInst)
+                }
             }
             bb.instructions = newInsts
         }
     }
+
+    // Enable type-table-level collapse as a safety net: any half*/i8* device pointers
+    // that leak through (e.g. from store bitcasts above) will be collapsed to float* in
+    // the bitcode type table. The IR keeps half* for correct store byte-addressing, but
+    // the GPU JIT only sees float* device pointers.
+    TypeTableWriter.collapseDevicePtrsToFloat = true
 
     // Eliminate device pointer bitcasts that become identity after type table collapse.
     // e.g. bitcast i32* %x → i8* becomes bitcast float* → float* (identity) which is invalid.

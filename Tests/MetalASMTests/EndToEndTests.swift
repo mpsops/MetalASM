@@ -2727,7 +2727,9 @@ extension EndToEndTests {
         #if !canImport(Metal)
         throw XCTSkip("Metal not available")
         #else
-        // Part 1: PSO creation (tests bitcast zeroinitializer + MMA + half ptrs)
+        // Part 1: PSO creation (tests bitcast zeroinitializer + MMA + half load + float store)
+        // Real Triton MMA kernels load half inputs but always store float outputs.
+        // GPU JIT crashes on `store half` + MMA declarations, so output is float.
         let mmaIR = """
         source_filename = "LLVMDialectModule"
 
@@ -2760,8 +2762,10 @@ extension EndToEndTests {
             <64 x float> %mma_c, ptr addrspace(3) %mma_base,
             <2 x i64> <i64 64, i64 8>, <2 x i64> <i64 1, i64 64>, <2 x i64> zeroinitializer)
 
-          %out_gep = getelementptr half, ptr addrspace(1) %2, i32 %a_idx
-          store half %a_val, ptr addrspace(1) %out_gep, align 2
+          ; Store widened float output (real MMA kernels accumulate in float)
+          %a_f32 = fpext half %a_val to float
+          %out_gep = getelementptr float, ptr addrspace(1) %2, i32 %a_idx
+          store float %a_f32, ptr addrspace(1) %out_gep, align 4
           ret void
         }
 
@@ -2775,14 +2779,12 @@ extension EndToEndTests {
         let mmaPso = try device.makeComputePipelineState(function: mmaFn)
         XCTAssertGreaterThan(mmaPso.maxTotalThreadsPerThreadgroup, 0)
 
-        // Part 2: Correctness — half load from A, half store to C (store-only ptr).
-        // Verifies index addressing is correct for both load (float*) and store (half*) paths.
+        // Part 2: Correctness — half load from A, half store to C.
+        // No MMA declarations — half store to device is fine without MMA.
+        // Verifies index addressing is correct for half→half copy.
         let copyIR = """
         source_filename = "LLVMDialectModule"
 
-        @__tg_dot_ab_0 = internal addrspace(3) global [64 x float] undef, align 4
-
-        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
         declare [3 x i32] @air.thread_position_in_threadgroup()
 
         define void @copy_kernel(ptr addrspace(1) %0, ptr addrspace(1) %1) {
