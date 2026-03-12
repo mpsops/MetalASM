@@ -3653,15 +3653,16 @@ private func transformWidenDeviceLoads(module: IRModule) {
     guard hasMMADecl else { return }
 
     for fn in module.functions where !fn.isDeclaration {
-        // Build map of GEP names that were half-scaled (lshr) → original index name + type.
-        // We find the lshr instruction (%<gep>_hidx) and get its first operand as the
-        // current name of the original index (may have been renamed by later passes).
-        var halfScaledGEPs: [String: (origIdxName: String, idxType: IRType)] = [:]
+        // Build map of GEP names that were half-scaled (lshr) → original index names + types.
+        // For chained GEPs (e.g. gep half base %44 → gep half result %161), we track ALL
+        // original indices in the chain so the store widening can compute the correct lane
+        // as (idx1 + idx2 + ...) & 1 instead of just the innermost index.
+        var halfScaledGEPs: [String: [(origIdxName: String, idxType: IRType)]] = [:]
         // First, build map of lshr name → first operand (the original index)
         var lshrOrigIdx: [String: (name: String, type: IRType)] = [:]
         for bb in fn.basicBlocks {
             for inst in bb.instructions where inst.opcode == .lshr {
-                if inst.name.hasSuffix("_hidx"),
+                if inst.name.hasSuffix("_hidx") || inst.name.hasSuffix("_hidx2"),
                    inst.operands.count >= 1,
                    case .value(let origVal) = inst.operands[0] {
                     lshrOrigIdx[inst.name] = (name: origVal.name, type: origVal.type)
@@ -3673,14 +3674,23 @@ private func transformWidenDeviceLoads(module: IRModule) {
                 if inst.attributes.gepHalfScaledOrigIdx != nil {
                     // Find the lshr that feeds this GEP's index
                     let lshrName = "\(inst.name)_hidx"
-                    if let origInfo = lshrOrigIdx[lshrName] {
-                        halfScaledGEPs[inst.name] = (origIdxName: origInfo.name, idxType: origInfo.type)
+                    let lshrName2 = "\(inst.name)_hidx2"
+                    let origInfo = lshrOrigIdx[lshrName] ?? lshrOrigIdx[lshrName2]
+                    if let origInfo = origInfo {
+                        // Check if the base pointer was also half-scaled (chained GEP)
+                        var chain: [(origIdxName: String, idxType: IRType)] = []
+                        if case .value(let baseVal) = inst.operands[0],
+                           let baseChain = halfScaledGEPs[baseVal.name] {
+                            chain = baseChain
+                        }
+                        chain.append((origIdxName: origInfo.name, idxType: origInfo.type))
+                        halfScaledGEPs[inst.name] = chain
                     }
                 }
             }
         }
-        // Propagate through phi, inttoptr, ptrtoint, bitcast — any instruction that
-        // passes a half-scaled pointer through to a new name
+        // Propagate through phi, inttoptr, ptrtoint, bitcast, and constant-index
+        // GEPs whose base pointer is half-scaled.
         var changed = true
         while changed {
             changed = false
@@ -3700,6 +3710,15 @@ private func transformWidenDeviceLoads(module: IRModule) {
                         if let op = inst.operands.first,
                            case .value(let v) = op,
                            let info = halfScaledGEPs[v.name] {
+                            halfScaledGEPs[inst.name] = info
+                            changed = true
+                        }
+                    case .getelementptr:
+                        // Constant-0 index GEPs are identity — propagate base's half-scaled info
+                        if inst.operands.count >= 2,
+                           case .constant(.integer(_, 0)) = inst.operands[1],
+                           case .value(let baseVal) = inst.operands[0],
+                           let info = halfScaledGEPs[baseVal.name] {
                             halfScaledGEPs[inst.name] = info
                             changed = true
                         }
@@ -3791,11 +3810,11 @@ private func transformWidenDeviceLoads(module: IRModule) {
                     let castName = "\(inst.name)_wcast"
                     // Check if this load's pointer came from a half-scaled GEP
                     if (origType == .float16 || origType == .bfloat16),
-                       let halfInfo = halfScaledGEPs[ptrVal.name] {
+                       let halfChain = halfScaledGEPs[ptrVal.name], !halfChain.isEmpty {
                         // Load-and-extract pattern:
                         // %f = load float, float* %gep        (load 4 bytes = 2 halves)
                         // %v2 = bitcast float %f to <2 x half>
-                        // %bit = and i32 %origIdx, 1           (odd/even selector)
+                        // %bit = (sum of all chain orig indices) & 1  (odd/even selector)
                         // %val = extractelement <2 x half> %v2, i32 %bit
                         inst.type = .float32
                         newInsts.append(inst)
@@ -3807,20 +3826,47 @@ private func transformWidenDeviceLoads(module: IRModule) {
                             operands: [.value(IRValue(type: .float32, name: inst.name))])
                         newInsts.append(bcInst)
 
-                        let andName = "\(inst.name)_lane"
-                        let andInst = IRInstruction(
-                            opcode: .and, type: halfInfo.idxType, name: andName,
-                            operands: [
-                                .value(IRValue(type: halfInfo.idxType, name: halfInfo.origIdxName)),
-                                .constant(.integer(halfInfo.idxType, 1))
-                            ])
-                        newInsts.append(andInst)
+                        // Compute combined lane from all indices in the GEP chain
+                        let idxType = halfChain[0].idxType
+                        let laneName: String
+                        if halfChain.count == 1 {
+                            laneName = "\(inst.name)_lane"
+                            let andInst = IRInstruction(
+                                opcode: .and, type: idxType, name: laneName,
+                                operands: [
+                                    .value(IRValue(type: idxType, name: halfChain[0].origIdxName)),
+                                    .constant(.integer(idxType, 1))
+                                ])
+                            newInsts.append(andInst)
+                        } else {
+                            // Sum all original indices, then AND 1
+                            var sumName = halfChain[0].origIdxName
+                            for i in 1..<halfChain.count {
+                                let addName = "\(inst.name)_idxsum\(i)"
+                                let addInst = IRInstruction(
+                                    opcode: .add, type: idxType, name: addName,
+                                    operands: [
+                                        .value(IRValue(type: idxType, name: sumName)),
+                                        .value(IRValue(type: idxType, name: halfChain[i].origIdxName))
+                                    ])
+                                newInsts.append(addInst)
+                                sumName = addName
+                            }
+                            laneName = "\(inst.name)_lane"
+                            let andInst = IRInstruction(
+                                opcode: .and, type: idxType, name: laneName,
+                                operands: [
+                                    .value(IRValue(type: idxType, name: sumName)),
+                                    .constant(.integer(idxType, 1))
+                                ])
+                            newInsts.append(andInst)
+                        }
 
                         let extractInst = IRInstruction(
                             opcode: .extractElement, type: origType, name: castName,
                             operands: [
                                 .value(IRValue(type: v2Type, name: bcName)),
-                                .value(IRValue(type: halfInfo.idxType, name: andName))
+                                .value(IRValue(type: idxType, name: laneName))
                             ])
                         newInsts.append(extractInst)
                         widenedLoads[inst.name] = (castName, origType)
@@ -3906,7 +3952,7 @@ private func transformWidenDeviceLoads(module: IRModule) {
                 let v2Type = IRType.vector(element: halfType, count: 2)
                 let prefix = "\(inst.name.isEmpty ? ptr.name : inst.name)_ws\(newInsts.count)"
 
-                if let halfInfo = halfScaledGEPs[ptr.name] {
+                if let halfChain = halfScaledGEPs[ptr.name], !halfChain.isEmpty {
                     // Half-scaled GEP: float address holds 2 packed halves.
                     // Load float → bitcast <2 x half> → insertelement → bitcast float → store float.
                     let ldName = "\(prefix)_ld"
@@ -3921,14 +3967,41 @@ private func transformWidenDeviceLoads(module: IRModule) {
                         operands: [.value(IRValue(type: .float32, name: ldName))])
                     newInsts.append(v2Inst)
 
-                    let laneName = "\(prefix)_lane"
-                    let laneInst = IRInstruction(
-                        opcode: .and, type: halfInfo.idxType, name: laneName,
-                        operands: [
-                            .value(IRValue(type: halfInfo.idxType, name: halfInfo.origIdxName)),
-                            .constant(.integer(halfInfo.idxType, 1))
-                        ])
-                    newInsts.append(laneInst)
+                    // Compute combined lane from all indices in the GEP chain
+                    let idxType = halfChain[0].idxType
+                    let laneName: String
+                    if halfChain.count == 1 {
+                        laneName = "\(prefix)_lane"
+                        let laneInst = IRInstruction(
+                            opcode: .and, type: idxType, name: laneName,
+                            operands: [
+                                .value(IRValue(type: idxType, name: halfChain[0].origIdxName)),
+                                .constant(.integer(idxType, 1))
+                            ])
+                        newInsts.append(laneInst)
+                    } else {
+                        // Sum all original indices, then AND 1
+                        var sumName = halfChain[0].origIdxName
+                        for i in 1..<halfChain.count {
+                            let addName = "\(prefix)_idxsum\(i)"
+                            let addInst = IRInstruction(
+                                opcode: .add, type: idxType, name: addName,
+                                operands: [
+                                    .value(IRValue(type: idxType, name: sumName)),
+                                    .value(IRValue(type: idxType, name: halfChain[i].origIdxName))
+                                ])
+                            newInsts.append(addInst)
+                            sumName = addName
+                        }
+                        laneName = "\(prefix)_lane"
+                        let laneInst = IRInstruction(
+                            opcode: .and, type: idxType, name: laneName,
+                            operands: [
+                                .value(IRValue(type: idxType, name: sumName)),
+                                .constant(.integer(idxType, 1))
+                            ])
+                        newInsts.append(laneInst)
+                    }
 
                     let insName = "\(prefix)_ins"
                     let insInst = IRInstruction(
@@ -3936,7 +4009,7 @@ private func transformWidenDeviceLoads(module: IRModule) {
                         operands: [
                             .value(IRValue(type: v2Type, name: v2Name)),
                             .value(IRValue(type: halfType, name: val.name)),
-                            .value(IRValue(type: halfInfo.idxType, name: laneName))
+                            .value(IRValue(type: idxType, name: laneName))
                         ])
                     newInsts.append(insInst)
 

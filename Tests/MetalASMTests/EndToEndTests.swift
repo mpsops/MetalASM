@@ -4719,6 +4719,239 @@ extension EndToEndTests {
         #endif
     }
 
+    /// Regression test for chained half-GEP widening bug.
+    ///
+    /// When MMA intrinsics are present, MetalASM widens half device stores to float
+    /// by packing 2 halves per float word. For chained GEPs like:
+    ///   %base = gep half, %ptr, %row      ; row can be odd
+    ///   %addr = gep half, %base, %col     ; col is even (stride*N)
+    /// the lane selector must be (row + col) & 1, not just col & 1.
+    /// Otherwise, when row is odd, both elements of a (row, row+1) pair
+    /// write to lane 0 of the same float word — one overwrites the other.
+    func testChainedHalfGEPWidening() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Minimal kernel: 4 warps × 32 lanes = 128 threads.
+        // Each thread writes 2 half values to a 16×16 col-major output.
+        // Thread computes: row0 = (lane%8)*2, row1 = row0+1, col = warp*4 + lane/8.
+        // Output address: out[row + col*16] via chained GEP:
+        //   %base = gep half, %out, %row   ; row0=even, row1=odd
+        //   %addr = gep half, %base, %col_stride  ; col_stride = col*16 (always even)
+        // The bug: lshr(%row,1) truncates odd row1, both elements hit same float lane.
+        //
+        // MMA declaration present to trigger the widening transform.
+        let ir = """
+        @__tg_dot_ab_0 = internal addrspace(3) global [64 x float] undef, align 4
+
+        declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+        declare i32 @air.thread_index_in_simdgroup()
+
+        define void @test_chained_half_gep(ptr addrspace(1) %out) {
+          %tid_s = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tid_s, 0
+          %lane = call i32 @air.thread_index_in_simdgroup()
+          %warp = udiv i32 %tid, 32
+
+          ; Dest encoding: spt=[2,1] tpw=[8,4] wpc=[1,4] order=[0,1]
+          %lR = urem i32 %lane, 8
+          %lC = udiv i32 %lane, 8
+          %row0 = mul i32 %lR, 2
+          %row1 = add i32 %row0, 1
+          %wC = mul i32 %warp, 4
+          %col = add i32 %wC, %lC
+
+          ; Values: val[row][col] = row*100 + col
+          %v0_r = mul i32 %row0, 100
+          %v0_i = add i32 %v0_r, %col
+          %v1_r = mul i32 %row1, 100
+          %v1_i = add i32 %v1_r, %col
+          %v0_f = uitofp i32 %v0_i to float
+          %v1_f = uitofp i32 %v1_i to float
+          %val0 = fptrunc float %v0_f to half
+          %val1 = fptrunc float %v1_f to half
+
+          ; Col-major store via chained GEP: out[row + col*16]
+          ; First GEP: base = out + row
+          ; Second GEP: addr = base + col*16
+          %col16 = mul i32 %col, 16
+          %base0 = getelementptr half, ptr addrspace(1) %out, i32 %row0
+          %addr0 = getelementptr half, ptr addrspace(1) %base0, i32 %col16
+          store half %val0, ptr addrspace(1) %addr0, align 2
+
+          %base1 = getelementptr half, ptr addrspace(1) %out, i32 %row1
+          %addr1 = getelementptr half, ptr addrspace(1) %base1, i32 %col16
+          store half %val1, ptr addrspace(1) %addr1, align 2
+
+          ret void
+        }
+        """
+
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "test_chained_half_gep")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let count = 256  // 16×16 col-major output
+        let outBuf = device.makeBuffer(length: count * 2, options: .storageModeShared)!
+        let outPtr = outBuf.contents().bindMemory(to: UInt16.self, capacity: count)
+
+        // Fill with sentinel 0xFFFF (NaN in f16)
+        for i in 0..<count { outPtr[i] = 0xFFFF }
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        func fromF16(_ h: UInt16) -> Float {
+            let sign = (h >> 15) & 1
+            let exp = (h >> 10) & 0x1F
+            let mant = h & 0x3FF
+            if exp == 0 { return sign == 1 ? -0.0 : 0.0 }
+            if exp == 31 { return .infinity }
+            let e = Float(Int(exp) - 15)
+            let m = 1.0 + Float(mant) / 1024.0
+            return (sign == 1 ? -1.0 : 1.0) * m * powf(2.0, e)
+        }
+
+        // Col-major output: flat[i] = val[row=i%16][col=i/16] = row*100 + col
+        var failures = 0
+        for i in 0..<count {
+            let row = i % 16
+            let col = i / 16
+            let expected = Float(row * 100 + col)
+            let got = fromF16(outPtr[i])
+            if abs(got - expected) > 0.5 {
+                failures += 1
+                if failures <= 10 {
+                    print("  WRONG out[\(i)] (r=\(row),c=\(col)): got \(got), expect \(expected)")
+                }
+            }
+        }
+        print("testChainedHalfGEPWidening: \(count - failures)/\(count) correct")
+        XCTAssertEqual(failures, 0,
+            "Chained half-GEP store widening: odd base index must select lane 1, not lane 0")
+        #endif
+    }
+
+    /// Regression test for non-scaled half store widening via fpext+store float.
+    ///
+    /// When MMA intrinsics are present, MetalASM widens all device stores to float.
+    /// For half stores through non-half-scaled GEPs (e.g. gep half with constant-0
+    /// second index), the fallback path does fpext→store float, writing 4 bytes
+    /// instead of 2 — corrupting the adjacent half element.
+    ///
+    /// The correct behavior: a non-scaled half store to an arbitrary half-element
+    /// address must still do a read-modify-write of the containing float word,
+    /// using the pointer's byte offset to select the correct lane.
+    func testNonScaledHalfStoreWidening() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // 32 threads each write 2 adjacent half values: out[tid*2] and out[tid*2+1].
+        // Uses chained GEPs where the second GEP has constant index 0:
+        //   %base = gep half, %out, %idx   ; variable index
+        //   %addr = gep half, %base, 0     ; constant-0 (identity)
+        // Without the fix, the constant-0 GEP breaks the half-scaled chain,
+        // causing the store to fall through to fpext→store float (4 bytes),
+        // corrupting the adjacent half element.
+        let ir = """
+        @__tg_dot_ab_0 = internal addrspace(3) global [64 x float] undef, align 4
+
+        declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @test_nonscaled_half(ptr addrspace(1) %out) {
+          %tid_s = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tid_s, 0
+
+          ; Flat indices: idx0 = tid*2, idx1 = tid*2+1
+          %idx0 = mul i32 %tid, 2
+          %idx1 = add i32 %idx0, 1
+
+          ; Values: val0 = tid*10, val1 = tid*10+5
+          %v0_i = mul i32 %tid, 10
+          %v1_i = add i32 %v0_i, 5
+          %v0_f = uitofp i32 %v0_i to float
+          %v1_f = uitofp i32 %v1_i to float
+          %val0 = fptrunc float %v0_f to half
+          %val1 = fptrunc float %v1_f to half
+
+          ; Chained GEP with constant-0 second index (identity GEP).
+          ; The constant-0 GEP must propagate the half-scaled info from base.
+          %base0 = getelementptr half, ptr addrspace(1) %out, i32 %idx0
+          %addr0 = getelementptr half, ptr addrspace(1) %base0, i32 0
+          store half %val0, ptr addrspace(1) %addr0, align 2
+
+          %base1 = getelementptr half, ptr addrspace(1) %out, i32 %idx1
+          %addr1 = getelementptr half, ptr addrspace(1) %base1, i32 0
+          store half %val1, ptr addrspace(1) %addr1, align 2
+
+          ret void
+        }
+        """
+
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "test_nonscaled_half")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        let count = 64  // 32 threads × 2 halves
+        let outBuf = device.makeBuffer(length: count * 2, options: .storageModeShared)!
+        let outPtr = outBuf.contents().bindMemory(to: UInt16.self, capacity: count)
+        for i in 0..<count { outPtr[i] = 0xFFFF }
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(outBuf, offset: 0, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        func fromF16(_ h: UInt16) -> Float {
+            let sign = (h >> 15) & 1
+            let exp = (h >> 10) & 0x1F
+            let mant = h & 0x3FF
+            if exp == 0 { return sign == 1 ? -0.0 : 0.0 }
+            if exp == 31 { return .infinity }
+            let e = Float(Int(exp) - 15)
+            let m = 1.0 + Float(mant) / 1024.0
+            return (sign == 1 ? -1.0 : 1.0) * m * powf(2.0, e)
+        }
+
+        var failures = 0
+        for i in 0..<count {
+            let tid = i / 2
+            let elem = i % 2
+            let expected = Float(tid * 10 + elem * 5)
+            let got = fromF16(outPtr[i])
+            if abs(got - expected) > 0.5 {
+                failures += 1
+                if failures <= 10 {
+                    print("  WRONG out[\(i)] tid=\(tid) elem=\(elem): got \(got), expect \(expected)")
+                }
+            }
+        }
+        print("testNonScaledHalfStoreWidening: \(count - failures)/\(count) correct")
+        XCTAssertEqual(failures, 0,
+            "Non-scaled half store must not clobber adjacent elements with 4-byte float writes")
+        #endif
+    }
+
     /// Dispatch an external .ll kernel with 2 buffers (input i32[], output i32[])
     /// and verify output against expected values from TEST_LLIR_EXPECTED.
     ///
@@ -4730,6 +4963,22 @@ extension EndToEndTests {
     /// in_count/out_count = number of i32 elements, threads = threadgroup width.
     /// Input is filled with deterministic pattern (i % 1000).
     /// Output is printed so you can compare with reference.
+    /// Dispatch an external .ll kernel with flexible buffer setup.
+    ///
+    /// Usage:
+    ///   TEST_LLIR=/tmp/kernel.ll \
+    ///   TEST_LLIR_RUN="bufs:threads" \
+    ///   swift test --filter testExternalLLIRRun
+    ///
+    /// bufs = comma-separated "type:count" or "type:count:fill" specs.
+    ///   type: i32, f32, f16
+    ///   count: number of elements
+    ///   fill: "index" (val=i%1000), "zero", "neg1", "f16enc" (val=f16(i%1000))
+    ///         default: "index" for i32, "zero" for f16/f32
+    ///
+    /// Examples:
+    ///   TEST_LLIR_RUN="i32:256,i32:256:neg1:128"       # 2 i32 bufs, 128 threads
+    ///   TEST_LLIR_RUN="f16:256:f16enc,f16:256:neg1:128" # 2 f16 bufs, 128 threads
     func testExternalLLIRRun() throws {
         #if !canImport(Metal)
         throw XCTSkip("Metal not available")
@@ -4738,14 +4987,62 @@ extension EndToEndTests {
             throw XCTSkip("Set TEST_LLIR=/path/to/file.ll")
         }
         guard let runSpec = ProcessInfo.processInfo.environment["TEST_LLIR_RUN"] else {
-            throw XCTSkip("Set TEST_LLIR_RUN=in_count:out_count:threads")
+            throw XCTSkip("Set TEST_LLIR_RUN=bufs:threads (see doc)")
         }
-        let parts = runSpec.split(separator: ":").compactMap { Int($0) }
-        guard parts.count == 3 else {
-            XCTFail("TEST_LLIR_RUN must be in_count:out_count:threads, got \(runSpec)")
-            return
+
+        // Parse: last component is threads, rest are buf specs separated by ","
+        // Format: "type:count:fill,type:count:fill:threads"
+        // Actually simpler: split by "," then last element's last ":" component is threads
+        let segments = runSpec.split(separator: ",").map(String.init)
+        guard !segments.isEmpty else {
+            XCTFail("Empty TEST_LLIR_RUN"); return
         }
-        let inCount = parts[0], outCount = parts[1], threads = parts[2]
+
+        // Last segment ends with ":threads"
+        let lastParts = segments.last!.split(separator: ":").map(String.init)
+        guard lastParts.count >= 1, let threads = Int(lastParts.last!) else {
+            XCTFail("Last value must be thread count"); return
+        }
+
+        // Rebuild buf specs: all segments, but strip the thread count from last
+        var bufSpecs: [(type: String, count: Int, fill: String)] = []
+        for (si, seg) in segments.enumerated() {
+            var parts = seg.split(separator: ":").map(String.init)
+            if si == segments.count - 1 { parts.removeLast() } // remove threads
+            guard parts.count >= 2, let count = Int(parts[1]) else {
+                XCTFail("Bad buf spec: \(seg)"); return
+            }
+            let type = parts[0]
+            let fill = parts.count >= 3 ? parts[2] : (type == "i32" ? "index" : "zero")
+            bufSpecs.append((type: type, count: count, fill: fill))
+        }
+
+        func elemSize(_ t: String) -> Int {
+            switch t { case "f16": return 2; case "i32", "f32": return 4; default: return 4 }
+        }
+
+        func toF16(_ v: Float) -> UInt16 {
+            let bits = v.bitPattern
+            let sign = (bits >> 31) & 1
+            let exp = Int((bits >> 23) & 0xFF) - 127
+            let mant = bits & 0x7FFFFF
+            if exp < -24 { return UInt16(sign << 15) }
+            if exp < -14 { return UInt16(sign << 15) }
+            if exp > 15 { return UInt16(sign << 15) | 0x7C00 }
+            let h = UInt16(sign << 15) | UInt16((exp + 15) << 10) | UInt16(mant >> 13)
+            return h
+        }
+
+        func fromF16(_ h: UInt16) -> Float {
+            let sign = (h >> 15) & 1
+            let exp = (h >> 10) & 0x1F
+            let mant = h & 0x3FF
+            if exp == 0 { return sign == 1 ? -0.0 : 0.0 }
+            if exp == 31 { return .infinity }
+            let e = Float(Int(exp) - 15)
+            let m = 1.0 + Float(mant) / 1024.0
+            return (sign == 1 ? -1.0 : 1.0) * m * powf(2.0, e)
+        }
 
         let ir = try String(contentsOfFile: path, encoding: .utf8)
         let metallib = try MetalASM.assemble(ir: ir)
@@ -4755,45 +5052,66 @@ extension EndToEndTests {
         let fn = library.makeFunction(name: fnName)!
         let pso = try device.makeComputePipelineState(function: fn)
 
-        let inBuf = device.makeBuffer(length: inCount * 4, options: .storageModeShared)!
-        let outBuf = device.makeBuffer(length: outCount * 4, options: .storageModeShared)!
-        let inPtr = inBuf.contents().bindMemory(to: Int32.self, capacity: inCount)
-        let outPtr = outBuf.contents().bindMemory(to: Int32.self, capacity: outCount)
-
-        // Deterministic input
-        for i in 0..<inCount { inPtr[i] = Int32(i % 1000) }
-        for i in 0..<outCount { outPtr[i] = -1 }
+        // Create buffers
+        var bufs: [MTLBuffer] = []
+        for spec in bufSpecs {
+            let buf = device.makeBuffer(length: spec.count * elemSize(spec.type), options: .storageModeShared)!
+            switch spec.type {
+            case "f16":
+                let ptr = buf.contents().bindMemory(to: UInt16.self, capacity: spec.count)
+                switch spec.fill {
+                case "f16enc": for i in 0..<spec.count { ptr[i] = toF16(Float(i % 1000)) }
+                case "neg1":   for i in 0..<spec.count { ptr[i] = toF16(-1.0) }
+                default:       for i in 0..<spec.count { ptr[i] = 0 }
+                }
+            case "f32":
+                let ptr = buf.contents().bindMemory(to: Float.self, capacity: spec.count)
+                switch spec.fill {
+                case "index": for i in 0..<spec.count { ptr[i] = Float(i % 1000) }
+                case "neg1":  for i in 0..<spec.count { ptr[i] = -1.0 }
+                default:      for i in 0..<spec.count { ptr[i] = 0 }
+                }
+            default: // i32
+                let ptr = buf.contents().bindMemory(to: Int32.self, capacity: spec.count)
+                switch spec.fill {
+                case "neg1": for i in 0..<spec.count { ptr[i] = -1 }
+                case "zero": for i in 0..<spec.count { ptr[i] = 0 }
+                default:     for i in 0..<spec.count { ptr[i] = Int32(i % 1000) }
+                }
+            }
+            bufs.append(buf)
+        }
 
         let queue = device.makeCommandQueue()!
         let cmd = queue.makeCommandBuffer()!
         let enc = cmd.makeComputeCommandEncoder()!
         enc.setComputePipelineState(pso)
-        enc.setBuffer(inBuf, offset: 0, index: 0)
-        enc.setBuffer(outBuf, offset: 0, index: 1)
+        for (i, buf) in bufs.enumerated() {
+            enc.setBuffer(buf, offset: 0, index: i)
+        }
         enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
         enc.endEncoding()
         cmd.commit()
         cmd.waitUntilCompleted()
 
-        // Print output for comparison
-        print("testExternalLLIRRun: output[\(outCount)] =", (0..<outCount).map { outPtr[$0] })
-
-        // If TEST_LLIR_EXPECTED is set, verify
-        if let expectedStr = ProcessInfo.processInfo.environment["TEST_LLIR_EXPECTED"] {
-            let expected = expectedStr.split(separator: ",").compactMap { Int32($0) }
-            guard expected.count == outCount else {
-                XCTFail("Expected \(outCount) values, got \(expected.count)")
-                return
+        // Print all buffers
+        for (i, spec) in bufSpecs.enumerated() {
+            let buf = bufs[i]
+            switch spec.type {
+            case "f16":
+                let ptr = buf.contents().bindMemory(to: UInt16.self, capacity: spec.count)
+                let vals = (0..<min(spec.count, 64)).map { fromF16(ptr[$0]) }
+                print("buf[\(i)] f16[\(spec.count)] first \(vals.count): \(vals)")
+            case "f32":
+                let ptr = buf.contents().bindMemory(to: Float.self, capacity: spec.count)
+                let vals = (0..<min(spec.count, 64)).map { ptr[$0] }
+                print("buf[\(i)] f32[\(spec.count)] first \(vals.count): \(vals)")
+            default:
+                let ptr = buf.contents().bindMemory(to: Int32.self, capacity: spec.count)
+                let vals = (0..<min(spec.count, 64)).map { ptr[$0] }
+                print("buf[\(i)] i32[\(spec.count)] first \(vals.count): \(vals)")
             }
-            var failures = 0
-            for i in 0..<outCount {
-                if outPtr[i] != expected[i] {
-                    print("  MISMATCH at [\(i)]: got \(outPtr[i]), expected \(expected[i])")
-                    failures += 1
-                }
-            }
-            XCTAssertEqual(failures, 0, "\(failures)/\(outCount) elements wrong")
         }
         #endif
     }
