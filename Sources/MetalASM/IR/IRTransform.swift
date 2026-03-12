@@ -25,13 +25,17 @@ public func applyAirTransforms(module: IRModule) {
     transformStructPhis(module: module)
     transformPtrPhisToI64(module: module)
     transformBarrierRename(module: module)
+    transformTGStoreBarrierInsert(module: module)
+    transformNaNPropagatingMinMax(module: module)
     transformFNegToFSub(module: module)
+    transformBitcastZeroInit(module: module)
     transformLLVMIntrinsicRename(module: module)
     transformI64ShuffleSplit(module: module)
     transformAtomicRMW(module: module)
     transformTGGlobalDeadElim(module: module)
     transformTGGlobalCoalesce(module: module)
     transformTGGlobalGEPs(module: module)
+    transformInferOpaquePointerTypes(module: module)  // After TG GEP pass — convert remaining opaque ptrs
     transformMMATypedPtrs(module: module)
     transformBFloat16Casts(module: module)
     transformScalarStoreGuard(module: module)
@@ -842,6 +846,95 @@ private func transformBarrierRename(module: IRModule) {
     }
 }
 
+// MARK: - Transform 1.1: TG store barrier insertion
+//
+// Metal GPU JIT can reorder addrspace(3) loads past independent instructions,
+// allowing a fast warp to overwrite threadgroup memory before a slow warp
+// finishes reading. This causes WAR hazards when two reduce operations share
+// the same TG allocation (allocation.offset = 0).
+//
+// Fix: ensure every TG store is preceded by a barrier within the same basic
+// block. If the instruction immediately before a TG store is not a barrier
+// (air.wg.barrier), insert one.
+
+private func transformTGStoreBarrierInsert(module: IRModule) {
+    // Build set of basic blocks that contain TG stores (addrspace 3)
+    for fn in module.functions where !fn.isDeclaration {
+        var tgStoreBlockNames = Set<String>()
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .store {
+                guard inst.operands.count >= 2 else { continue }
+                if case .value(let v) = inst.operands[1], isTGPointer(v.type) {
+                    tgStoreBlockNames.insert(bb.name)
+                }
+            }
+        }
+        guard !tgStoreBlockNames.isEmpty else { continue }
+
+        // Find conditional branches that target TG-store blocks.
+        // Pattern: `br i1 cond, label %thenBlock, label %endBlock`
+        // where thenBlock contains a TG store (storeDShared pattern).
+        // Insert a barrier before this branch if not already preceded by one.
+        for bb in fn.basicBlocks {
+            var i = 0
+            while i < bb.instructions.count {
+                let inst = bb.instructions[i]
+                guard inst.opcode == .br, inst.operands.count >= 3 else { i += 1; continue }
+                // operands: [cond, trueBlock, falseBlock]
+                let branchesToTG: Bool
+                if case .basicBlock(let targetBB) = inst.operands[1],
+                   tgStoreBlockNames.contains(targetBB.name) {
+                    branchesToTG = true
+                } else {
+                    branchesToTG = false
+                }
+                guard branchesToTG else { i += 1; continue }
+
+                // Check if preceded by a barrier
+                let needsBarrier: Bool
+                if i > 0 {
+                    needsBarrier = !isBarrierCall(bb.instructions[i - 1])
+                } else {
+                    needsBarrier = true
+                }
+                if needsBarrier {
+                    bb.instructions.insert(makeBarrierCall(module: module), at: i)
+                    i += 1  // skip past inserted barrier
+                }
+                i += 1
+            }
+        }
+    }
+}
+
+private func isTGPointer(_ type: IRType) -> Bool {
+    switch type {
+    case .pointer(_, 3), .opaquePointer(3): return true
+    default: return false
+    }
+}
+
+private func isBarrierCall(_ inst: IRInstruction) -> Bool {
+    guard inst.opcode == .call else { return false }
+    guard let calleeOp = inst.operands.last,
+          case .value(let calleeVal) = calleeOp else { return false }
+    return calleeVal.name == "air.wg.barrier"
+}
+
+private func makeBarrierCall(module: IRModule) -> IRInstruction {
+    let i32Ty = IRType.int(bits: 32)
+    let fnTy = IRType.function(ret: .void, params: [i32Ty, i32Ty], isVarArg: false)
+    let barrierFn = IRValue(type: fnTy, name: "air.wg.barrier")
+    let inst = IRInstruction(opcode: .call, type: .void)
+    // air.wg.barrier(i32 2, i32 1) — flag 2 = threadgroup memory fence, scope 1 = threadgroup
+    inst.operands = [
+        .constant(.integer(i32Ty, 2)),
+        .constant(.integer(i32Ty, 1)),
+        .value(barrierFn)
+    ]
+    return inst
+}
+
 // MARK: - Transform 1.5: LLVM intrinsic → AIR intrinsic renaming
 
 /// Map LLVM math intrinsics to their AIR equivalents.
@@ -886,6 +979,92 @@ private let llvmToAirIntrinsics: [(String, String)] = [
     ("__mul64hi",       "air.mul_hi.u.i64"),
 ]
 
+// MARK: - Transform 1.6: llvm.minimum/maximum → air.fmin/fmax + NaN propagation
+//
+// llvm.minimum.f32 propagates NaN (returns NaN if EITHER operand is NaN).
+// Metal's air.fmin.f32 uses minnum semantics (returns non-NaN if one operand is NaN).
+// Lower: %r = call llvm.minimum.f32(%a, %b)
+//   →  %min = call air.fmin.f32(%a, %b)
+//      %nan = fcmp uno %a, %b          ; true if either is NaN
+//      %r   = select %nan, NaN, %min
+// Same for llvm.maximum → air.fmax.
+
+private let nanPropagatingIntrinsics: [(String, String, IRType)] = [
+    ("llvm.minimum.f32", "air.fmin.f32", .float32),
+    ("llvm.maximum.f32", "air.fmax.f32", .float32),
+    ("llvm.minimum.f16", "air.fmin.f16", .float16),
+    ("llvm.maximum.f16", "air.fmax.f16", .float16),
+]
+
+private func transformNaNPropagatingMinMax(module: IRModule) {
+    let intrinsicMap = Dictionary(nanPropagatingIntrinsics.map { ($0.0, ($0.1, $0.2)) },
+                                   uniquingKeysWith: { _, b in b })
+
+    // Replace declarations: llvm.minimum.f32 → air.fmin.f32
+    for fn in module.functions where fn.isDeclaration {
+        if let (airName, _) = intrinsicMap[fn.name] {
+            fn.name = airName
+            fn.attributeGroupIndex = nil
+        }
+    }
+
+    var nameCounter = 0
+    func freshName(_ prefix: String) -> String {
+        nameCounter += 1
+        return "\(prefix).\(nameCounter)"
+    }
+
+    for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            var i = 0
+            while i < bb.instructions.count {
+                let inst = bb.instructions[i]
+                guard inst.opcode == .call,
+                      let calleeOp = inst.operands.last,
+                      case .value(let calleeVal) = calleeOp,
+                      let (airName, floatTy) = intrinsicMap[calleeVal.name] else {
+                    i += 1; continue
+                }
+
+                // Rename callee to air.fmin/fmax
+                calleeVal.name = airName
+
+                // The call result is now minnum/maxnum (NaN-ignoring).
+                // Expand: %origName = call llvm.minimum(a, b)
+                //   → %tmp = call air.fmin(a, b)
+                //     %cmp = fcmp uno a, b
+                //     %origName = select %cmp, NaN, %tmp
+                let a = inst.operands[0]
+                let b = inst.operands[1]
+                let origName = inst.name
+                let tmpName = freshName("minmax_tmp")
+                inst.name = tmpName
+                let tmpVal = IRValue(type: floatTy, name: tmpName)
+
+                let cmpName = freshName("nan_check")
+                let cmpInst = IRInstruction(opcode: .fcmp, type: .i1, name: cmpName,
+                                             operands: [a, b])
+                cmpInst.attributes.predicate = 8  // uno
+                let cmpVal = IRValue(type: .i1, name: cmpName)
+
+                let nanConst: IRConstant
+                switch floatTy {
+                case .float16:  nanConst = .float16(0x7E00)  // NaN in f16
+                case .float32:  nanConst = .float32(.nan)
+                default:        nanConst = .float32(.nan)
+                }
+
+                let selInst = IRInstruction(opcode: .select, type: floatTy, name: origName,
+                                             operands: [.value(cmpVal), .constant(nanConst), .value(tmpVal)])
+
+                bb.instructions.insert(cmpInst, at: i + 1)
+                bb.instructions.insert(selInst, at: i + 2)
+                i += 3
+            }
+        }
+    }
+}
+
 // MARK: - Transform: fneg → fsub -0.0
 //
 // Metal GPU JIT (LLVM 14) doesn't support FUNC_CODE_INST_UNOP (fneg).
@@ -908,6 +1087,46 @@ private func transformFNegToFSub(module: IRModule) {
                     opcode: .fsub, type: inst.type, name: inst.name,
                     operands: [.constant(negZero), inst.operands[0]])
             }
+        }
+    }
+}
+
+// MARK: - Transform: Bitcast of zeroinitializer → zeroinitializer of dest type
+//
+// Metal GPU JIT crashes on bitcast <2 x i64> zeroinitializer to <64 x float> (size mismatch).
+// LLVM treats zeroinitializer as all-zeros regardless of type, so bitcast of zero = zero of dest type.
+
+private func transformBitcastZeroInit(module: IRModule) {
+    for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            // Collect names that should be replaced with zeroinitializer constants
+            var zeroReplacements: [String: IRType] = [:]
+            var indicesToRemove: Set<Int> = []
+
+            for (i, inst) in bb.instructions.enumerated() {
+                guard inst.opcode == .bitcast, inst.operands.count >= 1 else { continue }
+                if case .constant(.zeroInitializer(_)) = inst.operands[0] {
+                    zeroReplacements[inst.name] = inst.type
+                    indicesToRemove.insert(i)
+                }
+            }
+
+            guard !zeroReplacements.isEmpty else { continue }
+
+            // Replace uses and remove dead bitcasts
+            var newInsts: [IRInstruction] = []
+            for (i, inst) in bb.instructions.enumerated() {
+                if indicesToRemove.contains(i) { continue }
+                // Replace operands that reference the removed bitcast
+                for j in inst.operands.indices {
+                    if case .value(let v) = inst.operands[j],
+                       let destTy = zeroReplacements[v.name] {
+                        inst.operands[j] = .constant(.zeroInitializer(destTy))
+                    }
+                }
+                newInsts.append(inst)
+            }
+            bb.instructions = newInsts
         }
     }
 }
@@ -1059,6 +1278,462 @@ private func transformI64ShuffleSplit(module: IRModule) {
     module.functions.removeAll { $0.isDeclaration && $0.name.hasPrefix("air.simd_shuffle") && $0.name.hasSuffix(".i64") }
 }
 
+// MARK: - Transform: Infer opaque pointer types
+//
+// Metal GPU JIT (LLVM 14-based) requires typed pointers, but LLVM 19+ emits opaque pointers.
+// Walk the entire module and infer the correct pointee type for every opaque pointer (addrspace 1/3)
+// from its usage context (loads, stores, GEPs, phis). Convert all opaque ptrs to typed ptrs
+// before bitcode emission. This eliminates all opaque ptr edge cases.
+//
+// Key insight: Every pointer has a knowable type from the ops that use it.
+// - Load result type = pointee type
+// - Store value type = pointee type
+// - GEP source type = pointee type
+// - Phi incoming values = consistent pointee type
+
+private func transformInferOpaquePointerTypes(module: IRModule) {
+    // Collect all opaque device/TG pointers and infer their pointee types
+    var valueToPointeeType: [String: IRType] = [:]
+
+    // Phase 1: Scan all uses of each opaque pointer and infer pointee type
+    for fn in module.functions where !fn.isDeclaration {
+        // Build param name → opaque ptr map
+        var opaqueParamNames: Set<String> = []
+        for param in fn.parameters {
+            if case .opaquePointer(let addrSpace) = param.type, addrSpace >= 1 {
+                opaqueParamNames.insert(param.name)
+            }
+        }
+
+        // Infer pointee types for opaque params
+        for paramName in opaqueParamNames {
+            if let pointee = inferPointeeTypeFromUsage(paramName, in: fn) {
+                valueToPointeeType[paramName] = pointee
+            }
+        }
+
+        // Infer pointee types for opaque instructions
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions {
+                if case .opaquePointer(let addrSpace) = inst.type, addrSpace >= 1, !inst.name.isEmpty {
+                    // First try usage-based inference (load/store/GEP on the result)
+                    // This is more accurate than GEP source type for byte-addressed TG buffers
+                    // where GEP source is i8 but actual data is <4 x i32> etc.
+                    if let pointee = inferPointeeTypeFromUsage(inst.name, in: fn) {
+                        valueToPointeeType[inst.name] = pointee
+                    } else if inst.opcode == .getelementptr, let srcTy = inst.attributes.gepSourceType {
+                        // Fallback: use GEP source type
+                        let pointee = (srcTy == .int(bits: 1)) ? IRType.int(bits: 8) : srcTy
+                        valueToPointeeType[inst.name] = pointee
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 2: Apply inferred types to convert all opaque ptrs to typed ptrs
+    for fn in module.functions where !fn.isDeclaration {
+        var changed = false
+
+        // Convert param types
+        for i in fn.parameters.indices {
+            if case .opaquePointer(let addrSpace) = fn.parameterTypes[i] {
+                let pointee = valueToPointeeType[fn.parameters[i].name] ?? .float32
+                fn.parameterTypes[i] = .pointer(pointee: pointee, addressSpace: addrSpace)
+                fn.parameters[i].type = fn.parameterTypes[i]
+                changed = true
+            }
+        }
+
+        // Convert instruction types + operands
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions {
+                if case .opaquePointer(let addrSpace) = inst.type {
+                    let pointee = valueToPointeeType[inst.name] ?? .float32
+                    inst.type = .pointer(pointee: pointee, addressSpace: addrSpace)
+                    changed = true
+                }
+
+                // Fix operand types (params, other instructions, phi nodes)
+                for j in inst.operands.indices {
+                    if case .value(let v) = inst.operands[j],
+                       case .opaquePointer(let addrSpace) = v.type {
+                        let pointee = valueToPointeeType[v.name] ?? .float32
+                        inst.operands[j] = .value(IRValue(type: .pointer(pointee: pointee, addressSpace: addrSpace), name: v.name))
+                        changed = true
+                    }
+                }
+            }
+        }
+
+        if changed {
+            fn.type = .function(ret: fn.returnType, params: fn.parameterTypes, isVarArg: false)
+        }
+    }
+
+    // Phase 3: Fix i1 loads — Metal has no i1 memory type.
+    // Change `load i1, i8* %p` to `load i8, i8* %p` + `trunc i8 to i1`
+    for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            var insertions: [(Int, IRInstruction)] = []
+            for (idx, inst) in bb.instructions.enumerated() {
+                guard inst.opcode == .load, inst.type == .int(bits: 1) else { continue }
+                let origName = inst.name
+                let tmpName = origName + "_i8"
+                inst.type = .int(bits: 8)
+                inst.name = tmpName
+                let trunc = IRInstruction(opcode: .trunc, type: .int(bits: 1), name: origName,
+                                          operands: [.value(IRValue(type: .int(bits: 8), name: tmpName))])
+                insertions.append((idx + 1, trunc))
+            }
+            for (offset, (idx, trunc)) in insertions.enumerated() {
+                bb.instructions.insert(trunc, at: idx + offset)
+            }
+        }
+    }
+
+    // Phase 4: Fix GEP source types and result types
+    // - Always remap i1 source types to i8 (Metal has no i1 memory type)
+    // - For remaining opaque GEPs, set typed pointer result from source type
+    // - Skip typed GEPs that were already handled by inference
+    for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .getelementptr {
+                guard let srcTy = inst.attributes.gepSourceType else { continue }
+
+                // Always remap i1 → i8 in GEP source types (even for typed ptrs)
+                if srcTy == .int(bits: 1) {
+                    inst.attributes.gepSourceType = .int(bits: 8)
+                }
+
+                let addrSpace: Int
+                let isOpaque: Bool
+                switch inst.type {
+                case .opaquePointer(let a): addrSpace = a; isOpaque = true
+                case .pointer(_, let a): addrSpace = a; isOpaque = false
+                default: continue
+                }
+
+                // If already typed by inference, skip result type update
+                if !isOpaque { continue }
+
+                // Metal has no i1 memory type — remap to i8
+                let pointee = (srcTy == .int(bits: 1)) ? IRType.int(bits: 8) : srcTy
+
+                let typedPtr = IRType.pointer(pointee: pointee, addressSpace: addrSpace)
+                if inst.type != typedPtr {
+                    let oldType = inst.type
+                    inst.type = typedPtr
+                    // Propagate to uses
+                    let gepName = inst.name
+                    if !gepName.isEmpty {
+                        for bb2 in fn.basicBlocks {
+                            for inst2 in bb2.instructions {
+                                for j in inst2.operands.indices {
+                                    if case .value(let v) = inst2.operands[j],
+                                       v.name == gepName,
+                                       (v.type == oldType || {
+                                           if case .opaquePointer(_) = v.type { return true }
+                                           return false
+                                       }()) {
+                                        inst2.operands[j] = .value(IRValue(type: typedPtr, name: v.name))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 5: MMA device ptr override
+    // When MMA present, half device ptrs that feed LOADS must become float* (with index rescaling)
+    // for the load-and-extract pattern. Half device ptrs used ONLY for stores keep half* —
+    // no index rescaling needed, and Metal GPU JIT doesn't support bitcast float*→half* for stores.
+    let hasMMADecl = module.functions.contains { $0.name.hasPrefix("air.simdgroup_matrix_8x8_") }
+    if hasMMADecl {
+        for fn in module.functions where !fn.isDeclaration {
+            // Step 1: Determine which half* device params feed loads vs stores.
+            // A param feeds loads if any GEP based on it is used as a load pointer.
+            // A param feeds stores if any GEP based on it is used as a store pointer.
+            var paramFeedsLoad: Set<Int> = []
+            var paramFeedsStore: Set<Int> = []
+
+            // Map param name → param index for half* device params
+            var halfParamIndices: [String: Int] = [:]
+            for i in fn.parameterTypes.indices {
+                if case .pointer(let pointee, 1) = fn.parameterTypes[i],
+                   pointee == .float16 {
+                    halfParamIndices[fn.parameters[i].name] = i
+                }
+            }
+
+            if !halfParamIndices.isEmpty {
+                // Find GEPs based on half* device params, track their names
+                // gepName → param index (propagate through chained GEPs)
+                var gepToParam: [String: Int] = [:]
+                var gepChanged = true
+                while gepChanged {
+                    gepChanged = false
+                    for bb in fn.basicBlocks {
+                        for inst in bb.instructions where inst.opcode == .getelementptr {
+                            guard !gepToParam.keys.contains(inst.name) else { continue }
+                            if let baseOp = inst.operands.first,
+                               case .value(let base) = baseOp {
+                                if let paramIdx = halfParamIndices[base.name] {
+                                    gepToParam[inst.name] = paramIdx
+                                    gepChanged = true
+                                } else if let paramIdx = gepToParam[base.name] {
+                                    gepToParam[inst.name] = paramIdx
+                                    gepChanged = true
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Scan all loads/stores to see which params they reference
+                for bb in fn.basicBlocks {
+                    for inst in bb.instructions {
+                        if inst.opcode == .load, let ptrOp = inst.operands.first,
+                           case .value(let ptr) = ptrOp {
+                            if let paramIdx = halfParamIndices[ptr.name] {
+                                paramFeedsLoad.insert(paramIdx)
+                            } else if let paramIdx = gepToParam[ptr.name] {
+                                paramFeedsLoad.insert(paramIdx)
+                            }
+                        }
+                        if inst.opcode == .store, inst.operands.count >= 2,
+                           case .value(let ptr) = inst.operands[1] {
+                            if let paramIdx = halfParamIndices[ptr.name] {
+                                paramFeedsStore.insert(paramIdx)
+                            } else if let paramIdx = gepToParam[ptr.name] {
+                                paramFeedsStore.insert(paramIdx)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Step 2: Convert params that feed loads OR have no direct load/store uses
+            // (ambiguous params like phi-only chains need conversion for MMA compatibility).
+            // Only SKIP conversion for params that EXCLUSIVELY feed stores (output buffers).
+            var changed = false
+            var convertedParams: Set<String> = []
+            for i in fn.parameterTypes.indices {
+                if case .pointer(let pointee, 1) = fn.parameterTypes[i],
+                   pointee == .float16,
+                   !paramFeedsStore.contains(i) || paramFeedsLoad.contains(i) {
+                    fn.parameterTypes[i] = .pointer(pointee: .float32, addressSpace: 1)
+                    fn.parameters[i].type = fn.parameterTypes[i]
+                    convertedParams.insert(fn.parameters[i].name)
+                    changed = true
+                }
+            }
+
+            // Step 3: Convert half* device ptrs/phis/GEPs to float* for converted params only.
+            // GEPs chaining from a converted param must all be converted (otherwise type mismatch).
+            // GEPs rooted in unconverted (store-only) params must stay half* to preserve byte addressing.
+            // Track which values are reachable from converted params via pointer-producing instructions.
+            var convertedValues: Set<String> = Set(convertedParams)
+            // Iteratively propagate: if a GEP/phi/etc produces half*(1) and its base is converted, convert it too
+            var changed2 = true
+            while changed2 {
+                changed2 = false
+                for bb in fn.basicBlocks {
+                    for inst in bb.instructions {
+                        guard case .pointer(let pointee, 1) = inst.type, pointee == .float16,
+                              !convertedValues.contains(inst.name) else { continue }
+                        // Check if any operand is a converted pointer
+                        let basesConverted = inst.operands.contains { op in
+                            if case .value(let v) = op { return convertedValues.contains(v.name) }
+                            return false
+                        }
+                        if basesConverted {
+                            convertedValues.insert(inst.name)
+                            changed2 = true
+                        }
+                    }
+                }
+            }
+
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    if case .pointer(let pointee, 1) = inst.type, pointee == .float16,
+                       convertedValues.contains(inst.name) {
+                        inst.type = .pointer(pointee: .float32, addressSpace: 1)
+                        changed = true
+                    }
+                    for j in inst.operands.indices {
+                        if case .value(let v) = inst.operands[j],
+                           case .pointer(let pointee, 1) = v.type, pointee == .float16,
+                           convertedValues.contains(v.name) {
+                            inst.operands[j] = .value(IRValue(type: .pointer(pointee: .float32, addressSpace: 1), name: v.name))
+                            changed = true
+                        }
+                    }
+                }
+            }
+            if changed {
+                fn.type = .function(ret: fn.returnType, params: fn.parameterTypes, isVarArg: false)
+            }
+
+            // Step 4: Rescale half GEP indices to float — only for GEPs in convertedValues
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions where inst.opcode == .getelementptr {
+                    if case .pointer(_, 1) = inst.type,
+                       let srcTy = inst.attributes.gepSourceType, srcTy == .float16,
+                       convertedValues.contains(inst.name) {
+                        inst.attributes.gepSourceType = .float32
+                        inst.type = .pointer(pointee: .float32, addressSpace: 1)
+                        if inst.operands.count >= 2 {
+                            if let newIdx = scaleGepIndexToFloat(inst.operands[1], elemSize: 2) {
+                                inst.operands[1] = newIdx
+                            } else if case .value(let idxVal) = inst.operands[1] {
+                                let scaledName = "\(inst.name)_hidx"
+                                let scaledInst = IRInstruction(
+                                    opcode: .lshr, type: idxVal.type, name: scaledName,
+                                    operands: [
+                                        .value(idxVal),
+                                        .constant(.integer(idxVal.type, 1))
+                                    ])
+                                if let bbRef = fn.basicBlocks.first(where: { $0.instructions.contains(where: { $0 === inst }) }),
+                                   let idx = bbRef.instructions.firstIndex(where: { $0 === inst }) {
+                                    bbRef.instructions.insert(scaledInst, at: idx)
+                                }
+                                inst.operands[1] = .value(IRValue(type: idxVal.type, name: scaledName))
+                                inst.attributes.gepHalfScaledOrigIdx = idxVal.name
+                            }
+                        }
+                        // Propagate float* to uses of this GEP
+                        let gepName = inst.name
+                        if !gepName.isEmpty {
+                            let floatDevPtr = IRType.pointer(pointee: .float32, addressSpace: 1)
+                            for bb2 in fn.basicBlocks {
+                                for inst2 in bb2.instructions {
+                                    for j in inst2.operands.indices {
+                                        if case .value(let v) = inst2.operands[j], v.name == gepName {
+                                            inst2.operands[j] = .value(IRValue(type: floatDevPtr, name: v.name))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 6: Fix load/store type mismatches with pointer pointee type.
+    // Skip addrspace 1 (device) — handled by transformWidenDeviceLoads.
+    // Only fix TG (addrspace 3) and other non-device mismatches here.
+    for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            var insertions: [(Int, IRInstruction)] = []
+            for (idx, inst) in bb.instructions.enumerated() {
+                if inst.opcode == .load, let ptrOp = inst.operands.first,
+                   case .value(let ptr) = ptrOp,
+                   case .pointer(let pointee, let addrSpace) = ptr.type,
+                   addrSpace != 1,
+                   pointee != inst.type {
+                    let bcName = "\(ptr.name)_bc_\(inst.name)"
+                    let bcType = IRType.pointer(pointee: inst.type, addressSpace: addrSpace)
+                    let bc = IRInstruction(opcode: .bitcast, type: bcType, name: bcName,
+                                           operands: [.value(ptr)])
+                    insertions.append((idx, bc))
+                    inst.operands[0] = .value(IRValue(type: bcType, name: bcName))
+                }
+                if inst.opcode == .store, inst.operands.count >= 2,
+                   case .value(let val) = inst.operands[0],
+                   case .value(let ptr) = inst.operands[1],
+                   case .pointer(let pointee, let addrSpace) = ptr.type,
+                   addrSpace != 1,
+                   pointee != val.type {
+                    let bcName = "\(ptr.name)_bc_\(idx)"
+                    let bcType = IRType.pointer(pointee: val.type, addressSpace: addrSpace)
+                    let bc = IRInstruction(opcode: .bitcast, type: bcType, name: bcName,
+                                           operands: [.value(ptr)])
+                    insertions.append((idx, bc))
+                    inst.operands[1] = .value(IRValue(type: bcType, name: bcName))
+                }
+            }
+            for (offset, (idx, bc)) in insertions.enumerated() {
+                bb.instructions.insert(bc, at: idx + offset)
+            }
+        }
+    }
+
+    // Disable bitcode fallback flags — inference has converted everything
+    TypeTableWriter.emitOpaqueAsTyped = false
+    TypeTableWriter.collapseDevicePtrsToFloat = false
+}
+
+/// Infer the pointee type of a pointer (param or instruction) by scanning its uses in a function.
+private func inferPointeeTypeFromUsage(_ name: String, in fn: IRFunction) -> IRType? {
+    return inferPointeeTypeFromUsage(name, in: fn, visited: [])
+}
+
+private func inferPointeeTypeFromUsage(_ name: String, in fn: IRFunction, visited: Set<String>) -> IRType? {
+    var candidates: [IRType] = []
+    var visited = visited
+    visited.insert(name)
+
+    for bb in fn.basicBlocks {
+        for inst in bb.instructions {
+            // Load from this pointer
+            if inst.opcode == .load, let op = inst.operands.first,
+               case .value(let v) = op, v.name == name {
+                let loadType = (inst.type == .int(bits: 1)) ? IRType.int(bits: 8) : inst.type
+                candidates.append(loadType)
+            }
+
+            // Store through this pointer
+            if inst.opcode == .store, inst.operands.count >= 2,
+               case .value(let ptrVal) = inst.operands[1], ptrVal.name == name,
+               case .value(let valVal) = inst.operands[0] {
+                candidates.append(valVal.type)
+            }
+
+            // GEP with this pointer as base
+            if inst.opcode == .getelementptr, let op = inst.operands.first,
+               case .value(let v) = op, v.name == name,
+               let srcTy = inst.attributes.gepSourceType {
+                let srcType = (srcTy == .int(bits: 1)) ? IRType.int(bits: 8) : srcTy
+                candidates.append(srcType)
+            }
+
+            // Phi with this pointer as incoming — follow the phi result
+            if inst.opcode == .phi, !visited.contains(inst.name) {
+                let usesName = inst.operands.contains { op in
+                    if case .value(let v) = op { return v.name == name }
+                    return false
+                }
+                if usesName, let inferred = inferPointeeTypeFromUsage(inst.name, in: fn, visited: visited) {
+                    candidates.append(inferred)
+                }
+            }
+        }
+    }
+
+    // Consensus: if all candidates agree, use that type
+    if !candidates.isEmpty {
+        let first = candidates[0]
+        if candidates.allSatisfy({ $0 == first }) {
+            return first
+        }
+
+        // Conflicting types: try to find most common
+        let counts = Dictionary(grouping: candidates, by: { $0 }).mapValues { $0.count }
+        if let most = counts.max(by: { $0.value < $1.value })?.key {
+            return most
+        }
+    }
+
+    return nil
+}
+
 // MARK: - Transform 2: MMA load/store elimination + multiply-accumulate fixup
 //
 // air.simdgroup_matrix_8x8_load/store crash the Metal GPU shader compiler XPC service.
@@ -1083,7 +1758,6 @@ private let mmaMulName   = "air.simdgroup_matrix_8x8_multiply_accumulate"
 
 private func transformMMATypedPtrs(module: IRModule) {
     let floatTGPtr = IRType.pointer(pointee: .float32, addressSpace: 3)
-    let floatDevPtr = IRType.pointer(pointee: .float32, addressSpace: 1)
 
     // Fix declaration param types: opaquePointer(3) → float addrspace(3)*
     // Add nocapture+readonly paramattr on mmaLoad param 1 (matches ref bc)
@@ -1117,301 +1791,66 @@ private func transformMMATypedPtrs(module: IRModule) {
         }
     }
 
-    // Convert remaining opaque pointer params to typed pointers based on usage.
-    // Metal AIR (LLVM 14) requires typed pointers — opaque ptrs crash the GPU JIT
-    // when complex ops (typed GEPs) reference them. IRTransform converts param
-    // types; emitOpaqueAsTyped catches remaining opaque ptr types (GEP results,
-    // intermediates) at bitcode emission time. Both gates live here.
-    let hasMMADecl = module.functions.contains { $0.name.hasPrefix("air.simdgroup_matrix_8x8_") }
-    let hasTGByteGlobal = module.globals.contains { g in
-        g.addressSpace == 3 && {
-            if case .array(let e, _) = g.valueType, e == .i8 { return true }
-            return false
-        }()
-    }
-    let hasAtomicDecl = module.functions.contains { $0.name.hasPrefix("air.atomic.") }
-    let hasTGGlobal = module.globals.contains { $0.addressSpace == 3 }
-    // i1 loads from constant buffer need typed ptrs — opaque ptr + i1 load crashes GPU JIT
-    let hasI1Load = module.functions.contains { fn in
-        !fn.isDeclaration && fn.basicBlocks.contains { bb in
-            bb.instructions.contains { $0.opcode == .load && $0.type == .int(bits: 1) }
-        }
-    }
-    let needsTypedPtrs = hasMMADecl || hasTGByteGlobal || hasAtomicDecl || hasTGGlobal || hasI1Load
-    TypeTableWriter.emitOpaqueAsTyped = needsTypedPtrs
-    TypeTableWriter.collapseDevicePtrsToFloat = hasMMADecl
-    guard needsTypedPtrs else { return }
+    // Pointer type inference (opaque → typed) is now handled by transformInferOpaquePointerTypes,
+    // which runs early in the pipeline. All opaquePointer params/instructions are converted to
+    // typed pointers with correct pointee types inferred from usage. No need for piecemeal fixups here.
 
-    // Fix cmpxchg: pointer types in cmpxchg calls must be i32*, not float*.
-    // emitOpaqueAsTyped converts opaquePointer → float* by default, but cmpxchg operates on i32.
-    // We collect SSA names that feed cmpxchg (alloca, inttoptr) and convert those + call operands.
-    let hasAtomicCalls = module.functions.contains { $0.name.contains(".cmpxchg.") || $0.name.hasPrefix("air.atomic.") }
-    if hasAtomicCalls {
-        let i32Ptr = { (a: Int) in IRType.pointer(pointee: .int(bits: 32), addressSpace: a) }
-        // Step 1: Fix atomic declarations — all opaque ptr params → i32*
-        for fn in module.functions where fn.isDeclaration && (fn.name.contains(".cmpxchg.") || fn.name.hasPrefix("air.atomic.")) {
-            for i in fn.parameterTypes.indices {
-                if case .opaquePointer(let a) = fn.parameterTypes[i] {
-                    fn.parameterTypes[i] = i32Ptr(a)
-                }
-            }
-            fn.type = .function(ret: fn.returnType, params: fn.parameterTypes, isVarArg: false)
-        }
-        // Step 2: Collect names of values feeding atomic ptr args
-        // Also fix GEP instructions whose results feed atomics: change gepSourceType to i32
-        for fn in module.functions where !fn.isDeclaration {
-            var atomicPtrNames: Set<String> = []
-            for bb in fn.basicBlocks {
-                for inst in bb.instructions where inst.opcode == .alloca {
-                    if let allocTy = inst.attributes.allocaType, allocTy == .int(bits: 32) {
-                        atomicPtrNames.insert(inst.name)
-                    }
-                }
+    // Fix atomic declaration params: opaquePointer → typed pointer.
+    // transformInferOpaquePointerTypes skips declarations, so we fix them here.
+    // Infer pointee types from call sites (match the caller's argument types).
+    for fn in module.functions where fn.isDeclaration && (fn.name.contains(".cmpxchg.") || fn.name.hasPrefix("air.atomic.")) {
+        // Collect pointee types from call sites
+        var inferredPointee: [Int: IRType] = [:]
+        for callerFn in module.functions where !callerFn.isDeclaration {
+            for bb in callerFn.basicBlocks {
                 for inst in bb.instructions where inst.opcode == .call {
                     guard let calleeOp = inst.operands.last,
-                          case .value(let callee) = calleeOp,
-                          (callee.name.contains(".cmpxchg.") || callee.name.hasPrefix("air.atomic.")) else { continue }
-                    let numPtrArgs = callee.name.contains(".cmpxchg.") ? 2 : 1
-                    for i in 0..<min(numPtrArgs, inst.operands.count - 1) {
-                        if case .value(let v) = inst.operands[i] {
-                            atomicPtrNames.insert(v.name)
+                          case .value(let v) = calleeOp,
+                          v.name == fn.name else { continue }
+                    // Check each argument for pointer types
+                    for i in 0..<min(inst.operands.count - 1, fn.parameterTypes.count) {
+                        if case .value(let argVal) = inst.operands[i],
+                           case .pointer(let pointee, _) = argVal.type {
+                            inferredPointee[i] = pointee
                         }
                     }
-                }
-            }
-            guard !atomicPtrNames.isEmpty else { continue }
-            // Convert types: opaque→i32*, typed ptr→i32*, GEP source type→i32
-            for bb in fn.basicBlocks {
-                for inst in bb.instructions {
-                    if atomicPtrNames.contains(inst.name) {
-                        // Fix GEP source type so result becomes i32* consistently
-                        if inst.opcode == .getelementptr {
-                            inst.attributes.gepSourceType = .int(bits: 32)
-                        }
-                        switch inst.type {
-                        case .opaquePointer(let a):
-                            inst.type = i32Ptr(a)
-                        case .pointer(_, let a):
-                            inst.type = i32Ptr(a)
-                        default: break
-                        }
-                    }
-                    for i in inst.operands.indices {
-                        if case .value(let v) = inst.operands[i],
-                           atomicPtrNames.contains(v.name) {
-                            switch v.type {
-                            case .opaquePointer(let a):
-                                v.type = i32Ptr(a)
-                            case .pointer(_, let a):
-                                v.type = i32Ptr(a)
-                            default: break
-                            }
-                        }
-                    }
-                }
-            }
-            for name in atomicPtrNames {
-                if let idx = fn.parameters.firstIndex(where: { $0.name == name }) {
-                    switch fn.parameterTypes[idx] {
-                    case .opaquePointer(let a), .pointer(_, let a):
-                        fn.parameterTypes[idx] = i32Ptr(a)
-                        fn.parameters[idx].type = i32Ptr(a)
-                    default: break
-                    }
-                }
-            }
-            fn.type = .function(ret: fn.returnType, params: fn.parameterTypes, isVarArg: false)
-        }
-        // Step 3: Fix callee operand types in call instructions to match declarations
-        var atomicDeclTypes: [String: IRType] = [:]
-        for fn in module.functions where fn.isDeclaration && (fn.name.contains(".cmpxchg.") || fn.name.hasPrefix("air.atomic.")) {
-            atomicDeclTypes[fn.name] = fn.type
-        }
-        for fn in module.functions where !fn.isDeclaration {
-            for bb in fn.basicBlocks {
-                for inst in bb.instructions where inst.opcode == .call {
-                    if let lastOp = inst.operands.last,
-                       case .value(let callee) = lastOp,
-                       let declType = atomicDeclTypes[callee.name] {
-                        callee.type = .pointer(pointee: declType, addressSpace: 0)
-                    }
-                }
-            }
-        }
-    }
-
-    for fn in module.functions where !fn.isDeclaration {
-        // Map param name → index for quick lookup
-        var paramIndices: [String: Int] = [:]
-        for (i, p) in fn.parameters.enumerated() {
-            paramIndices[p.name] = i
-        }
-
-        // For each opaque pointer param, find what type is loaded from it
-        var paramPointeeTypes: [Int: IRType] = [:]
-        for bb in fn.basicBlocks {
-            for inst in bb.instructions {
-                if inst.opcode == .load, let op = inst.operands.first,
-                   case .value(let v) = op, let idx = paramIndices[v.name],
-                   case .opaquePointer(_) = fn.parameterTypes[idx] {
-                    // Metal has no i1 memory type — booleans are i8 in memory
-                    paramPointeeTypes[idx] = (inst.type == .int(bits: 1)) ? .int(bits: 8) : inst.type
-                }
-                // Also check GEPs that use a param as base
-                if inst.opcode == .getelementptr, let op = inst.operands.first,
-                   case .value(let v) = op, let idx = paramIndices[v.name],
-                   case .opaquePointer(_) = fn.parameterTypes[idx],
-                   let srcTy = inst.attributes.gepSourceType {
-                    // Metal has no i1 memory type — booleans are i8 in memory
-                    paramPointeeTypes[idx] = (srcTy == .int(bits: 1)) ? .int(bits: 8) : srcTy
                 }
             }
         }
 
-        // Convert opaque pointer params to typed pointers
-        // When MMA is present, GPU JIT requires all device ptrs to be float* —
-        // half*, i8* etc. crash when MMA intrinsics are in the same module.
         var changed = false
         for i in fn.parameterTypes.indices {
-            if case .opaquePointer(let addrSpace) = fn.parameterTypes[i] {
-                var pointee = paramPointeeTypes[i] ?? .float32
-                if hasMMADecl && addrSpace == 1 { pointee = .float32 }
-                fn.parameterTypes[i] = .pointer(pointee: pointee, addressSpace: addrSpace)
-                fn.parameters[i].type = fn.parameterTypes[i]
+            switch fn.parameterTypes[i] {
+            case .opaquePointer(let a):
+                // Use inferred pointee from call site, or fall back to i32 (safe for atomics)
+                let pointee = inferredPointee[i] ?? .int(bits: 32)
+                fn.parameterTypes[i] = .pointer(pointee: pointee, addressSpace: a)
                 changed = true
+            case .pointer(_, let a) where fn.name.contains(".cmpxchg.") && a >= 1:
+                // cmpxchg device ptr should be i32* (it operates on i32)
+                fn.parameterTypes[i] = .pointer(pointee: .int(bits: 32), addressSpace: a)
+                changed = true
+            default: break
             }
         }
         if changed {
             fn.type = .function(ret: fn.returnType, params: fn.parameterTypes, isVarArg: false)
-
-            // Update operand types throughout the function body
-            for bb in fn.basicBlocks {
-                for inst in bb.instructions {
-                    for j in inst.operands.indices {
-                        if case .value(let v) = inst.operands[j],
-                           let idx = paramIndices[v.name],
-                           v.type != fn.parameterTypes[idx] {
-                            inst.operands[j] = .value(IRValue(type: fn.parameterTypes[idx], name: v.name))
+            // Update call site operands that reference this function
+            for callerFn in module.functions where !callerFn.isDeclaration {
+                for bb in callerFn.basicBlocks {
+                    for inst in bb.instructions where inst.opcode == .call {
+                        if let calleeOp = inst.operands.last,
+                           case .value(let v) = calleeOp,
+                           v.name == fn.name {
+                            inst.operands[inst.operands.count - 1] = .value(IRValue(type: fn.type, name: fn.name))
                         }
                     }
                 }
-            }
-        }
-
-        // Fix i1 loads from i8* params: change `load i1, i8* %p` to `load i8, i8* %p` + `trunc i8 to i1`
-        // Metal has no i1 memory type; typed pointer i8* with load i1 = type mismatch → GPU JIT crash
-        for bb in fn.basicBlocks {
-            var insertions: [(Int, IRInstruction)] = []
-            for (idx, inst) in bb.instructions.enumerated() {
-                guard inst.opcode == .load, inst.type == .int(bits: 1) else { continue }
-                // Change load type from i1 to i8
-                let origName = inst.name
-                let tmpName = origName + "_i8"
-                inst.type = .int(bits: 8)
-                inst.name = tmpName
-                // Insert trunc i8 → i1 right after
-                let trunc = IRInstruction(opcode: .trunc, type: .int(bits: 1), name: origName,
-                                          operands: [.value(IRValue(type: .int(bits: 8), name: tmpName))])
-                insertions.append((idx + 1, trunc))
-            }
-            for (offset, (idx, trunc)) in insertions.enumerated() {
-                bb.instructions.insert(trunc, at: idx + offset)
-            }
-        }
-
-        // Update GEP result types: if the base pointer is now typed,
-        // the GEP result should also be typed (using gepSourceType).
-        for bb in fn.basicBlocks {
-            for inst in bb.instructions where inst.opcode == .getelementptr {
-                // Get addrspace from either opaque or typed pointer
-                let addrSpace: Int
-                let isOpaque: Bool
-                switch inst.type {
-                case .opaquePointer(let a): addrSpace = a; isOpaque = true
-                case .pointer(_, let a): addrSpace = a; isOpaque = false
-                default: continue
-                }
-                guard let srcTy = inst.attributes.gepSourceType else { continue }
-
-                    // Metal has no i1 memory type — remap to i8
-                    var pointee = (srcTy == .int(bits: 1)) ? IRType.int(bits: 8) : srcTy
-                    if srcTy == .int(bits: 1) {
-                        inst.attributes.gepSourceType = .int(bits: 8)
-                    }
-
-                    // For device ptrs with MMA: force float32 GEP source type.
-                    // GPU JIT requires GEP source type to match pointer pointee type.
-                    if addrSpace == 1 && pointee != .float32 && hasMMADecl {
-                        let elemSize = scalarSizeAlign(srcTy).0
-                        pointee = .float32
-                        inst.attributes.gepSourceType = .float32
-                        if elemSize != 4, inst.operands.count >= 2 {
-                            if let newIdx = scaleGepIndexToFloat(inst.operands[1], elemSize: elemSize) {
-                                inst.operands[1] = newIdx
-                            } else {
-                                // Variable index: insert scaling instruction
-                                // half (2 bytes) → float (4 bytes): new_idx = old_idx * 2 / 4
-                                // But 2/4 = 0.5 which loses precision for odd indices.
-                                // Instead: byte_offset = old_idx * elemSize, new_idx = byte_offset / 4
-                                // For half (2 bytes): new_idx = old_idx / 2 (truncating)
-                                // This is only correct if the original indices are even, which they
-                                // should be for half→float stride conversion in practice.
-                                // Actually for half→float we need: new_byte_offset = old_idx * 2
-                                // new_float_idx = new_byte_offset / 4 = old_idx / 2
-                                // We insert: %scaled = lshr i32 %old_idx, 1 (divide by 2)
-                                if elemSize == 2 {
-                                    if case .value(let idxVal) = inst.operands[1] {
-                                        let origIdxName = idxVal.name
-                                        let scaledName = "\(inst.name)_hidx"
-                                        let scaledInst = IRInstruction(
-                                            opcode: .lshr, type: idxVal.type, name: scaledName,
-                                            operands: [
-                                                .value(idxVal),
-                                                .constant(.integer(idxVal.type, 1))
-                                            ])
-                                        // Insert before this GEP
-                                        let bb = fn.basicBlocks.first(where: { $0.instructions.contains(where: { $0 === inst }) })!
-                                        if let idx = bb.instructions.firstIndex(where: { $0 === inst }) {
-                                            bb.instructions.insert(scaledInst, at: idx)
-                                        }
-                                        inst.operands[1] = .value(IRValue(type: idxVal.type, name: scaledName))
-                                        // Tag GEP so load widening can emit extractelement
-                                        inst.attributes.gepHalfScaledOrigIdx = origIdxName
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let typedPtr = IRType.pointer(pointee: pointee, addressSpace: addrSpace)
-                    if inst.type != typedPtr {
-                        let oldType = inst.type
-                        inst.type = typedPtr
-                        // Propagate to uses
-                        let gepName = inst.name
-                        if !gepName.isEmpty {
-                            for bb2 in fn.basicBlocks {
-                                for inst2 in bb2.instructions {
-                                    for j in inst2.operands.indices {
-                                        if case .value(let v) = inst2.operands[j],
-                                           v.name == gepName,
-                                           (v.type == oldType || {
-                                               if case .opaquePointer(_) = v.type { return true }
-                                               return false
-                                           }()) {
-                                            inst2.operands[j] = .value(IRValue(type: typedPtr, name: v.name))
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
             }
         }
     }
 
     // Update metadata function pointer types to match actual function types
-    // (paramPointeeTypes may have changed fn.type from opaque → typed pointers)
     let fnTypeMap: [String: IRType] = Dictionary(
         uniqueKeysWithValues: module.functions.filter { !$0.isDeclaration }.map { ($0.name, $0.type) }
     )
@@ -1512,6 +1951,23 @@ private func transformTGGlobalDeadElim(module: IRModule) {
 // Both the ab and c buffers are live during MMA, so they CANNOT be merged.
 //
 private func transformTGGlobalCoalesce(module: IRModule) {
+    // Only coalesce when the kernel actually calls MMA intrinsics.
+    // Without MMA, the dot uses TG for intermediates and cvt+dot buffers
+    // are live simultaneously (same index space, overlapping lifetimes).
+    var hasMMACall = false
+    outer: for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .call {
+                if case .value(let callee) = inst.operands.last,
+                   callee.name.contains("multiply_accumulate") {
+                    hasMMACall = true
+                    break outer
+                }
+            }
+        }
+    }
+    guard hasMMACall else { return }
+
     // Find cvt and dot globals
     var cvtGlobals: [(global: IRGlobal, elemType: IRType, count: Int)] = []
     var dotGlobals: [(global: IRGlobal, elemType: IRType, count: Int)] = []
@@ -2129,9 +2585,7 @@ private func transformTGGlobalGEPs(module: IRModule) {
         var ssaTypeMap: [String: IRType] = [:]
 
         for g in mmaGlobals where needsPreamble.contains(g.name) {
-            var elemTy = mmaGlobalElemType[g.name] ?? .float32
-            // Metal GPU JIT doesn't support bfloat* typed pointers — use half* (same size)
-            if elemTy == .bfloat16 { elemTy = .float16 }
+            let elemTy = mmaGlobalElemType[g.name] ?? .float32
             let typedTGPtr = IRType.pointer(pointee: elemTy, addressSpace: 3)
             let ssaName = "__base_\(g.name)"
             baseSSAs[g.name] = ssaName
@@ -2700,11 +3154,11 @@ private func transformAirSystemValues(module: IRModule) {
 
             /// Given a descriptor group of `count` scalar params, return the type
             /// pattern matching _expand_descriptor(no metadata): [i64×(2N), i1, i1, i32×N, i64×N].
-            func descriptorTypePattern(count: Int) -> [IRType] {
+            func descriptorTypePattern(count: Int) -> [IRType]? {
                 // count = 4*N + 2 → N = (count - 2) / 4
                 guard count >= 2, (count - 2) % 4 == 0 else {
-                    // Not a recognized descriptor pattern — fall back to i64
-                    return Array(repeating: .int(bits: 64), count: count)
+                    // Not a recognized descriptor pattern — no type inference possible
+                    return nil
                 }
                 let ndim = (count - 2) / 4
                 var types: [IRType] = []
@@ -2722,7 +3176,9 @@ private func transformAirSystemValues(module: IRModule) {
             // that happen to follow a device pointer.
             var descriptorTypeForParam: [Int: IRType] = [:]
             for group in descriptorGroups {
-                let pattern = descriptorTypePattern(count: group.count)
+                guard let pattern = descriptorTypePattern(count: group.count) else {
+                    continue  // Not a descriptor group — dead params default to i32
+                }
                 // Validate: check that live params' load types match the pattern
                 var patternValid = true
                 for offset in 0..<group.count {
@@ -3201,6 +3657,15 @@ private func transformWidenDeviceLoads(module: IRModule) {
                         continue
                     }
 
+                    // bfloat16 loads from bfloat16* don't need widening — types already match.
+                    // Only half-scaled GEP loads (float16 with index÷2) need load-and-extract.
+                    if origType == .bfloat16,
+                       case .pointer(let pointee, _) = ptrVal.type,
+                       pointee == .bfloat16 {
+                        newInsts.append(inst)
+                        continue
+                    }
+
                     inst.type = .float32
                     newInsts.append(inst)
                     let castOpcode: IRInstruction.Opcode
@@ -3252,19 +3717,103 @@ private func transformWidenDeviceLoads(module: IRModule) {
         }
     }
 
+    // Fix store type mismatches for device pointers after MMA half→float conversion.
+    // Half-scaled GEPs (index÷2, float32 stride) have the wrong address for half stores —
+    // two consecutive halves map to the same float32 address, so storing a single half
+    // at the float32-aligned address overwrites the wrong lane.
+    // Fix: create a new GEP with the ORIGINAL (un-halved) index and half* source type.
+    for fn in module.functions where !fn.isDeclaration {
+        // Build map: half-scaled GEP name → (base ptr operand, original index operand)
+        struct HalfGEPInfo {
+            let baseName: String
+            let baseType: IRType
+            let origIdxName: String
+            let origIdxType: IRType
+        }
+        var halfGEPMap: [String: HalfGEPInfo] = [:]
+        for bb in fn.basicBlocks {
+            for inst in bb.instructions where inst.opcode == .getelementptr {
+                if let origIdx = inst.attributes.gepHalfScaledOrigIdx,
+                   inst.operands.count >= 2,
+                   case .value(let baseVal) = inst.operands[0] {
+                    // Find the lshr instruction to get original index type
+                    let lshrName = "\(inst.name)_hidx"
+                    var idxType: IRType = .int(bits: 32)
+                    for bb2 in fn.basicBlocks {
+                        for inst2 in bb2.instructions where inst2.name == lshrName {
+                            if case .value(let v) = inst2.operands[0] {
+                                idxType = v.type
+                            }
+                        }
+                    }
+                    halfGEPMap[inst.name] = HalfGEPInfo(
+                        baseName: baseVal.name, baseType: baseVal.type,
+                        origIdxName: origIdx, origIdxType: idxType
+                    )
+                }
+            }
+        }
+
+        for bb in fn.basicBlocks {
+            var newInsts: [IRInstruction] = []
+            for inst in bb.instructions {
+                if inst.opcode == .store, inst.operands.count >= 2,
+                   case .value(let val) = inst.operands[0],
+                   case .value(let ptr) = inst.operands[1],
+                   case .pointer(let pointee, let addrSpace) = ptr.type,
+                   addrSpace == 1,
+                   pointee != val.type {
+                    // Check if the store pointer is a half-scaled GEP
+                    if let info = halfGEPMap[ptr.name] {
+                        // Bitcast base param (float32*) back to half*, then GEP with original index.
+                        // Metal typed pointers require GEP source type == pointer pointee type.
+                        let halfPtrTy = IRType.pointer(pointee: val.type, addressSpace: addrSpace)
+                        let bcBaseName = "\(ptr.name)_stbase"
+                        let bcBase = IRInstruction(
+                            opcode: .bitcast, type: halfPtrTy, name: bcBaseName,
+                            operands: [.value(IRValue(type: info.baseType, name: info.baseName))])
+                        newInsts.append(bcBase)
+                        let stGepName = "\(ptr.name)_stgep"
+                        let stGep = IRInstruction(
+                            opcode: .getelementptr, type: halfPtrTy, name: stGepName,
+                            operands: [
+                                .value(IRValue(type: halfPtrTy, name: bcBaseName)),
+                                .value(IRValue(type: info.origIdxType, name: info.origIdxName))
+                            ])
+                        stGep.attributes.gepSourceType = val.type
+                        newInsts.append(stGep)
+                        inst.operands[1] = .value(IRValue(type: halfPtrTy, name: stGepName))
+                    } else {
+                        // Non-half-scaled GEP: simple bitcast (address is correct)
+                        let bcName = "\(ptr.name)_stbc"
+                        let bcType = IRType.pointer(pointee: val.type, addressSpace: addrSpace)
+                        let bc = IRInstruction(opcode: .bitcast, type: bcType, name: bcName,
+                                               operands: [.value(ptr)])
+                        newInsts.append(bc)
+                        inst.operands[1] = .value(IRValue(type: bcType, name: bcName))
+                    }
+                }
+                newInsts.append(inst)
+            }
+            bb.instructions = newInsts
+        }
+    }
+
     // Eliminate device pointer bitcasts that become identity after type table collapse.
     // e.g. bitcast i32* %x → i8* becomes bitcast float* → float* (identity) which is invalid.
+    // Only eliminate when source and dest pointee types are the same (true identity).
     let floatDevPtr = IRType.pointer(pointee: .float32, addressSpace: 1)
     for fn in module.functions where !fn.isDeclaration {
         for bb in fn.basicBlocks {
             var renames: [String: String] = [:] // old name → replacement name
             bb.instructions.removeAll { inst in
                 if inst.opcode == .bitcast,
-                   case .pointer(_, 1) = inst.type,
+                   case .pointer(let destPt, 1) = inst.type,
                    inst.operands.count == 1,
                    case .value(let src) = inst.operands[0],
-                   case .pointer(_, 1) = src.type {
-                    // Both source and dest are device pointers — will collapse to same float*
+                   case .pointer(let srcPt, 1) = src.type,
+                   destPt == srcPt {
+                    // Same pointee type — true identity bitcast
                     renames[inst.name] = src.name
                     return true
                 }

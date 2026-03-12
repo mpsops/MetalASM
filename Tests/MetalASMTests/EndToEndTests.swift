@@ -2717,6 +2717,135 @@ extension EndToEndTests {
         #endif
     }
 
+    /// Dot kernel pattern: half device ptrs for both input (load) and output (store-only),
+    /// MMA intrinsics, TG half buffer for layout conversion, bitcast zeroinitializer.
+    /// Tests three fixes:
+    ///   1. bitcast <2 x i64> zeroinitializer to <64 x float> → replaced with zeroinitializer
+    ///   2. half* device ptrs: load ptrs → float* (with index rescaling), store-only ptrs → stay half*
+    ///   3. phi inference: params feeding phis that feed half GEPs are inferred as half*
+    func testDotKernelHalfMMA() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Part 1: PSO creation (tests bitcast zeroinitializer + MMA + half ptrs)
+        let mmaIR = """
+        source_filename = "LLVMDialectModule"
+
+        @__tg_dot_ab_0 = internal addrspace(3) global [512 x float] undef, align 4
+
+        declare void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(<64 x float>, ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare void @air.wg.barrier(i32, i32)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @mma_kernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ptr addrspace(1) %2) {
+          %tid = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tidx = extractvalue [3 x i32] %tid, 0
+          %lane = urem i32 %tidx, 32
+          %a_idx = mul i32 %lane, 8
+          %a_gep = getelementptr half, ptr addrspace(1) %0, i32 %a_idx
+          %a_val = load half, ptr addrspace(1) %a_gep, align 2
+
+          %mma_base = getelementptr float, ptr addrspace(3) @__tg_dot_ab_0, i64 0
+          %mma_a = call <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(
+            ptr addrspace(3) %mma_base,
+            <2 x i64> <i64 64, i64 8>, <2 x i64> <i64 1, i64 64>, <2 x i64> zeroinitializer)
+
+          %zero_acc = bitcast <2 x i64> zeroinitializer to <64 x float>
+          %mma_c = call <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(
+            <64 x float> %mma_a, <64 x float> %mma_a, <64 x float> %zero_acc)
+
+          call void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(
+            <64 x float> %mma_c, ptr addrspace(3) %mma_base,
+            <2 x i64> <i64 64, i64 8>, <2 x i64> <i64 1, i64 64>, <2 x i64> zeroinitializer)
+
+          %out_gep = getelementptr half, ptr addrspace(1) %2, i32 %a_idx
+          store half %a_val, ptr addrspace(1) %out_gep, align 2
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+        let mmaData = try MetalASM.assemble(ir: mmaIR)
+        let device = MTLCreateSystemDefaultDevice()!
+        let mmaLib = try device.makeLibrary(data: asDispatchData(mmaData))
+        let mmaFn = mmaLib.makeFunction(name: "mma_kernel")!
+        let mmaPso = try device.makeComputePipelineState(function: mmaFn)
+        XCTAssertGreaterThan(mmaPso.maxTotalThreadsPerThreadgroup, 0)
+
+        // Part 2: Correctness — half load from A, half store to C (store-only ptr).
+        // Verifies index addressing is correct for both load (float*) and store (half*) paths.
+        let copyIR = """
+        source_filename = "LLVMDialectModule"
+
+        @__tg_dot_ab_0 = internal addrspace(3) global [64 x float] undef, align 4
+
+        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @copy_kernel(ptr addrspace(1) %0, ptr addrspace(1) %1) {
+          %tid = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tidx = extractvalue [3 x i32] %tid, 0
+
+          ; Load half from input (chained GEPs like real dot kernel)
+          %base_gep = getelementptr half, ptr addrspace(1) %0, i32 0
+          %elem_gep = getelementptr half, ptr addrspace(1) %base_gep, i32 %tidx
+          %val = load half, ptr addrspace(1) %elem_gep, align 2
+
+          ; Store half to output (store-only ptr, chained GEPs)
+          %out_base = getelementptr half, ptr addrspace(1) %1, i32 0
+          %out_elem = getelementptr half, ptr addrspace(1) %out_base, i32 %tidx
+          store half %val, ptr addrspace(1) %out_elem, align 2
+
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+        let copyData = try MetalASM.assemble(ir: copyIR)
+        let copyLib = try device.makeLibrary(data: asDispatchData(copyData))
+        let copyFn = copyLib.makeFunction(name: "copy_kernel")!
+        let copyPso = try device.makeComputePipelineState(function: copyFn)
+
+        let n = 64
+        let aBuf = device.makeBuffer(length: n * 2, options: .storageModeShared)!
+        let cBuf = device.makeBuffer(length: n * 2, options: .storageModeShared)!
+        let aPtr = aBuf.contents().bindMemory(to: UInt16.self, capacity: n)
+        let cPtr = cBuf.contents().bindMemory(to: UInt16.self, capacity: n)
+        for i in 0..<n {
+            var f = Float16(i)
+            aPtr[i] = withUnsafeBytes(of: &f) { $0.load(as: UInt16.self) }
+            cPtr[i] = 0xFFFF
+        }
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(copyPso)
+        enc.setBuffer(aBuf, offset: 0, index: 0)
+        enc.setBuffer(cBuf, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: n, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        var failures = 0
+        for i in 0..<n {
+            let aVal = Float16(bitPattern: aPtr[i])
+            let cVal = Float16(bitPattern: cPtr[i])
+            if cVal != aVal { failures += 1 }
+            if i < 4 || cVal != aVal {
+                print("testDotKernelHalfMMA: C[\(i)] = \(cVal), expected \(aVal) \(cVal == aVal ? "OK" : "FAIL")")
+            }
+        }
+        XCTAssertEqual(failures, 0, "\(failures)/\(n) elements wrong")
+        #endif
+    }
+
     /// Minimal repro: advancing ptr phi + MMA load in same loop = GPU JIT crash.
     /// Either alone works. The combination triggers "Failed to materializeAll."
     func testAdvancingPtrPhiWithMMA() throws {
@@ -4216,6 +4345,375 @@ extension EndToEndTests {
         }
         print("testHalfGEPLoadExtractMMA: max_err = \(maxErr)")
         XCTAssertLessThan(maxErr, 0.1, "Half GEP load-and-extract max_err=\(maxErr)")
+        #endif
+    }
+
+    /// Test llvm.minimum.f32 (NaN-propagating) lowering.
+    /// llvm.minimum returns NaN if either operand is NaN.
+    /// Metal only has air.fmin (minnum — NaN-ignoring), so MetalASM must expand
+    /// to fmin + fcmp uno + select.
+    func testLLVMMinimumNaNPropagation() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        source_filename = "test"
+
+        declare float @llvm.minimum.f32(float, float)
+
+        define void @min_nan_kernel(ptr addrspace(1) %A, ptr addrspace(1) %B, ptr addrspace(1) %C) {
+          %tid = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid_x = extractvalue [3 x i32] %tid, 0
+          %idx = zext i32 %tid_x to i64
+          %pa = getelementptr float, ptr addrspace(1) %A, i64 %idx
+          %a = load float, ptr addrspace(1) %pa
+          %pb = getelementptr float, ptr addrspace(1) %B, i64 %idx
+          %b = load float, ptr addrspace(1) %pb
+          %r = call float @llvm.minimum.f32(float %a, float %b)
+          %pc = getelementptr float, ptr addrspace(1) %C, i64 %idx
+          store float %r, ptr addrspace(1) %pc
+          ret void
+        }
+
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "min_nan_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        print("testLLVMMinimumNaNPropagation: PSO OK")
+
+        let N = 4
+        let aBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+        let bBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+        let cBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+
+        let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: N)
+        let bPtr = bBuf.contents().bindMemory(to: Float.self, capacity: N)
+        // lane 0: min(1,2) = 1 (no NaN)
+        // lane 1: min(NaN,3) = NaN (a is NaN)
+        // lane 2: min(4,NaN) = NaN (b is NaN)
+        // lane 3: min(5,2) = 2 (no NaN)
+        aPtr[0] = 1; aPtr[1] = .nan; aPtr[2] = 4; aPtr[3] = 5
+        bPtr[0] = 2; bPtr[1] = 3;    bPtr[2] = .nan; bPtr[3] = 2
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(aBuf, offset: 0, index: 0)
+        enc.setBuffer(bBuf, offset: 0, index: 1)
+        enc.setBuffer(cBuf, offset: 0, index: 2)
+        enc.dispatchThreads(MTLSize(width: N, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: N, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let cPtr = cBuf.contents().bindMemory(to: Float.self, capacity: N)
+        print("testLLVMMinimumNaNPropagation: results = [\(cPtr[0]), \(cPtr[1]), \(cPtr[2]), \(cPtr[3])]")
+        XCTAssertEqual(cPtr[0], 1.0, accuracy: 1e-5, "min(1,2) should be 1")
+        XCTAssert(cPtr[1].isNaN, "min(NaN,3) should be NaN")
+        XCTAssert(cPtr[2].isNaN, "min(4,NaN) should be NaN")
+        XCTAssertEqual(cPtr[3], 2.0, accuracy: 1e-5, "min(5,2) should be 2")
+        #endif
+    }
+
+    /// Test llvm.maximum.f32 (NaN-propagating) lowering.
+    func testLLVMMaximumNaNPropagation() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        let ir = """
+        source_filename = "test"
+
+        declare float @llvm.maximum.f32(float, float)
+
+        define void @max_nan_kernel(ptr addrspace(1) %A, ptr addrspace(1) %B, ptr addrspace(1) %C) {
+          %tid = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid_x = extractvalue [3 x i32] %tid, 0
+          %idx = zext i32 %tid_x to i64
+          %pa = getelementptr float, ptr addrspace(1) %A, i64 %idx
+          %a = load float, ptr addrspace(1) %pa
+          %pb = getelementptr float, ptr addrspace(1) %B, i64 %idx
+          %b = load float, ptr addrspace(1) %pb
+          %r = call float @llvm.maximum.f32(float %a, float %b)
+          %pc = getelementptr float, ptr addrspace(1) %C, i64 %idx
+          store float %r, ptr addrspace(1) %pc
+          ret void
+        }
+
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+        """
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "max_nan_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        print("testLLVMMaximumNaNPropagation: PSO OK")
+
+        let N = 4
+        let aBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+        let bBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+        let cBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+
+        let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: N)
+        let bPtr = bBuf.contents().bindMemory(to: Float.self, capacity: N)
+        // lane 0: max(1,2) = 2 (no NaN)
+        // lane 1: max(NaN,3) = NaN (a is NaN)
+        // lane 2: max(4,NaN) = NaN (b is NaN)
+        // lane 3: max(5,2) = 5 (no NaN)
+        aPtr[0] = 1; aPtr[1] = .nan; aPtr[2] = 4; aPtr[3] = 5
+        bPtr[0] = 2; bPtr[1] = 3;    bPtr[2] = .nan; bPtr[3] = 2
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(aBuf, offset: 0, index: 0)
+        enc.setBuffer(bBuf, offset: 0, index: 1)
+        enc.setBuffer(cBuf, offset: 0, index: 2)
+        enc.dispatchThreads(MTLSize(width: N, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: N, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let cPtr = cBuf.contents().bindMemory(to: Float.self, capacity: N)
+        print("testLLVMMaximumNaNPropagation: results = [\(cPtr[0]), \(cPtr[1]), \(cPtr[2]), \(cPtr[3])]")
+        XCTAssertEqual(cPtr[0], 2.0, accuracy: 1e-5, "max(1,2) should be 2")
+        XCTAssert(cPtr[1].isNaN, "max(NaN,3) should be NaN")
+        XCTAssert(cPtr[2].isNaN, "max(4,NaN) should be NaN")
+        XCTAssertEqual(cPtr[3], 5.0, accuracy: 1e-5, "max(5,2) should be 5")
+        #endif
+    }
+
+    /// 16x16 dot kernel LLIR with dual TG globals (__tg_cvt_0 + __tg_dot_ab_0).
+    /// Tests that MetalASM keeps them separate (no coalescing without MMA calls).
+    /// No scalar buffer, 3 device ptrs.
+    func testDualTGGlobalDot16x16() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // 16x16 dot-like kernel using TG-based scatter/gather (no MMA calls).
+        // Has two TG globals that must NOT be coalesced.
+        let ir = """
+        ; ModuleID = 'LLVMDialectModule'
+        source_filename = "LLVMDialectModule"
+
+        @__tg_cvt_0 = internal addrspace(3) global [256 x float] undef, align 4
+        @__tg_dot_ab_0 = internal addrspace(3) global [256 x float] undef, align 4
+        @global_smem = internal addrspace(3) global [1024 x i8] undef, align 16
+
+        declare void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(<64 x float>, ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare void @air.simdgroup.barrier(i32, i32)
+        declare void @air.threadgroup.barrier(i32, i32)
+        declare i32 @air.thread_index_in_simdgroup()
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @dot_kernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ptr addrspace(1) %2) {
+          %4 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %5 = extractvalue [3 x i32] %4, 0
+          %6 = zext i32 %5 to i64
+          %7 = trunc i64 %6 to i32
+          %8 = and i32 %7, 127
+          %9 = urem i32 %8, 32
+          %10 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %11 = extractvalue [3 x i32] %10, 0
+          %12 = udiv i32 %11, 32
+          %13 = shl i32 %9, 0
+          %14 = or i32 0, %13
+          %15 = shl i32 %12, 5
+          %16 = or i32 %14, %15
+          %17 = and i32 %16, 120
+          %18 = lshr i32 %17, 3
+          %19 = or disjoint i32 %18, 0
+          %20 = xor i32 0, %19
+          %21 = xor i32 %20, 0
+          %22 = add i32 %21, 0
+          %23 = mul i32 %22, 16
+          %24 = getelementptr float, ptr addrspace(1) %0, i32 %23
+          %25 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %26 = extractvalue [3 x i32] %25, 0
+          %27 = zext i32 %26 to i64
+          %28 = trunc i64 %27 to i32
+          %29 = and i32 %28, 127
+          %30 = urem i32 %29, 32
+          %31 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %32 = extractvalue [3 x i32] %31, 0
+          %33 = udiv i32 %32, 32
+          %34 = shl i32 %30, 0
+          %35 = or i32 0, %34
+          %36 = shl i32 %33, 5
+          %37 = or i32 %35, %36
+          %38 = and i32 %37, 7
+          %39 = shl i32 %38, 1
+          %40 = or disjoint i32 %39, 0
+          %41 = xor i32 0, %40
+          %42 = xor i32 %41, 0
+          %43 = xor i32 %41, 1
+          %44 = add i32 %42, 0
+          %45 = add i32 %43, 0
+          %46 = getelementptr float, ptr addrspace(1) %24, i32 %44
+          %47 = getelementptr float, ptr addrspace(1) %24, i32 %45
+          %48 = load float, ptr addrspace(1) %46, align 4
+          %49 = load float, ptr addrspace(1) %47, align 4
+          %50 = getelementptr float, ptr addrspace(1) %1, i32 %23
+          %51 = getelementptr float, ptr addrspace(1) %50, i32 %44
+          %52 = getelementptr float, ptr addrspace(1) %50, i32 %45
+          %53 = load float, ptr addrspace(1) %51, align 4
+          %54 = load float, ptr addrspace(1) %52, align 4
+          %55 = call i32 @air.thread_index_in_simdgroup()
+          %56 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %57 = extractvalue [3 x i32] %56, 0
+          %58 = udiv i32 %57, 32
+          %59 = udiv i32 %55, 8
+          %60 = urem i32 %55, 8
+          %61 = mul i32 %58, 4
+          %62 = add i32 %61, %59
+          %63 = mul i32 %60, 2
+          %64 = add i32 0, %63
+          %65 = udiv i32 %55, 16
+          %66 = urem i32 %55, 16
+          %67 = mul i32 %58, 2
+          %68 = add i32 %67, %65
+          %69 = add i32 0, %66
+          %70 = mul i32 %62, 16
+          %71 = add i32 %70, %64
+          %72 = zext i32 %71 to i64
+          %73 = getelementptr float, ptr addrspace(3) @__tg_dot_ab_0, i64 %72
+          store float %48, ptr addrspace(3) %73, align 4
+          %74 = add i32 %64, 1
+          %75 = add i32 %70, %74
+          %76 = zext i32 %75 to i64
+          %77 = getelementptr float, ptr addrspace(3) @__tg_dot_ab_0, i64 %76
+          store float %49, ptr addrspace(3) %77, align 4
+          call void @air.threadgroup.barrier(i32 1, i32 4)
+          call void @air.threadgroup.barrier(i32 1, i32 4)
+          %78 = mul i32 %68, 16
+          %79 = add i32 %78, %69
+          %80 = zext i32 %79 to i64
+          %81 = getelementptr float, ptr addrspace(3) @__tg_dot_ab_0, i64 %80
+          store float 0.000000e+00, ptr addrspace(3) %81, align 4
+          %82 = add i32 %68, 8
+          %83 = mul i32 %82, 16
+          %84 = add i32 %83, %69
+          %85 = zext i32 %84 to i64
+          %86 = getelementptr float, ptr addrspace(3) @__tg_dot_ab_0, i64 %85
+          store float 0.000000e+00, ptr addrspace(3) %86, align 4
+          call void @air.threadgroup.barrier(i32 1, i32 4)
+          call void @air.threadgroup.barrier(i32 1, i32 4)
+          store float %53, ptr addrspace(3) %73, align 4
+          store float %54, ptr addrspace(3) %77, align 4
+          call void @air.threadgroup.barrier(i32 1, i32 4)
+          call void @air.threadgroup.barrier(i32 1, i32 4)
+          call void @air.threadgroup.barrier(i32 1, i32 4)
+          %87 = load float, ptr addrspace(3) %81, align 4
+          %88 = load float, ptr addrspace(3) %86, align 4
+          %89 = getelementptr float, ptr addrspace(1) %2, i32 %23
+          %90 = getelementptr float, ptr addrspace(1) %89, i32 %44
+          %91 = getelementptr float, ptr addrspace(1) %89, i32 %45
+          %92 = call i32 @air.thread_index_in_simdgroup()
+          %93 = call [3 x i32] @air.thread_position_in_threadgroup()
+          %94 = extractvalue [3 x i32] %93, 0
+          %95 = udiv i32 %94, 32
+          %96 = udiv i32 %92, 16
+          %97 = urem i32 %92, 16
+          %98 = mul i32 %95, 2
+          %99 = add i32 %98, %96
+          %100 = add i32 0, %97
+          %101 = udiv i32 %92, 8
+          %102 = urem i32 %92, 8
+          %103 = mul i32 %95, 4
+          %104 = add i32 %103, %101
+          %105 = mul i32 %102, 2
+          %106 = add i32 0, %105
+          br i1 true, label %107, label %117
+
+        107:
+          %108 = mul i32 %99, 16
+          %109 = add i32 %108, %100
+          %110 = zext i32 %109 to i64
+          %111 = getelementptr float, ptr addrspace(3) @__tg_cvt_0, i64 %110
+          store float %87, ptr addrspace(3) %111, align 4
+          %112 = add i32 %99, 8
+          %113 = mul i32 %112, 16
+          %114 = add i32 %113, %100
+          %115 = zext i32 %114 to i64
+          %116 = getelementptr float, ptr addrspace(3) @__tg_cvt_0, i64 %115
+          store float %88, ptr addrspace(3) %116, align 4
+          br label %117
+
+        117:
+          call void @air.threadgroup.barrier(i32 1, i32 4)
+          %118 = mul i32 %104, 16
+          %119 = add i32 %118, %106
+          %120 = zext i32 %119 to i64
+          %121 = getelementptr float, ptr addrspace(3) @__tg_cvt_0, i64 %120
+          %122 = load float, ptr addrspace(3) %121, align 4
+          %123 = add i32 %106, 1
+          %124 = add i32 %118, %123
+          %125 = zext i32 %124 to i64
+          %126 = getelementptr float, ptr addrspace(3) @__tg_cvt_0, i64 %125
+          %127 = load float, ptr addrspace(3) %126, align 4
+          store float %122, ptr addrspace(1) %90, align 4
+          store float %127, ptr addrspace(1) %91, align 4
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        let M = 16, N = 16, K = 16
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "dot_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+
+        // This LLIR has no MMA calls — it's a scatter/gather through two TG buffers.
+        // The kernel passes B values through to output (B is scattered last to __tg_dot_ab_0,
+        // then gathered via __tg_cvt_0). This tests that MetalASM keeps __tg_cvt_0 and
+        // __tg_dot_ab_0 as separate globals (no coalescing without MMA).
+        let aBuf = device.makeBuffer(length: M * K * 4, options: .storageModeShared)!
+        let bBuf = device.makeBuffer(length: K * N * 4, options: .storageModeShared)!
+        let cBuf = device.makeBuffer(length: M * N * 4, options: .storageModeShared)!
+        let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: M * K)
+        let bPtr = bBuf.contents().bindMemory(to: Float.self, capacity: K * N)
+        let cPtr = cBuf.contents().bindMemory(to: Float.self, capacity: M * N)
+        for i in 0..<(M * K) { aPtr[i] = Float(i % 5 + 1) }   // A = 1..5
+        for i in 0..<(K * N) { bPtr[i] = Float(i % 3 + 10) }  // B = 10..12
+        for i in 0..<(M * N) { cPtr[i] = -999.0 }  // sentinel
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(aBuf, offset: 0, index: 0)
+        enc.setBuffer(bBuf, offset: 0, index: 1)
+        enc.setBuffer(cBuf, offset: 0, index: 2)
+        // 4 warps × 32 threads = 128 threads in one threadgroup
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // Verify output = B values (no MMA, B is passed through)
+        var failures = 0
+        for i in 0..<M {
+            for j in 0..<N {
+                let got = cPtr[i * N + j]
+                let expected = bPtr[i * N + j]
+                if abs(got - expected) > 0.01 { failures += 1 }
+            }
+        }
+        print("testDualTGGlobalDot16x16: \(failures == 0 ? "OK" : "FAIL \(failures)/\(M*N)")")
+        XCTAssertEqual(failures, 0, "\(failures)/\(M*N) elements wrong — TG global coalescing bug?")
         #endif
     }
 }
