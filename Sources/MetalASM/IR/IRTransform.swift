@@ -2087,6 +2087,8 @@ private func transformTGGlobalCoalesce(module: IRModule) {
         // Resize target if cvt is larger
         if cvt.count > target.count {
             target.global.valueType = .array(element: cvt.elemType, count: cvt.count)
+            // Must also update .type (pointer to valueType) — bitcode writer uses .type
+            target.global.type = .pointer(pointee: target.global.valueType, addressSpace: target.global.addressSpace)
         }
 
         // Remove cvt global
