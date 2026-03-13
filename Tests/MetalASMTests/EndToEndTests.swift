@@ -5115,4 +5115,324 @@ extension EndToEndTests {
         }
         #endif
     }
+
+    /// Test: i8 GEPs converted to float GEPs (offset/4) on a float TG global.
+    /// This is the approach for merging byte+MMA globals into one float global.
+    func testTGByteToFloatGEPConversion() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Same as byte GEP test but with i8 GEP converted to float GEP:
+        // instead of `getelementptr i8, @tg, byteOff` we do
+        // `lshr byteOff, 2` then `getelementptr float, @tg, floatIdx`
+        let ir = """
+        ; ModuleID = 'LLVMDialectModule'
+        source_filename = "LLVMDialectModule"
+
+        @tg_buf = internal addrspace(3) global [64 x float] undef, align 16
+
+        declare void @air.threadgroup.barrier(i32, i32)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @cvt_gep_kernel(ptr addrspace(1) %In, ptr addrspace(1) %Out) {
+          %tidArr = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tidArr, 0
+          %tid64 = zext i32 %tid to i64
+
+          ; Load from device
+          %inAddr = getelementptr float, ptr addrspace(1) %In, i64 %tid64
+          %val = load float, ptr addrspace(1) %inAddr, align 4
+
+          ; CONVERTED: byte offset → float index via lshr by 2
+          %byteOff = mul i32 %tid, 4
+          %floatIdx = lshr i32 %byteOff, 2
+          %floatIdx64 = zext i32 %floatIdx to i64
+          %tgAddr = getelementptr float, ptr addrspace(3) @tg_buf, i64 %floatIdx64
+          store float %val, ptr addrspace(3) %tgAddr, align 4
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+
+          ; Load back via float GEP
+          %tgAddr2 = getelementptr float, ptr addrspace(3) @tg_buf, i64 %tid64
+          %val2 = load float, ptr addrspace(3) %tgAddr2, align 4
+
+          ; Store to output
+          %outAddr = getelementptr float, ptr addrspace(1) %Out, i64 %tid64
+          store float %val2, ptr addrspace(1) %outAddr, align 4
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "cvt_gep_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        print("testTGByteToFloatGEPConversion: PSO OK")
+
+        let N = 32
+        let inBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+        let outBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+        let inPtr = inBuf.contents().bindMemory(to: Float.self, capacity: N)
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: N)
+        for i in 0..<N { inPtr[i] = Float(i + 1); outPtr[i] = -999 }
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        var failures = 0
+        for i in 0..<N {
+            if abs(outPtr[i] - Float(i + 1)) > 0.01 { failures += 1 }
+        }
+        print("testTGByteToFloatGEPConversion: \(failures == 0 ? "OK" : "FAIL \(failures)/\(N)")")
+        XCTAssertEqual(failures, 0, "byte-to-float GEP conversion round-trip failed")
+        #endif
+    }
+
+    /// Test: can float-typed GEPs work on a byte-typed TG global?
+    /// (Expected to FAIL — confirms Metal requires matching GEP/global types)
+    func testTGFloatGEPOnByteGlobal() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Kernel with [512 x i8] global. MMA load uses a float-typed GEP
+        // on the byte global (getelementptr float, @global, i64 idx).
+        // This should work because opaque pointers allow GEP source type
+        // to differ from the global's element type.
+        let ir = """
+        ; ModuleID = 'LLVMDialectModule'
+        source_filename = "LLVMDialectModule"
+
+        @global_smem = internal addrspace(3) global [512 x i8] undef, align 16
+
+        declare void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(<64 x float>, ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare void @air.simdgroup.barrier(i32, i32)
+        declare void @air.threadgroup.barrier(i32, i32)
+        declare i32 @air.thread_index_in_simdgroup()
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @float_gep_kernel(ptr addrspace(1) %A, ptr addrspace(1) %B, ptr addrspace(1) %C) {
+          %tidArr = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tidArr, 0
+          %tid64 = zext i32 %tid to i64
+
+          ; Scatter A into TG using FLOAT-typed GEP on byte global
+          %aAddr = getelementptr float, ptr addrspace(1) %A, i64 %tid64
+          %aVal = load float, ptr addrspace(1) %aAddr, align 4
+          %tgAddr = getelementptr float, ptr addrspace(3) @global_smem, i64 %tid64
+          store float %aVal, ptr addrspace(3) %tgAddr, align 4
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+
+          ; MMA load from TG — also uses float-typed GEP on byte global
+          %origin = insertelement <2 x i64> zeroinitializer, i64 0, i32 0
+          %origin2 = insertelement <2 x i64> %origin, i64 0, i32 1
+          %stride = insertelement <2 x i64> zeroinitializer, i64 8, i32 0
+          %stride2 = insertelement <2 x i64> %stride, i64 1, i32 1
+          %aTile = call <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(
+              ptr addrspace(3) @global_smem, <2 x i64> %origin2, <2 x i64> %stride2, <2 x i64> %stride2)
+
+          ; Load B and MMA
+          %bAddr = getelementptr float, ptr addrspace(1) %B, i64 %tid64
+          %bVal = load float, ptr addrspace(1) %bAddr, align 4
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+          store float %bVal, ptr addrspace(3) %tgAddr, align 4
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+          %bTile = call <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(
+              ptr addrspace(3) @global_smem, <2 x i64> %origin2, <2 x i64> %stride2, <2 x i64> %stride2)
+
+          %zeros = shufflevector <64 x float> zeroinitializer, <64 x float> zeroinitializer,
+              <64 x i32> zeroinitializer
+          %cTile = call <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(
+              <64 x float> %aTile, <64 x float> %bTile, <64 x float> %zeros)
+
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+          call void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(
+              <64 x float> %cTile, ptr addrspace(3) @global_smem,
+              <2 x i64> %origin2, <2 x i64> %stride2, <2 x i64> %stride2)
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+
+          %cVal = load float, ptr addrspace(3) %tgAddr, align 4
+          %cAddr = getelementptr float, ptr addrspace(1) %C, i64 %tid64
+          store float %cVal, ptr addrspace(1) %cAddr, align 4
+
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        // This SHOULD fail — Metal GPU JIT rejects float-typed GEPs on i8 globals.
+        // This test confirms the constraint that motivates the TG merge transform.
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "float_gep_kernel")!
+        XCTAssertThrowsError(try device.makeComputePipelineState(function: fn),
+                             "Expected materializeAll failure for float GEP on byte global") { error in
+            let msg = "\(error)"
+            XCTAssertTrue(msg.contains("materializeAll"), "Expected materializeAll, got: \(msg)")
+        }
+        print("testTGFloatGEPOnByteGlobal: correctly rejected (materializeAll)")
+        #endif
+    }
+
+    /// Test that MMA TG globals are merged into global_smem when their combined
+    /// size would exceed 32KB. This reproduces the fla chunk_scaled_dot_kkt
+    /// failure where global_smem = [32768 x i8] + __tg_dot_ab_0 = [257 x float]
+    /// stacks to >32KB causing "Failed to materializeAll".
+    ///
+    /// The fix: MetalASM should merge MMA globals into global_smem (alias at
+    /// offset 0) since they're used between barriers and don't overlap.
+    func testTGMergeOverflow32KB() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Minimal kernel: scatter A[8x8] into __tg_dot_ab_0 via float GEPs,
+        // MMA load/multiply/store, gather result via __tg_dot_ab_0, store to C.
+        // global_smem is [32768 x i8] — just large enough to fill 32KB alone.
+        // Without merging, total TG = 32768 + 257*4 = 33796 > 32768 → crash.
+        let ir = """
+        ; ModuleID = 'LLVMDialectModule'
+        source_filename = "LLVMDialectModule"
+
+        @__tg_dot_ab_0 = internal addrspace(3) global [257 x float] undef, align 4
+        @global_smem = internal addrspace(3) global [32768 x i8] undef, align 16
+
+        declare void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(<64 x float>, ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+        declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(ptr addrspace(3), <2 x i64>, <2 x i64>, <2 x i64>)
+        declare void @air.simdgroup.barrier(i32, i32)
+        declare void @air.threadgroup.barrier(i32, i32)
+        declare i32 @air.thread_index_in_simdgroup()
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @merge_kernel(ptr addrspace(1) %A, ptr addrspace(1) %B, ptr addrspace(1) %C) {
+          ; --- Thread indexing (64 threads = 2 warps, warp 0 does MMA) ---
+          %tidArr = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tidArr, 0
+
+          ; --- Each thread loads 1 element from A and scatters to TG ---
+          %tid64 = zext i32 %tid to i64
+          %aAddr = getelementptr float, ptr addrspace(1) %A, i64 %tid64
+          %aVal = load float, ptr addrspace(1) %aAddr, align 4
+          %tgAddr = getelementptr float, ptr addrspace(3) @__tg_dot_ab_0, i64 %tid64
+          store float %aVal, ptr addrspace(3) %tgAddr, align 4
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+
+          ; --- MMA load A tile from TG (all warps execute, only warp 0 matters) ---
+          %aOrigin = insertelement <2 x i64> zeroinitializer, i64 0, i32 0
+          %aOrigin2 = insertelement <2 x i64> %aOrigin, i64 0, i32 1
+          %aStride = insertelement <2 x i64> zeroinitializer, i64 8, i32 0
+          %aStride2 = insertelement <2 x i64> %aStride, i64 1, i32 1
+          %aTile = call <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(
+              ptr addrspace(3) @__tg_dot_ab_0, <2 x i64> %aOrigin2, <2 x i64> %aStride2, <2 x i64> %aStride2)
+
+          ; --- Load B into TG (all 64 threads scatter) ---
+          %bAddr = getelementptr float, ptr addrspace(1) %B, i64 %tid64
+          %bVal = load float, ptr addrspace(1) %bAddr, align 4
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+          store float %bVal, ptr addrspace(3) %tgAddr, align 4
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+
+          ; --- MMA load B tile from TG ---
+          %bTile = call <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p3f32(
+              ptr addrspace(3) @__tg_dot_ab_0, <2 x i64> %aOrigin2, <2 x i64> %aStride2, <2 x i64> %aStride2)
+
+          ; --- MMA: C = A * B + 0 ---
+          %zeros = shufflevector <64 x float> zeroinitializer, <64 x float> zeroinitializer,
+              <64 x i32> zeroinitializer
+          %cTile = call <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(
+              <64 x float> %aTile, <64 x float> %bTile, <64 x float> %zeros)
+
+          ; --- MMA store result to TG ---
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+          call void @air.simdgroup_matrix_8x8_store.v64f32.p3f32(
+              <64 x float> %cTile, ptr addrspace(3) @__tg_dot_ab_0,
+              <2 x i64> %aOrigin2, <2 x i64> %aStride2, <2 x i64> %aStride2)
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+
+          ; --- Gather result from TG and store to C ---
+          %cVal = load float, ptr addrspace(3) %tgAddr, align 4
+          %cAddr = getelementptr float, ptr addrspace(1) %C, i64 %tid64
+          store float %cVal, ptr addrspace(1) %cAddr, align 4
+
+          ; Touch global_smem via i8 GEP (simulates Triton shared memory access)
+          ; The merge transform should convert this i8 GEP to a float GEP
+          %byteOff = shl i32 %tid, 2
+          %smemPtr = getelementptr i8, ptr addrspace(3) @global_smem, i32 %byteOff
+          store float %aVal, ptr addrspace(3) %smemPtr, align 4
+
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        // Step 1: Just assemble + create PSO. If TG globals stack, this crashes.
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "merge_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        print("testTGMergeOverflow32KB: PSO created OK (TG merge worked)")
+
+        // Step 2: Run the kernel and verify A @ B = C for 8x8 identity-like test
+        let N = 64  // 8x8 = 64 floats
+        let aBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+        let bBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+        let cBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+
+        // A = identity 8x8, B = identity 8x8 → C should be identity
+        let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: N)
+        let bPtr = bBuf.contents().bindMemory(to: Float.self, capacity: N)
+        let cPtr = cBuf.contents().bindMemory(to: Float.self, capacity: N)
+        for i in 0..<N { aPtr[i] = 0; bPtr[i] = 0; cPtr[i] = -999 }
+        for i in 0..<8 { aPtr[i * 8 + i] = 1.0; bPtr[i * 8 + i] = 1.0 }
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(aBuf, offset: 0, index: 0)
+        enc.setBuffer(bBuf, offset: 0, index: 1)
+        enc.setBuffer(cBuf, offset: 0, index: 2)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // I @ I = I
+        var failures = 0
+        for i in 0..<8 {
+            for j in 0..<8 {
+                let got = cPtr[i * 8 + j]
+                let expected: Float = (i == j) ? 1.0 : 0.0
+                if abs(got - expected) > 0.01 {
+                    failures += 1
+                    if failures <= 8 {
+                        print("  [\(i),\(j)] got=\(got) expected=\(expected)")
+                    }
+                }
+            }
+        }
+        print("testTGMergeOverflow32KB: \(failures == 0 ? "OK" : "FAIL \(failures)/64")")
+        XCTAssertEqual(failures, 0, "MMA result wrong after TG merge")
+        #endif
+    }
 }

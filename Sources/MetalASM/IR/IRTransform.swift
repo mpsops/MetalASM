@@ -2116,6 +2116,126 @@ private func transformTGGlobalGEPs(module: IRModule) {
         }
     }
 
+    // --- TG Global Merge ---
+    // When both byte globals ([N x i8]) and MMA globals ([M x float]) coexist,
+    // Metal sums their sizes for total TG memory. If the sum exceeds 32KB,
+    // pipeline creation fails ("Failed to materializeAll").
+    //
+    // Fix: merge everything into a single [N x float] global. The MMA globals
+    // and byte globals are used between barriers and don't overlap, so they
+    // can alias the same physical memory.
+    //
+    // Steps:
+    //   1. Resize to max(byteSize, mmaSize) as [N x float]
+    //   2. Convert all i8-typed GEPs to float-typed GEPs (lshr offset, 2)
+    //   3. Redirect MMA global references to the merged global
+    //   4. Remove old MMA globals
+    if !byteGlobals.isEmpty && !mmaGlobals.isEmpty {
+        // Find the primary byte global (global_smem) and compute merged size
+        let primaryByteGlobal = byteGlobals[0]
+        var maxBytes = 0
+        if case .array(_, let n) = primaryByteGlobal.valueType {
+            maxBytes = n
+        }
+        for mma in mmaGlobals {
+            if case .array(let elemTy, let count) = mma.arrayType {
+                let elemSize: Int
+                switch elemTy {
+                case .float32, .i32: elemSize = 4
+                case .float16, .bfloat16, .i16: elemSize = 2
+                case .float64, .i64: elemSize = 8
+                default: elemSize = 4
+                }
+                maxBytes = max(maxBytes, count * elemSize)
+            }
+        }
+        // Round up to multiple of 4 for float count
+        let floatCount = (maxBytes + 3) / 4
+
+        // Step 1: Change byte global to [floatCount x float]
+        let newArrayType = IRType.array(element: .float32, count: floatCount)
+        primaryByteGlobal.valueType = newArrayType
+        primaryByteGlobal.type = .pointer(pointee: newArrayType, addressSpace: 3)
+        // Update initializer to match new type (undef of new array type)
+        if primaryByteGlobal.initializer != nil {
+            primaryByteGlobal.initializer = .undef(newArrayType)
+        }
+
+        // Step 2: Convert i8-typed GEPs on the primary byte global to float-typed GEPs.
+        // For each `getelementptr i8, @global_smem, %byteOffset`:
+        //   → insert `%floatIdx = lshr i32 %byteOffset, 2`
+        //   → replace with `getelementptr float, @global_smem, %floatIdx`
+        let mergedName = primaryByteGlobal.name
+        for fn in module.functions where !fn.isDeclaration {
+            for bb in fn.basicBlocks {
+                var newInsts: [IRInstruction] = []
+                for inst in bb.instructions {
+                    if inst.opcode == .getelementptr,
+                       inst.operands.count >= 2,
+                       case .i8 = inst.attributes.gepSourceType,
+                       case .value(let baseVal) = inst.operands[0],
+                       baseVal.name == mergedName || baseVal.name == "__base_\(mergedName)" {
+                        // Insert lshr to convert byte offset to float index
+                        let offsetOp = inst.operands[1]
+                        let shiftName = "\(inst.name ?? "gep")_shr"
+
+                        // Check if offset is constant
+                        if case .constant(let c) = offsetOp, case .integer(_, let val) = c {
+                            // Constant offset: just divide by 4
+                            let floatIdx = val / 4
+                            inst.operands[1] = .constant(.integer(.i32, floatIdx))
+                        } else {
+                            // Dynamic offset: insert lshr
+                            let shiftInst = IRInstruction(
+                                opcode: .lshr,
+                                type: .i32,
+                                name: shiftName,
+                                operands: [
+                                    offsetOp,
+                                    .constant(.integer(.i32, 2)),
+                                ],
+                                attributes: IRInstruction.InstructionAttributes()
+                            )
+                            newInsts.append(shiftInst)
+                            inst.operands[1] = .value(IRValue(type: .i32, name: shiftName))
+                        }
+                        // Change GEP source type from i8 to float
+                        inst.attributes.gepSourceType = .float32
+                        // Update result type to float*(3)
+                        inst.type = .pointer(pointee: .float32, addressSpace: 3)
+                    }
+                    newInsts.append(inst)
+                }
+                bb.instructions = newInsts
+            }
+        }
+
+        // Step 3: Redirect all MMA global references to the merged global
+        let mmaNames = Set(mmaGlobals.map { $0.name })
+        for fn in module.functions where !fn.isDeclaration {
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    for i in inst.operands.indices {
+                        if case .value(let v) = inst.operands[i], mmaNames.contains(v.name) {
+                            inst.operands[i] = .value(IRValue(type: v.type, name: mergedName))
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 4: Remove old MMA globals from module
+        module.globals.removeAll(where: { mmaNames.contains($0.name) })
+
+        // Step 5: Update classification — everything is now one float global
+        // Remove additional byte globals that were merged (keep only for split-offset processing)
+        let mergedMmaEntry = (name: mergedName, arrayType: newArrayType, count: floatCount)
+        // Clear byte globals (the primary is now float-typed) and add to mmaGlobals
+        byteGlobals.removeAll()
+        mmaGlobals.removeAll()
+        mmaGlobals.append(mergedMmaEntry)
+    }
+
     // Flatten constant GEP offsets for ALL TG globals. The bitcode writer
     // ignores constantGEPByteOffset, so inline constant GEP expressions like
     // `getelementptr i8, @__tg_cvt_0, 4` must be expanded into explicit GEP
@@ -2576,6 +2696,36 @@ private func transformTGGlobalGEPs(module: IRModule) {
                             castMap[key] = cast
                         }
                         inst.operands[0] = .value(IRValue(type: cast.type, name: cast.name))
+                    }
+                    // Insert bitcast for MMA load/store calls on i8*(3) TG pointers
+                    if inst.opcode == .call,
+                       inst.operands.count >= 2,
+                       case .value(let callee) = inst.operands.last,
+                       callee.name.hasPrefix("air.simdgroup_matrix_8x8_") {
+                        let ptrIdx = callee.name.contains("_load") ? 0 : 1
+                        if ptrIdx < inst.operands.count,
+                           case .value(let ptrVal) = inst.operands[ptrIdx],
+                           gepResultNames.contains(ptrVal.name) || byteSSANames.contains(ptrVal.name) {
+                            let key = "\(ptrVal.name)_mma"
+                            let castType = IRType.pointer(pointee: .float32, addressSpace: 3)
+                            let cast: (name: String, type: IRType)
+                            if let existing = castMap[key], existing.type == castType {
+                                cast = existing
+                            } else {
+                                let castName = "__bc_\(ptrVal.name)_\(newInsts.count)"
+                                let bitcast = IRInstruction(
+                                    opcode: .bitcast,
+                                    type: castType,
+                                    name: castName,
+                                    operands: [.value(IRValue(type: i8TGPtr, name: ptrVal.name))],
+                                    attributes: IRInstruction.InstructionAttributes()
+                                )
+                                newInsts.append(bitcast)
+                                cast = (castName, castType)
+                                castMap[key] = cast
+                            }
+                            inst.operands[ptrIdx] = .value(IRValue(type: cast.type, name: cast.name))
+                        }
                     }
                     newInsts.append(inst)
                 }
