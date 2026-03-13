@@ -5435,4 +5435,115 @@ extension EndToEndTests {
         XCTAssertEqual(failures, 0, "MMA result wrong after TG merge")
         #endif
     }
+
+    /// Test: bf16 bitcast on addrspace(3) pointer crashes Metal GPU JIT.
+    /// MetalASM must rewrite pointer bitcasts to value bitcasts.
+    ///
+    /// Real pattern from Triton delta_rule after TG merge:
+    ///   @global_smem = [N x float]
+    ///   %fptr = getelementptr float, @global_smem, %idx  → float*(3)
+    ///   %bfptr = bitcast float*(3) → <2 x bfloat>*(3)   ← CRASH
+    ///   store <2 x bfloat>, %bfptr
+    func testTGBF16BitcastStore() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Uses [1024 x i8] global (no MMA globals → TG merge won't fire).
+        // i8 GEPs + bitcast i8*(3) → <2 x bfloat>*(3) crashes Metal GPU JIT.
+        // Transform must rewrite to value bitcast + compatible store type.
+        let ir = """
+        ; ModuleID = 'LLVMDialectModule'
+        source_filename = "LLVMDialectModule"
+
+        @global_smem = internal addrspace(3) global [1024 x i8] undef, align 16
+
+        declare void @air.threadgroup.barrier(i32, i32)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @bf16_tg_kernel(ptr addrspace(1) %A, ptr addrspace(1) %C) {
+          %tidArr = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tidArr, 0
+
+          ; Base pointer to shared memory (i8 GEP, as Triton emits)
+          %base = getelementptr i8, ptr addrspace(3) @global_smem, i32 0
+          %tid64 = zext i32 %tid to i64
+
+          ; Load float from A
+          %aAddr = getelementptr float, ptr addrspace(1) %A, i64 %tid64
+          %aVal = load float, ptr addrspace(1) %aAddr, align 4
+
+          ; Truncate to bf16
+          %bf = fptrunc float %aVal to bfloat
+
+          ; Build <2 x bfloat> = {bf, bf}
+          %v0 = insertelement <2 x bfloat> undef, bfloat %bf, i32 0
+          %v1 = insertelement <2 x bfloat> %v0, bfloat %bf, i32 1
+
+          ; Get float* into TG
+          %fptr = getelementptr float, ptr addrspace(3) %base, i64 %tid64
+
+          ; THE PROBLEMATIC PATTERN: bitcast float*(3) → <2 x bfloat>*(3)
+          %bfptr = bitcast ptr addrspace(3) %fptr to ptr addrspace(3)
+          store <2 x bfloat> %v1, ptr addrspace(3) %bfptr, align 4
+
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+
+          ; Load back as <2 x bfloat>
+          %bfptr2 = bitcast ptr addrspace(3) %fptr to ptr addrspace(3)
+          %v_back = load <2 x bfloat>, ptr addrspace(3) %bfptr2, align 4
+          %elem = extractelement <2 x bfloat> %v_back, i32 0
+
+          ; Convert back to float and store to C
+          %result = fpext bfloat %elem to float
+          %cAddr = getelementptr float, ptr addrspace(1) %C, i64 %tid64
+          store float %result, ptr addrspace(1) %cAddr, align 4
+
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "bf16_tg_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        print("testTGBF16BitcastStore: PSO created OK")
+
+        let N = 32
+        let aBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+        let cBuf = device.makeBuffer(length: N * 4, options: .storageModeShared)!
+
+        let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: N)
+        let cPtr = cBuf.contents().bindMemory(to: Float.self, capacity: N)
+        for i in 0..<N { aPtr[i] = Float(i) + 0.5; cPtr[i] = -999 }
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(aBuf, offset: 0, index: 0)
+        enc.setBuffer(cBuf, offset: 0, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: N, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // bf16 round-trip: values should be approximately equal (bf16 has ~3 decimal digits)
+        var failures = 0
+        for i in 0..<N {
+            let got = cPtr[i]
+            let expected = aPtr[i]
+            if abs(got - expected) > 0.5 {  // bf16 tolerance
+                failures += 1
+                if failures <= 5 { print("  [\(i)] got=\(got) expected=\(expected)") }
+            }
+        }
+        print("testTGBF16BitcastStore: \(failures == 0 ? "OK" : "FAIL \(failures)/\(N)")")
+        XCTAssertEqual(failures, 0, "bf16 TG round-trip failed")
+        #endif
+    }
 }

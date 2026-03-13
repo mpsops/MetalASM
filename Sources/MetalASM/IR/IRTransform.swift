@@ -2119,19 +2119,9 @@ private func transformTGGlobalGEPs(module: IRModule) {
     // --- TG Global Merge ---
     // When both byte globals ([N x i8]) and MMA globals ([M x float]) coexist,
     // Metal sums their sizes for total TG memory. If the sum exceeds 32KB,
-    // pipeline creation fails ("Failed to materializeAll").
-    //
-    // Fix: merge everything into a single [N x float] global. The MMA globals
-    // and byte globals are used between barriers and don't overlap, so they
-    // can alias the same physical memory.
-    //
-    // Steps:
-    //   1. Resize to max(byteSize, mmaSize) as [N x float]
-    //   2. Convert all i8-typed GEPs to float-typed GEPs (lshr offset, 2)
-    //   3. Redirect MMA global references to the merged global
-    //   4. Remove old MMA globals
+    // pipeline creation fails. Fix: merge into single [N x float] global.
+    // Also converts i8 GEPs to float GEPs so the pointer chain is consistent.
     if !byteGlobals.isEmpty && !mmaGlobals.isEmpty {
-        // Find the primary byte global (global_smem) and compute merged size
         let primaryByteGlobal = byteGlobals[0]
         var maxBytes = 0
         if case .array(_, let n) = primaryByteGlobal.valueType {
@@ -2156,15 +2146,11 @@ private func transformTGGlobalGEPs(module: IRModule) {
         let newArrayType = IRType.array(element: .float32, count: floatCount)
         primaryByteGlobal.valueType = newArrayType
         primaryByteGlobal.type = .pointer(pointee: newArrayType, addressSpace: 3)
-        // Update initializer to match new type (undef of new array type)
         if primaryByteGlobal.initializer != nil {
             primaryByteGlobal.initializer = .undef(newArrayType)
         }
 
         // Step 2: Convert i8-typed GEPs on the primary byte global to float-typed GEPs.
-        // For each `getelementptr i8, @global_smem, %byteOffset`:
-        //   → insert `%floatIdx = lshr i32 %byteOffset, 2`
-        //   → replace with `getelementptr float, @global_smem, %floatIdx`
         let mergedName = primaryByteGlobal.name
         for fn in module.functions where !fn.isDeclaration {
             for bb in fn.basicBlocks {
@@ -2175,17 +2161,13 @@ private func transformTGGlobalGEPs(module: IRModule) {
                        case .i8 = inst.attributes.gepSourceType,
                        case .value(let baseVal) = inst.operands[0],
                        baseVal.name == mergedName || baseVal.name == "__base_\(mergedName)" {
-                        // Insert lshr to convert byte offset to float index
                         let offsetOp = inst.operands[1]
                         let shiftName = "\(inst.name ?? "gep")_shr"
 
-                        // Check if offset is constant
                         if case .constant(let c) = offsetOp, case .integer(_, let val) = c {
-                            // Constant offset: just divide by 4
                             let floatIdx = val / 4
                             inst.operands[1] = .constant(.integer(.i32, floatIdx))
                         } else {
-                            // Dynamic offset: insert lshr
                             let shiftInst = IRInstruction(
                                 opcode: .lshr,
                                 type: .i32,
@@ -2199,9 +2181,7 @@ private func transformTGGlobalGEPs(module: IRModule) {
                             newInsts.append(shiftInst)
                             inst.operands[1] = .value(IRValue(type: .i32, name: shiftName))
                         }
-                        // Change GEP source type from i8 to float
                         inst.attributes.gepSourceType = .float32
-                        // Update result type to float*(3)
                         inst.type = .pointer(pointee: .float32, addressSpace: 3)
                     }
                     newInsts.append(inst)
@@ -2210,27 +2190,25 @@ private func transformTGGlobalGEPs(module: IRModule) {
             }
         }
 
-        // Step 3: Redirect all MMA global references to the merged global
-        let mmaNames = Set(mmaGlobals.map { $0.name })
-        for fn in module.functions where !fn.isDeclaration {
-            for bb in fn.basicBlocks {
-                for inst in bb.instructions {
-                    for i in inst.operands.indices {
-                        if case .value(let v) = inst.operands[i], mmaNames.contains(v.name) {
-                            inst.operands[i] = .value(IRValue(type: v.type, name: mergedName))
+        // Step 3: Redirect all MMA global references to the merged global (if any)
+        if !mmaGlobals.isEmpty {
+            let mmaNames = Set(mmaGlobals.map { $0.name })
+            for fn in module.functions where !fn.isDeclaration {
+                for bb in fn.basicBlocks {
+                    for inst in bb.instructions {
+                        for i in inst.operands.indices {
+                            if case .value(let v) = inst.operands[i], mmaNames.contains(v.name) {
+                                inst.operands[i] = .value(IRValue(type: v.type, name: mergedName))
+                            }
                         }
                     }
                 }
             }
+            module.globals.removeAll(where: { mmaNames.contains($0.name) })
         }
 
-        // Step 4: Remove old MMA globals from module
-        module.globals.removeAll(where: { mmaNames.contains($0.name) })
-
-        // Step 5: Update classification — everything is now one float global
-        // Remove additional byte globals that were merged (keep only for split-offset processing)
+        // Step 4: Update classification
         let mergedMmaEntry = (name: mergedName, arrayType: newArrayType, count: floatCount)
-        // Clear byte globals (the primary is now float-typed) and add to mmaGlobals
         byteGlobals.removeAll()
         mmaGlobals.removeAll()
         mmaGlobals.append(mergedMmaEntry)
@@ -2529,11 +2507,21 @@ private func transformTGGlobalGEPs(module: IRModule) {
             let preambleNames = Set(preambleInstrs.map { $0.name })
 
             // Replace uses of byte globals with preamble SSA (typed i8*)
-            // For GEPs with non-i8 source type, convert index to byte offset
+            // For GEPs with non-i8 source type, convert index to byte offset.
+            // Also handle chained GEPs (base is another byte-global GEP result).
             var gepScaleCounter = 6000
+            var byteGlobalGEPNames: Set<String> = []  // track GEP results derived from byte globals
             for bb in fn.basicBlocks {
                 var extraInsts: [(Int, IRInstruction)] = []
                 for (instIdx, inst) in bb.instructions.enumerated() where !preambleNames.contains(inst.name) {
+                    // Check if this GEP's base is a byte-global-derived pointer
+                    var isChainedByteGEP = false
+                    if inst.opcode == .getelementptr,
+                       case .value(let baseVal) = inst.operands.first,
+                       byteGlobalGEPNames.contains(baseVal.name) {
+                        isChainedByteGEP = true
+                    }
+
                     for i in inst.operands.indices {
                         if case .value(let v) = inst.operands[i],
                            let ssaName = baseSSAs[v.name] {
@@ -2552,7 +2540,6 @@ private func transformTGGlobalGEPs(module: IRModule) {
                                     default: elemSize = 4
                                     }
                                     if elemSize > 1, inst.operands.count > 1 {
-                                        // Multiply index by elemSize: %scaled = mul i32 %idx, elemSize
                                         let scaledName = "__gep_scale_\(gepScaleCounter)"
                                         gepScaleCounter += 1
                                         let mulInst = IRInstruction(
@@ -2566,9 +2553,47 @@ private func transformTGGlobalGEPs(module: IRModule) {
                                     }
                                     inst.attributes.gepSourceType = .i8
                                 }
+                                byteGlobalGEPNames.insert(inst.name)
                             }
                             inst.operands[i] = .value(IRValue(type: i8TGPtr, name: ssaName))
                         }
+                    }
+
+                    // Handle chained GEPs: base is a byte-global GEP result (not a global directly)
+                    if isChainedByteGEP, inst.opcode == .getelementptr {
+                        if case .array(_, _) = inst.attributes.gepSourceType {
+                            // skip array GEPs
+                        } else if let srcTy = inst.attributes.gepSourceType, srcTy != .i8 {
+                            let elemSize: Int
+                            switch srcTy {
+                            case .int(let bits): elemSize = bits / 8
+                            case .float32: elemSize = 4
+                            case .float64: elemSize = 8
+                            case .float16, .bfloat16: elemSize = 2
+                            default: elemSize = 4
+                            }
+                            if elemSize > 1, inst.operands.count > 1 {
+                                // Get index type from the operand
+                                let idxType: IRType
+                                switch inst.operands[1] {
+                                case .value(let v): idxType = v.type
+                                case .constant(let c): idxType = c.type
+                                default: idxType = .int(bits: 32)
+                                }
+                                let scaledName = "__gep_scale_\(gepScaleCounter)"
+                                gepScaleCounter += 1
+                                let mulInst = IRInstruction(
+                                    opcode: .mul,
+                                    type: idxType,
+                                    name: scaledName,
+                                    operands: [inst.operands[1], .constant(.integer(idxType, Int64(elemSize)))]
+                                )
+                                extraInsts.append((instIdx, mulInst))
+                                inst.operands[1] = .value(IRValue(type: idxType, name: scaledName))
+                            }
+                            inst.attributes.gepSourceType = .i8
+                        }
+                        byteGlobalGEPNames.insert(inst.name)
                     }
                 }
                 // Insert scale instructions before their GEPs
@@ -2606,6 +2631,7 @@ private func transformTGGlobalGEPs(module: IRModule) {
             }
 
             // Insert bitcasts: store/load of non-i8 types through i8*(3)
+            // Pointer bitcast i8*(3) → T*(3) works fine in Metal GPU JIT.
             for bb in fn.basicBlocks {
                 var newInsts: [IRInstruction] = []
                 var castMap: [String: (name: String, type: IRType)] = [:]
@@ -2669,7 +2695,7 @@ private func transformTGGlobalGEPs(module: IRModule) {
                             inst.operands[0] = .value(IRValue(type: cast.type, name: cast.name))
                         }
                     }
-                    // Insert bitcast for atomic calls on i8*(3) TG pointers
+                    // Insert bitcast for atomic calls on TG pointers
                     if inst.opcode == .call,
                        inst.operands.count >= 2,
                        case .value(let callee) = inst.operands.last,
@@ -2697,7 +2723,7 @@ private func transformTGGlobalGEPs(module: IRModule) {
                         }
                         inst.operands[0] = .value(IRValue(type: cast.type, name: cast.name))
                     }
-                    // Insert bitcast for MMA load/store calls on i8*(3) TG pointers
+                    // Insert bitcast for MMA load/store calls on TG pointers
                     if inst.opcode == .call,
                        inst.operands.count >= 2,
                        case .value(let callee) = inst.operands.last,
