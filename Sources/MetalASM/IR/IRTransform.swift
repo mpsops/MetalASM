@@ -30,6 +30,7 @@ public func applyAirTransforms(module: IRModule) {
     transformFNegToFSub(module: module)
     transformBitcastZeroInit(module: module)
     transformLLVMIntrinsicRename(module: module)
+    transformIntMinMax(module: module)
     transformI64ShuffleSplit(module: module)
     transformAtomicRMW(module: module)
     transformTGGlobalDeadElim(module: module)
@@ -818,12 +819,19 @@ private func transformPtrPhisToI64(module: IRModule) {
 // MARK: - Transform 1: barrier rename
 
 private func transformBarrierRename(module: IRModule) {
-    // Rename the declaration
+    // Rename the declaration (and deduplicate if air.wg.barrier already exists)
+    var hasWgBarrier = module.functions.contains { $0.isDeclaration && $0.name == "air.wg.barrier" }
     for fn in module.functions where fn.isDeclaration {
         if fn.name == "air.threadgroup.barrier" {
-            fn.name = "air.wg.barrier"
+            if hasWgBarrier {
+                fn.name = "__dead_barrier_decl"  // mark for removal
+            } else {
+                fn.name = "air.wg.barrier"
+                hasWgBarrier = true
+            }
         }
     }
+    module.functions.removeAll { $0.isDeclaration && $0.name == "__dead_barrier_decl" }
     // Fix call sites: change callee name + update args from (i32 1, i32 4) → (i32 2, i32 1)
     for fn in module.functions where !fn.isDeclaration {
         for bb in fn.basicBlocks {
@@ -1241,6 +1249,72 @@ private func transformLLVMIntrinsicRename(module: IRModule) {
     // Remove attribute groups that are no longer referenced by any function
     let usedGroupIndices = Set(module.functions.compactMap { $0.attributeGroupIndex })
     module.attributeGroups.removeAll { !usedGroupIndices.contains($0.index) }
+}
+
+// MARK: - Transform: Lower llvm.smin/smax/umin/umax to icmp+select
+//
+// Metal GPU JIT doesn't support LLVM integer min/max intrinsics.
+// Lower: %r = call llvm.smin.i32(%a, %b) → %cmp = icmp slt %a, %b; %r = select %cmp, %a, %b
+
+// (name, icmp predicate int): slt=40, sgt=38, ult=36, ugt=34
+private let intMinMaxIntrinsics: [(String, Int)] = [
+    ("llvm.smin.i32", 40), ("llvm.smax.i32", 38),
+    ("llvm.umin.i32", 36), ("llvm.umax.i32", 34),
+    ("llvm.smin.i64", 40), ("llvm.smax.i64", 38),
+    ("llvm.umin.i64", 36), ("llvm.umax.i64", 34),
+]
+
+private func transformIntMinMax(module: IRModule) {
+    let nameSet = Set(intMinMaxIntrinsics.map { $0.0 })
+    let predMap = Dictionary(intMinMaxIntrinsics, uniquingKeysWith: { _, b in b })
+
+    for fn in module.functions where !fn.isDeclaration {
+        for bb in fn.basicBlocks {
+            var i = 0
+            while i < bb.instructions.count {
+                let inst = bb.instructions[i]
+                guard inst.opcode == .call,
+                      let calleeOp = inst.operands.last,
+                      case .value(let calleeVal) = calleeOp,
+                      nameSet.contains(calleeVal.name),
+                      inst.operands.count >= 3,
+                      case .value(let aVal) = inst.operands[0],
+                      let pred = predMap[calleeVal.name] else {
+                    i += 1
+                    continue
+                }
+
+                let bOp = inst.operands[1]
+                let resultName = inst.name
+                let resultType = inst.type
+
+                // %cmp = icmp <pred> %a, %b
+                let cmpName = "\(resultName)_cmp"
+                let cmpInst = IRInstruction(
+                    opcode: .icmp, type: .i1, name: cmpName,
+                    operands: [
+                        .value(IRValue(type: resultType, name: aVal.name)),
+                        bOp
+                    ])
+                cmpInst.attributes.predicate = pred
+
+                // %r = select %cmp, %a, %b
+                let selInst = IRInstruction(
+                    opcode: .select, type: resultType, name: resultName,
+                    operands: [
+                        .value(IRValue(type: .i1, name: cmpName)),
+                        .value(IRValue(type: resultType, name: aVal.name)),
+                        bOp
+                    ])
+
+                bb.instructions.replaceSubrange(i...i, with: [cmpInst, selInst])
+                i += 2
+            }
+        }
+    }
+
+    // Remove the intrinsic declarations
+    module.functions.removeAll { $0.isDeclaration && nameSet.contains($0.name) }
 }
 
 // MARK: - Transform: Split i64 SIMD shuffles into pairs of i32 shuffles
@@ -1712,7 +1786,7 @@ private func transformInferOpaquePointerTypes(module: IRModule) {
 
     // Phase 6: Fix load/store type mismatches with pointer pointee type.
     // Skip addrspace 1 (device) — handled by transformWidenDeviceLoads.
-    // Only fix TG (addrspace 3) and other non-device mismatches here.
+    // For all other addrspaces (including TG addrspace 3): use pointer bitcasts.
     for fn in module.functions where !fn.isDeclaration {
         for bb in fn.basicBlocks {
             var insertions: [(Int, IRInstruction)] = []
@@ -1743,8 +1817,9 @@ private func transformInferOpaquePointerTypes(module: IRModule) {
                     inst.operands[1] = .value(IRValue(type: bcType, name: bcName))
                 }
             }
-            for (offset, (idx, bc)) in insertions.enumerated() {
-                bb.instructions.insert(bc, at: idx + offset)
+            // Insert bitcasts in reverse order to preserve indices
+            for (idx, bc) in insertions.reversed() {
+                bb.instructions.insert(bc, at: idx)
             }
         }
     }
@@ -2120,8 +2195,12 @@ private func transformTGGlobalGEPs(module: IRModule) {
     // When both byte globals ([N x i8]) and MMA globals ([M x float]) coexist,
     // Metal sums their sizes for total TG memory. If the sum exceeds 32KB,
     // pipeline creation fails. Fix: merge into single [N x float] global.
-    // Also converts i8 GEPs to float GEPs so the pointer chain is consistent.
-    if !byteGlobals.isEmpty && !mmaGlobals.isEmpty {
+    //
+    // Only merge when there's exactly 1 MMA global (after coalesce) — the byte
+    // scratch and MMA buffer alias the same memory at different times.
+    // With multiple MMA globals, they need distinct memory regions; merging
+    // overlaps them causing corruption and GPU crashes.
+    if !byteGlobals.isEmpty && mmaGlobals.count == 1 {
         let primaryByteGlobal = byteGlobals[0]
         var maxBytes = 0
         if case .array(_, let n) = primaryByteGlobal.valueType {
@@ -2190,22 +2269,20 @@ private func transformTGGlobalGEPs(module: IRModule) {
             }
         }
 
-        // Step 3: Redirect all MMA global references to the merged global (if any)
-        if !mmaGlobals.isEmpty {
-            let mmaNames = Set(mmaGlobals.map { $0.name })
-            for fn in module.functions where !fn.isDeclaration {
-                for bb in fn.basicBlocks {
-                    for inst in bb.instructions {
-                        for i in inst.operands.indices {
-                            if case .value(let v) = inst.operands[i], mmaNames.contains(v.name) {
-                                inst.operands[i] = .value(IRValue(type: v.type, name: mergedName))
-                            }
+        // Step 3: Redirect the single MMA global to the merged global
+        let mmaNames = Set(mmaGlobals.map { $0.name })
+        for fn in module.functions where !fn.isDeclaration {
+            for bb in fn.basicBlocks {
+                for inst in bb.instructions {
+                    for i in inst.operands.indices {
+                        if case .value(let v) = inst.operands[i], mmaNames.contains(v.name) {
+                            inst.operands[i] = .value(IRValue(type: v.type, name: mergedName))
                         }
                     }
                 }
             }
-            module.globals.removeAll(where: { mmaNames.contains($0.name) })
         }
+        module.globals.removeAll(where: { mmaNames.contains($0.name) })
 
         // Step 4: Update classification
         let mergedMmaEntry = (name: mergedName, arrayType: newArrayType, count: floatCount)
@@ -3793,6 +3870,41 @@ private func typeSizesMatch(_ a: IRType, _ b: IRType) -> Bool {
     return scalarSizeAlign(a).0 == scalarSizeAlign(b).0
 }
 
+/// Compute a type based on `pointeeScalar` that has the same byte size as `desired`.
+/// Used for TG value bitcasts: instead of ptr bitcast float*(3) → <8 x bf16>*(3),
+/// we bitcast the VALUE: <8 x bf16> → <4 x float>.
+///
+/// If sizes already match, returns `desired` unchanged (no bitcast needed).
+private func tgSizeMatchedType(desired: IRType, pointeeScalar: IRType) -> IRType {
+    let desiredSize = irTypeByteSize(desired)
+    let scalarSize = irTypeByteSize(pointeeScalar)
+    guard scalarSize > 0, desiredSize > scalarSize else {
+        return pointeeScalar  // same size or smaller — just use pointee directly
+    }
+    let count = desiredSize / scalarSize
+    return .vector(element: pointeeScalar, count: count)
+}
+
+/// Byte size of an IR type (for value bitcast size matching).
+private func irTypeByteSize(_ t: IRType) -> Int {
+    switch t {
+    case .int(let bits):
+        return max(1, bits / 8)
+    case .float16, .bfloat16:
+        return 2
+    case .float32:
+        return 4
+    case .float64:
+        return 8
+    case .vector(let elem, let count):
+        return irTypeByteSize(elem) * count
+    case .array(let elem, let count):
+        return irTypeByteSize(elem) * count
+    default:
+        return 4  // fallback
+    }
+}
+
 /// Returns (size, alignment) in bytes for scalar types in packed buffer layout.
 private func scalarSizeAlign(_ t: IRType) -> (Int, Int) {
     switch t {
@@ -3998,38 +4110,56 @@ private func transformWidenDeviceLoads(module: IRModule) {
                             operands: [.value(IRValue(type: .float32, name: inst.name))])
                         newInsts.append(bcInst)
 
-                        // Compute combined lane from all indices in the GEP chain
-                        let idxType = halfChain[0].idxType
+                        // Compute combined lane from all indices in the GEP chain.
+                        // Use i32 for lane computation (we only need bit 0).
+                        // Truncate any i64 indices to i32 first.
+                        let laneType = IRType.i32
                         let laneName: String
+
+                        // Helper: get an i32 name for a chain entry, inserting trunc if needed
+                        func ensureI32(_ entry: (origIdxName: String, idxType: IRType)) -> String {
+                            if case .int(let bits) = entry.idxType, bits > 32 {
+                                let truncName = "\(inst.name)_trunc_\(entry.origIdxName)"
+                                let truncInst = IRInstruction(
+                                    opcode: .trunc, type: laneType, name: truncName,
+                                    operands: [.value(IRValue(type: entry.idxType, name: entry.origIdxName))])
+                                newInsts.append(truncInst)
+                                return truncName
+                            }
+                            return entry.origIdxName
+                        }
+
                         if halfChain.count == 1 {
+                            let opName = ensureI32(halfChain[0])
                             laneName = "\(inst.name)_lane"
                             let andInst = IRInstruction(
-                                opcode: .and, type: idxType, name: laneName,
+                                opcode: .and, type: laneType, name: laneName,
                                 operands: [
-                                    .value(IRValue(type: idxType, name: halfChain[0].origIdxName)),
-                                    .constant(.integer(idxType, 1))
+                                    .value(IRValue(type: laneType, name: opName)),
+                                    .constant(.integer(laneType, 1))
                                 ])
                             newInsts.append(andInst)
                         } else {
-                            // Sum all original indices, then AND 1
-                            var sumName = halfChain[0].origIdxName
+                            // Sum all original indices (as i32), then AND 1
+                            var sumName = ensureI32(halfChain[0])
                             for i in 1..<halfChain.count {
+                                let rhsName = ensureI32(halfChain[i])
                                 let addName = "\(inst.name)_idxsum\(i)"
                                 let addInst = IRInstruction(
-                                    opcode: .add, type: idxType, name: addName,
+                                    opcode: .add, type: laneType, name: addName,
                                     operands: [
-                                        .value(IRValue(type: idxType, name: sumName)),
-                                        .value(IRValue(type: idxType, name: halfChain[i].origIdxName))
+                                        .value(IRValue(type: laneType, name: sumName)),
+                                        .value(IRValue(type: laneType, name: rhsName))
                                     ])
                                 newInsts.append(addInst)
                                 sumName = addName
                             }
                             laneName = "\(inst.name)_lane"
                             let andInst = IRInstruction(
-                                opcode: .and, type: idxType, name: laneName,
+                                opcode: .and, type: laneType, name: laneName,
                                 operands: [
-                                    .value(IRValue(type: idxType, name: sumName)),
-                                    .constant(.integer(idxType, 1))
+                                    .value(IRValue(type: laneType, name: sumName)),
+                                    .constant(.integer(laneType, 1))
                                 ])
                             newInsts.append(andInst)
                         }
@@ -4038,7 +4168,7 @@ private func transformWidenDeviceLoads(module: IRModule) {
                             opcode: .extractElement, type: origType, name: castName,
                             operands: [
                                 .value(IRValue(type: v2Type, name: bcName)),
-                                .value(IRValue(type: idxType, name: laneName))
+                                .value(IRValue(type: laneType, name: laneName))
                             ])
                         newInsts.append(extractInst)
                         widenedLoads[inst.name] = (castName, origType)
@@ -4139,38 +4269,54 @@ private func transformWidenDeviceLoads(module: IRModule) {
                         operands: [.value(IRValue(type: .float32, name: ldName))])
                     newInsts.append(v2Inst)
 
-                    // Compute combined lane from all indices in the GEP chain
-                    let idxType = halfChain[0].idxType
+                    // Compute combined lane from all indices in the GEP chain.
+                    // Use i32 for lane computation (we only need bit 0).
+                    let laneType2 = IRType.i32
                     let laneName: String
+
+                    func ensureI32Store(_ entry: (origIdxName: String, idxType: IRType)) -> String {
+                        if case .int(let bits) = entry.idxType, bits > 32 {
+                            let truncName = "\(prefix)_trunc_\(entry.origIdxName)"
+                            let truncInst = IRInstruction(
+                                opcode: .trunc, type: laneType2, name: truncName,
+                                operands: [.value(IRValue(type: entry.idxType, name: entry.origIdxName))])
+                            newInsts.append(truncInst)
+                            return truncName
+                        }
+                        return entry.origIdxName
+                    }
+
                     if halfChain.count == 1 {
+                        let opName = ensureI32Store(halfChain[0])
                         laneName = "\(prefix)_lane"
                         let laneInst = IRInstruction(
-                            opcode: .and, type: idxType, name: laneName,
+                            opcode: .and, type: laneType2, name: laneName,
                             operands: [
-                                .value(IRValue(type: idxType, name: halfChain[0].origIdxName)),
-                                .constant(.integer(idxType, 1))
+                                .value(IRValue(type: laneType2, name: opName)),
+                                .constant(.integer(laneType2, 1))
                             ])
                         newInsts.append(laneInst)
                     } else {
-                        // Sum all original indices, then AND 1
-                        var sumName = halfChain[0].origIdxName
+                        // Sum all original indices (as i32), then AND 1
+                        var sumName = ensureI32Store(halfChain[0])
                         for i in 1..<halfChain.count {
+                            let rhsName = ensureI32Store(halfChain[i])
                             let addName = "\(prefix)_idxsum\(i)"
                             let addInst = IRInstruction(
-                                opcode: .add, type: idxType, name: addName,
+                                opcode: .add, type: laneType2, name: addName,
                                 operands: [
-                                    .value(IRValue(type: idxType, name: sumName)),
-                                    .value(IRValue(type: idxType, name: halfChain[i].origIdxName))
+                                    .value(IRValue(type: laneType2, name: sumName)),
+                                    .value(IRValue(type: laneType2, name: rhsName))
                                 ])
                             newInsts.append(addInst)
                             sumName = addName
                         }
                         laneName = "\(prefix)_lane"
                         let laneInst = IRInstruction(
-                            opcode: .and, type: idxType, name: laneName,
+                            opcode: .and, type: laneType2, name: laneName,
                             operands: [
-                                .value(IRValue(type: idxType, name: sumName)),
-                                .constant(.integer(idxType, 1))
+                                .value(IRValue(type: laneType2, name: sumName)),
+                                .constant(.integer(laneType2, 1))
                             ])
                         newInsts.append(laneInst)
                     }
@@ -4181,7 +4327,7 @@ private func transformWidenDeviceLoads(module: IRModule) {
                         operands: [
                             .value(IRValue(type: v2Type, name: v2Name)),
                             .value(IRValue(type: halfType, name: val.name)),
-                            .value(IRValue(type: idxType, name: laneName))
+                            .value(IRValue(type: laneType2, name: laneName))
                         ])
                     newInsts.append(insInst)
 

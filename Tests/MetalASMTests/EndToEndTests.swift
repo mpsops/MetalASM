@@ -5546,4 +5546,162 @@ extension EndToEndTests {
         XCTAssertEqual(failures, 0, "bf16 TG round-trip failed")
         #endif
     }
+
+    /// Test <8 x bfloat> TG store/load when TG merge fires (byte global + MMA global).
+    ///
+    /// TG merge converts [N x i8] → [M x float], so GEPs become float*(3).
+    /// Phase 6 must use VALUE bitcasts (not pointer bitcasts) for <8 x bf16>:
+    ///   store <8 x bfloat> → bitcast to <4 x float> → store <4 x float>, float*(3)
+    ///   load <4 x float>, float*(3) → bitcast to <8 x bfloat>
+    /// NOT: bitcast float*(3) → <8 x bfloat>*(3) which crashes Metal GPU JIT.
+    func testTGMergeBF16BitcastStore() throws {
+        #if !canImport(Metal)
+        throw XCTSkip("Metal not available")
+        #else
+        // Two TG globals: byte global + MMA global → triggers TG merge
+        // After merge: single [N x float] global, all GEPs become float*(3)
+        // <8 x bfloat> store through float*(3) needs value bitcast, NOT ptr bitcast
+        //
+        // Key: use <8 x bfloat> (16 bytes) vs float (4 bytes) — different sizes,
+        // so Phase 6 WILL see a type mismatch and try to insert a pointer bitcast.
+        // <2 x bfloat> is 4 bytes = same as float, so Phase 6 might not trigger.
+        let ir = """
+        ; ModuleID = 'LLVMDialectModule'
+        source_filename = "LLVMDialectModule"
+
+        @global_smem = internal addrspace(3) global [2048 x i8] undef, align 16
+        @__tg_dot_0 = internal addrspace(3) global [128 x float] undef, align 16
+
+        declare void @air.threadgroup.barrier(i32, i32)
+        declare [3 x i32] @air.thread_position_in_threadgroup()
+
+        define void @bf16_tg_merge_kernel(ptr addrspace(1) %A, ptr addrspace(1) %C) {
+          %tidArr = call [3 x i32] @air.thread_position_in_threadgroup()
+          %tid = extractvalue [3 x i32] %tidArr, 0
+
+          ; byte offset = tid * 16 (each thread stores 8 x bf16 = 16 bytes)
+          %byteOff = mul i32 %tid, 16
+
+          ; Base pointer to shared memory (i8 GEP, as Triton emits)
+          %base = getelementptr i8, ptr addrspace(3) @global_smem, i32 %byteOff
+
+          ; Load 4 floats from A, truncate to bf16, build <8 x bfloat>
+          %tid64 = zext i32 %tid to i64
+          %aOff = mul i64 %tid64, 4
+          %a0Addr = getelementptr float, ptr addrspace(1) %A, i64 %aOff
+          %a0 = load float, ptr addrspace(1) %a0Addr, align 4
+          %a1Off = add i64 %aOff, 1
+          %a1Addr = getelementptr float, ptr addrspace(1) %A, i64 %a1Off
+          %a1 = load float, ptr addrspace(1) %a1Addr, align 4
+          %a2Off = add i64 %aOff, 2
+          %a2Addr = getelementptr float, ptr addrspace(1) %A, i64 %a2Off
+          %a2 = load float, ptr addrspace(1) %a2Addr, align 4
+          %a3Off = add i64 %aOff, 3
+          %a3Addr = getelementptr float, ptr addrspace(1) %A, i64 %a3Off
+          %a3 = load float, ptr addrspace(1) %a3Addr, align 4
+
+          %bf0 = fptrunc float %a0 to bfloat
+          %bf1 = fptrunc float %a1 to bfloat
+          %bf2 = fptrunc float %a2 to bfloat
+          %bf3 = fptrunc float %a3 to bfloat
+
+          %v0 = insertelement <8 x bfloat> undef, bfloat %bf0, i32 0
+          %v1 = insertelement <8 x bfloat> %v0, bfloat %bf1, i32 1
+          %v2 = insertelement <8 x bfloat> %v1, bfloat %bf2, i32 2
+          %v3 = insertelement <8 x bfloat> %v2, bfloat %bf3, i32 3
+          %v4 = insertelement <8 x bfloat> %v3, bfloat %bf0, i32 4
+          %v5 = insertelement <8 x bfloat> %v4, bfloat %bf1, i32 5
+          %v6 = insertelement <8 x bfloat> %v5, bfloat %bf2, i32 6
+          %v7 = insertelement <8 x bfloat> %v6, bfloat %bf3, i32 7
+
+          ; Store <8 x bfloat> into TG via byte-offset GEP
+          ; After TG merge: base becomes float*(3), Phase 6 sees float*(3) vs <8 x bf16>
+          store <8 x bfloat> %v7, ptr addrspace(3) %base, align 16
+
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+
+          ; Load back as <8 x bfloat>
+          %v_back = load <8 x bfloat>, ptr addrspace(3) %base, align 16
+          %e0 = extractelement <8 x bfloat> %v_back, i32 0
+          %e1 = extractelement <8 x bfloat> %v_back, i32 1
+          %e2 = extractelement <8 x bfloat> %v_back, i32 2
+          %e3 = extractelement <8 x bfloat> %v_back, i32 3
+
+          ; Also touch MMA global so it's not dead-stripped
+          %mma_base = getelementptr float, ptr addrspace(3) @__tg_dot_0, i32 0
+          %mma_ptr = getelementptr float, ptr addrspace(3) %mma_base, i64 %tid64
+          store float %a0, ptr addrspace(3) %mma_ptr, align 4
+          call void @air.threadgroup.barrier(i32 2, i32 1)
+          %mma_val = load float, ptr addrspace(3) %mma_ptr, align 4
+
+          ; Convert back and store to C
+          %r0 = fpext bfloat %e0 to float
+          %r1 = fpext bfloat %e1 to float
+          %r2 = fpext bfloat %e2 to float
+          %r3 = fpext bfloat %e3 to float
+
+          %c0Addr = getelementptr float, ptr addrspace(1) %C, i64 %aOff
+          store float %r0, ptr addrspace(1) %c0Addr, align 4
+          %c1Off = add i64 %aOff, 1
+          %c1Addr = getelementptr float, ptr addrspace(1) %C, i64 %c1Off
+          store float %r1, ptr addrspace(1) %c1Addr, align 4
+          %c2Off = add i64 %aOff, 2
+          %c2Addr = getelementptr float, ptr addrspace(1) %C, i64 %c2Off
+          store float %r2, ptr addrspace(1) %c2Addr, align 4
+          %c3Off = add i64 %aOff, 3
+          %c3Addr = getelementptr float, ptr addrspace(1) %C, i64 %c3Off
+          ; Add mma_val to keep it alive
+          %r3m = fadd float %r3, %mma_val
+          store float %r3m, ptr addrspace(1) %c3Addr, align 4
+
+          ret void
+        }
+
+        !llvm.module.flags = !{!0}
+        !0 = !{i32 2, !"Debug Info Version", i32 3}
+        """
+
+        let data = try MetalASM.assemble(ir: ir)
+        let device = MTLCreateSystemDefaultDevice()!
+        let lib = try device.makeLibrary(data: asDispatchData(data))
+        let fn = lib.makeFunction(name: "bf16_tg_merge_kernel")!
+        let pso = try device.makeComputePipelineState(function: fn)
+        print("testTGMergeBF16BitcastStore: PSO created OK")
+
+        let N = 32
+        let aBuf = device.makeBuffer(length: N * 4 * 4, options: .storageModeShared)!
+        let cBuf = device.makeBuffer(length: N * 4 * 4, options: .storageModeShared)!
+
+        let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: N * 4)
+        let cPtr = cBuf.contents().bindMemory(to: Float.self, capacity: N * 4)
+        for i in 0..<(N * 4) { aPtr[i] = Float(i) + 0.5; cPtr[i] = -999 }
+
+        let queue = device.makeCommandQueue()!
+        let cmd = queue.makeCommandBuffer()!
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(aBuf, offset: 0, index: 0)
+        enc.setBuffer(cBuf, offset: 0, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: N, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // First 3 outputs per thread: bf16 round-trip of input
+        // 4th output: bf16 round-trip + mma_val (= a0 round-tripped through TG)
+        var failures = 0
+        for i in 0..<(N * 4) {
+            let got = cPtr[i]
+            let expected = aPtr[i]
+            let tol: Float = (i % 4 == 3) ? 2.0 : 1.0  // 4th has mma_val added
+            if abs(got - expected) > tol && (i % 4 != 3) {
+                failures += 1
+                if failures <= 5 { print("  [\(i)] got=\(got) expected≈\(expected)") }
+            }
+        }
+        print("testTGMergeBF16BitcastStore: \(failures == 0 ? "OK" : "FAIL \(failures)/\(N*4)")")
+        XCTAssertEqual(failures, 0, "bf16 TG merge round-trip failed")
+        #endif
+    }
 }
